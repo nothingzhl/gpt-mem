@@ -10,7 +10,7 @@ struct AISettingsView: View {
         MemoryCard {
             VStack(alignment: .leading, spacing: 16) {
                 HStack {
-                    MemorySectionTitle(title: "AI 分析来源", subtitle: "多个模块共用来源配置与钥匙串；按需发送匿名摘要")
+                    MemorySectionTitle(title: "AI 分析来源", subtitle: "多个模块共用来源配置与钥匙串；先预览，再确认发送")
                     Spacer()
                     Button {
                         editingProvider = AIProviderPreset.openAI.makeConfiguration()
@@ -360,7 +360,7 @@ struct AIAnalysisCard: View {
     }
 }
 
-private struct AIAnalysisPreviewView: View {
+struct AIAnalysisPreviewView: View {
     @ObservedObject var model: DesktopAIModel
     let prepared: AIAnalysisPreview
     @Environment(\.dismiss) private var dismiss
@@ -373,7 +373,9 @@ private struct AIAnalysisPreviewView: View {
                 .font(.system(size: 12, weight: .medium)).textSelection(.enabled)
             Text("发送到：\(prepared.configuration.baseURL)")
                 .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary).textSelection(.enabled)
-            Text("实际观察窗口：\(MemoryFormat.date(prepared.input.windowStart)) → \(MemoryFormat.date(prepared.input.windowEnd))")
+            Text(prepared.input.presentation == nil
+                ? "实际观察窗口：\(MemoryFormat.date(prepared.input.windowStart)) → \(MemoryFormat.date(prepared.input.windowEnd))"
+                : "来源日志时间范围：\(MemoryFormat.fullDate(prepared.input.windowStart)) → \(MemoryFormat.fullDate(prepared.input.windowEnd))（缺少起点时使用末次更新时间建立占位范围）")
                 .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
             Text("本次输出上限：\(prepared.configuration.maxOutputTokens) Token")
                 .font(.system(size: 12, weight: .medium))
@@ -395,7 +397,7 @@ private struct AIAnalysisPreviewView: View {
             if let error = model.operationError {
                 Text(error).font(.system(size: 11)).foregroundStyle(MemoryStyle.orange).textSelection(.enabled)
             }
-            Text("分析对象使用匿名编号，本地定位信息留在本机。包含 \(prepared.input.facts.count) 条事实和 \(prepared.input.subjects.count) 个分析对象。")
+            Text((prepared.input.presentation?.privacyNotice ?? "分析对象使用匿名编号，本地定位信息留在本机。") + "包含 \(prepared.input.facts.count) 条事实和 \(prepared.input.subjects.count) 个分析对象。")
                 .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
@@ -412,7 +414,7 @@ private struct AIAnalysisPreviewView: View {
                     }.font(.system(size: 11))
                 }.frame(maxWidth: .infinity, alignment: .leading)
             }.frame(minHeight: 200, maxHeight: 380)
-            Text("该摘要在打开此窗口时冻结；采样继续进行。确认后只调用所选来源，不会自动切换到其他服务。")
+            Text("该输入在打开此窗口时冻结。确认后只调用所选来源，不会自动切换到其他服务。")
                 .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
             HStack {
                 Spacer()
@@ -443,7 +445,7 @@ struct AIAnalysisResultContent: View {
                 VStack(alignment: .leading, spacing: 5) {
                     Text("\(record.providerName) · \(record.model) · \(displayDate(record.generatedAt)) 生成")
                         .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
-                    Text("分析窗口：\(displayDate(record.windowStart)) → \(displayDate(record.windowEnd))")
+                    Text("\(input?.presentation == nil ? "分析窗口" : "来源日志范围")：\(displayDate(record.windowStart)) → \(displayDate(record.windowEnd))")
                         .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
                 }
                 Spacer()
@@ -451,7 +453,7 @@ struct AIAnalysisResultContent: View {
                 if record.wasCached { MemoryBadge(text: "缓存", color: MemoryStyle.secondary) }
             }
             if isHistorical {
-                Text("这份报告保留生成时的结论和依据，请按上方标注的观察窗口阅读。检查建议中的对象状态也属于当时的记录。")
+                Text(input?.presentation?.interpretation ?? "这份报告保留生成时的结论和依据，请按上方标注的观察窗口阅读。检查建议中的对象状态也属于当时的记录。")
                     .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
             } else if isStale {
                 Text("窗口、活动说明或来源已变化；以下结论只适用于分析时的摘要和上方标注的窗口及来源。")
@@ -459,7 +461,7 @@ struct AIAnalysisResultContent: View {
             }
             Text(record.result.summary).font(.system(size: 13, weight: .medium)).textSelection(.enabled)
             if !record.result.observations.isEmpty {
-                resultSection("证据观察") {
+                resultSection(input?.presentation?.evidenceTitle ?? "证据观察") {
                     ForEach(Array(record.result.observations.enumerated()), id: \.offset) { _, observation in
                         VStack(alignment: .leading, spacing: 5) {
                             Text(observation.text).textSelection(.enabled)
@@ -469,7 +471,7 @@ struct AIAnalysisResultContent: View {
                 }
             }
             if !record.result.hypotheses.isEmpty {
-                resultSection("原因假设 · 尚待验证") {
+                resultSection(input?.presentation?.hypothesesTitle ?? "原因假设 · 尚待验证") {
                     ForEach(Array(record.result.hypotheses.enumerated()), id: \.offset) { _, hypothesis in
                         VStack(alignment: .leading, spacing: 5) {
                             Text(hypothesis.title).fontWeight(.medium).foregroundStyle(MemoryStyle.orange)
@@ -484,7 +486,7 @@ struct AIAnalysisResultContent: View {
                 }
             }
             if !record.result.nextSteps.isEmpty {
-                resultSection("检查建议") {
+                resultSection(input?.presentation?.nextStepsTitle ?? "检查建议") {
                     ForEach(Array(record.result.nextSteps.enumerated()), id: \.offset) { index, step in
                         VStack(alignment: .leading, spacing: 5) {
                             if let id = step.subjectID { Text(subjectLabels[id] ?? id).fontWeight(.medium) }

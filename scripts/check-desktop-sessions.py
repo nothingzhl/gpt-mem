@@ -1524,7 +1524,7 @@ def release_inputs(project: Path, render: bool) -> tuple[Path, list[Path]]:
     objects: list[Path] = []
     missing: list[str] = []
     stale: list[str] = []
-    targets = ["GPTSessionKit"] + (["GPTMemoryCore", "GPTAnalysisKit"] if render else [])
+    targets = ["GPTSessionKit", "GPTAnalysisKit"] + (["GPTMemoryCore"] if render else [])
     for target in targets:
         if not (modules / f"{target}.swiftmodule").is_file():
             missing.append(f"{target}.swiftmodule")
@@ -1564,7 +1564,7 @@ def main() -> int:
         desktop = project / "Sources" / "GPTMemoryDesktop"
         sources = [desktop / "SessionManagementModel.swift", desktop / "SessionDesktopModel.swift"]
         if output:
-            sources += [desktop / "SessionViews.swift", desktop / "SessionProjectViews.swift", desktop / "SessionManagementViews.swift", desktop / "Style.swift"]
+            sources += [desktop / "SessionViews.swift", desktop / "SessionProjectViews.swift", desktop / "SessionManagementViews.swift", desktop / "Style.swift", desktop / "SessionHandoffAIViews.swift", desktop / "DesktopAIModel.swift", desktop / "AIReportLibraryModel.swift", desktop / "AIViews.swift", desktop / "AIReportViews.swift", desktop / "AIProviderEditorModel.swift"]
         command = ["swiftc", "-swift-version", "5", "-target", f"{architecture}-apple-macosx14.0",
                    "-module-cache-path", str(directory / "module-cache"), "-I", str(release / "Modules"),
                    "-I", str(release / "CNative.build"), "-o", str(executable)]

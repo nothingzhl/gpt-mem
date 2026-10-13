@@ -36,6 +36,7 @@ final class DesktopModel: ObservableObject {
     @Published var lastDiagnosticURL: URL?
     let databaseURL: URL
     let aiModel: DesktopAIModel
+    let sessionAIModel: DesktopAIModel
     let sessionModel: SessionDesktopModel
     let processActions: MemoryProcessActionsModel
     private var isPerformingFileOperation = false
@@ -73,6 +74,8 @@ final class DesktopModel: ObservableObject {
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/gpt-mem")
         databaseURL = directory.appendingPathComponent("history.sqlite3")
         aiModel = DesktopAIModel(configurationStore: AIConfigurationStore(url: directory.appendingPathComponent("ai-services.json")))
+        sessionAIModel = DesktopAIModel(configurationStore: AIConfigurationStore(url: directory.appendingPathComponent("ai-services.json")),
+            reportLibrary: aiModel.reportLibrary)
         sessionModel = SessionDesktopModel(indexDirectoryURL: directory.appendingPathComponent("session-index", isDirectory: true),
             managementDirectoryURL: directory.appendingPathComponent("session-management", isDirectory: true))
         processActions = MemoryProcessActionsModel(directoryURL: directory.appendingPathComponent("process-actions", isDirectory: true))

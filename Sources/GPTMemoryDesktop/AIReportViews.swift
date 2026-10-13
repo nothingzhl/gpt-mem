@@ -2,9 +2,11 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import GPTAnalysisKit
+import GPTSessionKit
 
 struct AIReportsContent: View {
     @ObservedObject var model: AIReportLibraryModel
+    @State private var handoffReport: AISavedReport?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -38,6 +40,10 @@ struct AIReportsContent: View {
         }
         .disclosureGroupStyle(WideDisclosureGroupStyle())
         .task { model.loadIfNeeded() }
+        .sheet(item: $handoffReport) { report in
+            SessionHandoffEditor(initialText: SessionHandoffAIModule.markdown(record: report.record,
+                input: report.input, subjectLabels: report.subjectLabels))
+        }
     }
 
     private var controls: some View {
@@ -110,6 +116,9 @@ struct AIReportsContent: View {
                 HStack(spacing: 12) {
                     Text(report.record.moduleTitle).font(.system(size: 15, weight: .semibold))
                     Spacer()
+                    if report.input.moduleID == SessionHandoffAIModule.moduleID {
+                        Button("继续工作") { handoffReport = report }
+                    }
                     Menu("导出") {
                         Button("导出 Markdown…") { export(report, format: .markdown) }
                         Button("导出 JSON…") { export(report, format: .json) }
@@ -124,7 +133,7 @@ struct AIReportsContent: View {
                             subjectLabels: report.subjectLabels, isStale: false, isHistorical: true)
                     }
                 }
-                Text("导出包含结论、匿名依据和活动说明；不包含本地 PID 映射或服务密钥。")
+                Text(report.input.presentation?.privacyNotice ?? "导出包含结论、匿名依据和活动说明；不包含本地 PID 映射或服务密钥。")
                     .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
             }.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         } else {

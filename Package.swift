@@ -14,7 +14,7 @@ let package = Package(
     targets: [
         .target(name: "CNative", linkerSettings: [.linkedLibrary("proc"), .linkedLibrary("sqlite3")]),
         .target(name: "GPTAnalysisKit"),
-        .target(name: "GPTSessionKit"),
+        .target(name: "GPTSessionKit", dependencies: ["GPTAnalysisKit"]),
         .target(name: "GPTMemoryCore", dependencies: ["CNative", "GPTAnalysisKit"]),
         .executableTarget(name: "GPTMemoryCLI", dependencies: ["GPTMemoryCore"]),
         .executableTarget(name: "GPTMemoryDesktop", dependencies: ["GPTMemoryCore", "GPTAnalysisKit", "GPTSessionKit"]),

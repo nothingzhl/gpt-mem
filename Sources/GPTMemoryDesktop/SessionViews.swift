@@ -17,12 +17,14 @@ enum SessionWorkspaceSection: String, CaseIterable {
 /// don't rebuild a long transcript. Its own model/state changes still redraw it.
 struct SessionWorkspaceHost: View, Equatable {
     let model: SessionDesktopModel
-    static func == (lhs: Self, rhs: Self) -> Bool { lhs.model === rhs.model }
-    var body: some View { SessionsContent(model: model) }
+    var aiModel: DesktopAIModel? = nil
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.model === rhs.model && lhs.aiModel === rhs.aiModel }
+    var body: some View { SessionsContent(model: model, aiModel: aiModel) }
 }
 
 struct SessionsContent: View {
     @ObservedObject var model: SessionDesktopModel
+    let aiModel: DesktopAIModel?
     @State private var expandedMessageIDs: Set<String>
     @State private var section: SessionWorkspaceSection
     @State private var messageRangeStart: Int
@@ -36,9 +38,10 @@ struct SessionsContent: View {
     @State private var editingProject: SessionProjectSummary?
     private let initiallyExpandedWarnings: Bool
 
-    init(model: SessionDesktopModel, initiallyExpandedMessageIDs: Set<String> = [],
+    init(model: SessionDesktopModel, aiModel: DesktopAIModel? = nil, initiallyExpandedMessageIDs: Set<String> = [],
          initialSection: SessionWorkspaceSection = .projects, initiallyExpandedWarnings: Bool = false) {
         self.model = model
+        self.aiModel = aiModel
         self.initiallyExpandedWarnings = initiallyExpandedWarnings
         _expandedMessageIDs = State(initialValue: initiallyExpandedMessageIDs)
         _section = State(initialValue: initialSection)
@@ -64,6 +67,7 @@ struct SessionsContent: View {
             controls
             if let jumpNotice { Text(jumpNotice).font(.caption).foregroundStyle(.orange) }
             SessionManagementStatus(model: model.management, showsWriteError: editingSession == nil && editingProject == nil)
+            if let aiModel { SessionHandoffBackgroundStatus(model: aiModel) }
             if let error = model.errorMessage {
                 SessionWarningsDisclosure(title: "读取失败", warnings: [error], initiallyExpanded: true)
             }
@@ -126,7 +130,7 @@ struct SessionsContent: View {
                 }
             }
             .sheet(item: $handoffDraft) { draft in
-                SessionHandoffEditor(initialText: draft.text)
+                SessionHandoffEditor(initialText: draft.text, transcript: draft.transcript, aiModel: aiModel)
             }
             .sheet(item: $editingSession) { summary in
                 SessionMetadataEditor(model: model, summary: summary)
@@ -361,7 +365,7 @@ struct SessionsContent: View {
                 }
                 Button("继续工作", systemImage: "arrow.right.doc.on.clipboard") {
                     guard let transcript = model.transcript, transcript.summary.id == summary.id else { return }
-                    handoffDraft = HandoffDraft(text: SessionHandoff.draft(transcript: transcript, note: model.note(for: summary)))
+                    handoffDraft = HandoffDraft(text: SessionHandoff.draft(transcript: transcript, note: model.note(for: summary)), transcript: transcript)
                 }.disabled(model.isLoadingTranscript || model.transcript?.summary.id != summary.id)
                 Button { beginEditing(summary) } label: { Label("编辑", systemImage: "pencil") }
                     .font(.system(size: 11)).disabled(!canManage)
@@ -617,18 +621,27 @@ private struct SessionMessageCard: View {
 private struct HandoffDraft: Identifiable {
     let id = UUID()
     let text: String
+    var transcript: SessionTranscript? = nil
 }
 
 struct SessionHandoffEditor: View {
     @Environment(\.dismiss) private var dismiss
     @State private var text: String
     @State private var status = ""
-    init(initialText: String) { _text = State(initialValue: initialText) }
+    let transcript: SessionTranscript?
+    let aiModel: DesktopAIModel?
+    init(initialText: String, transcript: SessionTranscript? = nil, aiModel: DesktopAIModel? = nil) {
+        _text = State(initialValue: initialText)
+        self.transcript = transcript; self.aiModel = aiModel
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("继续工作 · 交接说明").font(.headline)
-            Text("本地摘录，可编辑后复制到新会话。请补充目标、已验证结果与待办；不会自动发送。")
+            Text("可编辑后复制到新会话。请核对目标、已验证结果与待办；AI 结果保存在报告库，编辑内容请复制或导出保存。")
                 .font(.callout).foregroundStyle(.secondary)
+            if let transcript, let aiModel {
+                SessionHandoffAIControls(model: aiModel, transcript: transcript, draft: $text)
+            }
             TextEditor(text: $text).font(.system(size: 12, design: .monospaced))
                 .border(Color.gray.opacity(0.3))
             HStack {

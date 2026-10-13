@@ -94,7 +94,7 @@ import PackageDescription
 let package = Package(name: "gpt-mem-checks", platforms: [.macOS(.v14)], targets: [
     .target(name: "CNative", linkerSettings: [.linkedLibrary("proc"), .linkedLibrary("sqlite3")]),
     .target(name: "GPTAnalysisKit", swiftSettings: [.unsafeFlags(["-enable-testing"])]),
-    .target(name: "GPTSessionKit", swiftSettings: [.unsafeFlags(["-enable-testing"])]),
+    .target(name: "GPTSessionKit", dependencies: ["GPTAnalysisKit"], swiftSettings: [.unsafeFlags(["-enable-testing"])]),
     .target(name: "GPTMemoryCore", dependencies: ["CNative", "GPTAnalysisKit"], swiftSettings: [.unsafeFlags(["-enable-testing"])]),
     .executableTarget(name: "MemoryChecks", dependencies: ["GPTMemoryCore", "GPTAnalysisKit", "GPTSessionKit", "CNative"], path: "Checks")
 ], swiftLanguageModes: [.v5])

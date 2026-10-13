@@ -49,6 +49,25 @@ public struct AIAnalysisSubject: Codable, Equatable, Identifiable {
     public init(id: String, label: String, canInspect: Bool) { self.id = id; self.label = label; self.canInspect = canInspect }
 }
 
+/// Domain wording travels with the frozen input, so future modules reuse the same report UI.
+public struct AIAnalysisPresentation: Codable, Equatable {
+    public let evidenceTitle: String
+    public let hypothesesTitle: String
+    public let nextStepsTitle: String
+    public let interpretation: String
+    public let privacyNotice: String
+    public init(evidenceTitle: String, hypothesesTitle: String, nextStepsTitle: String,
+                interpretation: String, privacyNotice: String) {
+        self.evidenceTitle = evidenceTitle; self.hypothesesTitle = hypothesesTitle
+        self.nextStepsTitle = nextStepsTitle; self.interpretation = interpretation; self.privacyNotice = privacyNotice
+    }
+    public var isValid: Bool {
+        [evidenceTitle, hypothesesTitle, nextStepsTitle, interpretation, privacyNotice].allSatisfy {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.utf8.count <= 2_048
+        }
+    }
+}
+
 public struct AIAnalysisInput: Codable, Equatable {
     public let moduleID: String
     public let moduleTitle: String
@@ -59,18 +78,19 @@ public struct AIAnalysisInput: Codable, Equatable {
     public let facts: [AIAnalysisFact]
     public let subjects: [AIAnalysisSubject]
     public let context: String
+    public let presentation: AIAnalysisPresentation?
 
     public init(moduleID: String, moduleTitle: String, promptVersion: String, guidance: String,
-                windowStart: Date, windowEnd: Date, facts: [AIAnalysisFact], subjects: [AIAnalysisSubject], context: String = "") {
+                windowStart: Date, windowEnd: Date, facts: [AIAnalysisFact], subjects: [AIAnalysisSubject], context: String = "", presentation: AIAnalysisPresentation? = nil) {
         self.moduleID = moduleID; self.moduleTitle = moduleTitle; self.promptVersion = promptVersion
         self.guidance = guidance; self.windowStart = windowStart; self.windowEnd = windowEnd
-        self.facts = facts; self.subjects = subjects; self.context = context
+        self.facts = facts; self.subjects = subjects; self.context = context; self.presentation = presentation
     }
 
     public func validated() throws -> Data {
         guard !moduleID.isEmpty, !moduleTitle.isEmpty, !promptVersion.isEmpty,
               windowStart.timeIntervalSince1970.isFinite, windowEnd.timeIntervalSince1970.isFinite,
-              windowEnd > windowStart, !facts.isEmpty, facts.count <= 100,
+              windowEnd > windowStart, presentation?.isValid != false, !facts.isEmpty, facts.count <= 100,
               subjects.count <= 50, context.utf8.count <= 8_192, guidance.utf8.count <= 16_384 else {
             throw AIAnalysisError.invalidConfiguration("分析模块、时间范围或输入数量无效。")
         }

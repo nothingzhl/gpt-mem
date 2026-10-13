@@ -12,19 +12,19 @@ public enum AIReportExport {
                      "- 生成时间：\(formatter.string(from: record.generatedAt))",
                      "- 实际观察窗口：\(formatter.string(from: input.windowStart)) 至 \(formatter.string(from: input.windowEnd))",
                      "- 实际窗口长度：\(String(format: "%.3f", input.windowEnd.timeIntervalSince(input.windowStart))) 秒",
-                     "", "## 概要", "", escape(result.summary), "", "## 事实观察", ""]
+                     "", "## 概要", "", escape(result.summary), "", "## " + escape(input.presentation?.evidenceTitle ?? "事实观察"), ""]
         for observation in result.observations {
             lines += ["- \(escape(observation.text))", "  - 引用证据：\(observation.evidenceIDs.map(escape).joined(separator: "、"))"]
         }
-        lines += ["", "## 原因假设", ""]
-        if result.hypotheses.isEmpty { lines.append("本次报告没有提出原因假设。") }
+        lines += ["", "## " + escape(input.presentation?.hypothesesTitle ?? "原因假设"), ""]
+        if result.hypotheses.isEmpty { lines.append(input.presentation == nil ? "本次报告没有提出原因假设。" : "本次没有提出待确认问题。") }
         for hypothesis in result.hypotheses {
             lines += ["### \(escape(hypothesis.title))", "", escape(hypothesis.explanation), "",
                       "- 引用证据：\(hypothesis.evidenceIDs.map(escape).joined(separator: "、"))"]
             for missing in hypothesis.missingEvidence { lines.append("- 待补证据：\(escape(missing))") }
             lines.append("")
         }
-        lines += ["", "## 检查建议", ""]
+        lines += ["", "## " + escape(input.presentation?.nextStepsTitle ?? "检查建议"), ""]
         for (index, step) in result.nextSteps.enumerated() {
             let subject = step.subjectID.flatMap { id in input.subjects.first { $0.id == id } }
             lines += ["\(index + 1). \(escape(step.action))", "   - 目的：\(escape(step.purpose))"]
@@ -49,8 +49,9 @@ public enum AIReportExport {
             lines += safeJSONText(json).components(separatedBy: "\n").map { "    " + $0 }
             lines.append("")
         }
-        lines += ["", "AI 原因假设需要后续验证。此报告保存的是生成时的证据和对象状态，不能代表当前状态。",
+        lines += ["", escape(input.presentation?.interpretation ?? "AI 原因假设需要后续验证。此报告保存的是生成时的证据和对象状态，不能代表当前状态。"),
                   "导出不包含本地 PID 映射、来源内部编号、请求指纹或服务连接配置。", ""]
+        if let notice = input.presentation?.privacyNotice { lines += [escape(notice), ""] }
         let markdown = lines.joined(separator: "\n")
         guard markdown.utf8.count <= 1_048_576 else { throw AIReportStoreError.oversizedReport }
         return markdown
@@ -67,7 +68,8 @@ public enum AIReportExport {
                                     activityContext: report.input.context, analysisGuidance: report.input.guidance,
                                     facts: report.input.facts, subjects: report.input.subjects,
                                     result: report.record.result,
-                                    interpretation: "AI 原因假设需要后续验证；对象状态与证据反映生成时的观察窗口。")
+                                    interpretation: report.input.presentation?.interpretation ?? "AI 原因假设需要后续验证；对象状态与证据反映生成时的观察窗口。",
+                                    presentation: report.input.presentation)
         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         // Numeric Unix times preserve subsecond windows in a portable, explicit form.
         encoder.dateEncodingStrategy = .secondsSince1970
@@ -95,6 +97,7 @@ public enum AIReportExport {
         let subjects: [AIAnalysisSubject]
         let result: AIAnalysisResult
         let interpretation: String
+        let presentation: AIAnalysisPresentation?
     }
 
     private static func safeJSONText(_ value: String) -> String {

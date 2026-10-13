@@ -76,7 +76,7 @@ struct MemoryDesktopView: View {
                             .padding(.horizontal, 28).padding(.bottom, 28)
                     }
                 case .sessions:
-                    SessionWorkspaceHost(model: model.sessionModel).equatable()
+                    SessionWorkspaceHost(model: model.sessionModel, aiModel: model.sessionAIModel).equatable()
                         .padding(.horizontal, 28).padding(.bottom, 24)
                 case .reports:
                     AIReportsContent(model: model.aiModel.reportLibrary)
@@ -98,6 +98,8 @@ struct MemoryDesktopView: View {
         .onChange(of: minutes) { _, value in model.setWindow(seconds: Double(value * 60)) }
         .onChange(of: model.interval) { _, value in model.setInterval(value) }
         .onChange(of: selectedPage) { _, value in
+            if value == .sessions { model.sessionAIModel.reloadSettings() }
+            else if value == .settings || value == .overview || value == .history { model.aiModel.reloadSettings() }
             model.isSessionWorkspaceActive = value == .sessions
             model.isReportLibraryActive = value == .reports
         }

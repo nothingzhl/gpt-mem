@@ -17,6 +17,7 @@ SWIFT_CHECKS = r'''
 import Foundation
 import Darwin
 import GPTAnalysisKit
+import GPTSessionKit
 #if RENDER_AI
 import AppKit
 import SwiftUI
@@ -62,6 +63,12 @@ actor MockAIClient: AIProviderClient {
         if input.context == "length-limit-always" || (input.context == "length-limit" && configuration.maxOutputTokens < 8192) {
             throw AIAnalysisError.generationLengthLimit(limit: configuration.maxOutputTokens,
                 generatedTokens: configuration.maxOutputTokens, reasoningTokens: 1200)
+        }
+        if input.moduleID == SessionHandoffAIModule.moduleID {
+            return AIAnalysisResult(summary: "模拟交接：继续实现搜索功能",
+                observations: [.init(text: "用户要求继续实现搜索，需核对代码。", evidenceIDs: ["m1"])],
+                hypotheses: [], nextSteps: [.init(subjectID: "session", action: "核对实现和测试", purpose: "确认当前进度")],
+                limitations: ["只是冻结会话摘录，不代表当前代码。"])
         }
         return AIAnalysisResult(
             summary: "模拟服务：\(input.context)",
@@ -565,6 +572,38 @@ struct MockModelCatalog: AIModelCatalogClient {
     try png.write(to: output)
     print("RENDER \(output.lastPathComponent)")
 
+    let sessionFixture = try makeFixture("render-session")
+    let sessionSummary = CodexSessionSummary(id: "preview", sessionID: "preview", fileURL: URL(fileURLWithPath: "/mock/session.jsonl"),
+        title: "模拟搜索功能开发", projectPath: "/mock/project", startedAt: Date(timeIntervalSince1970: 100), updatedAt: Date(timeIntervalSince1970: 200))
+    let sessionTranscript = SessionTranscript(summary: sessionSummary, messages: [
+        .init(id: "user", kind: .user, text: "继续完善跨会话搜索，支持助手答复与工具结果。"),
+        .init(id: "assistant", kind: .assistant, text: "已实现搜索和跳转，测试通过。下一步核对大日志搜索性能。")])
+    let sessionModule = try SessionHandoffAIModule(transcript: sessionTranscript)
+    sessionFixture.model.prepare(module: sessionModule, subjectLabels: sessionModule.subjectLabels, windowSelectionSeconds: 100)
+    guard let sessionPreview = sessionFixture.model.preview else { throw CheckFailure(description: "session render preview missing") }
+    let previewView = AnyView(AIAnalysisPreviewView(model: sessionFixture.model, prepared: sessionPreview))
+    sessionFixture.model.beginAnalysis(sessionPreview)
+    try await waitUntilIdle(sessionFixture.model)
+    let editorView = AnyView(SessionHandoffEditor(initialText: SessionHandoff.draft(transcript: sessionTranscript),
+        transcript: sessionTranscript, aiModel: sessionFixture.model))
+    for (name, rootView, width, height) in [("desktop-ai-handoff-confirmation.png", previewView, CGFloat(700), CGFloat(830)),
+                                           ("desktop-ai-handoff-editor.png", editorView, CGFloat(760), CGFloat(720))] {
+        let view = NSHostingView(rootView: rootView.background(MemoryStyle.surface).foregroundStyle(MemoryStyle.text).tint(MemoryStyle.accent))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: height), styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = view
+        view.frame = NSRect(x: 0, y: 0, width: width, height: height)
+        view.layoutSubtreeIfNeeded()
+        try await Task.sleep(nanoseconds: 70_000_000)
+        view.layoutSubtreeIfNeeded()
+        guard let image = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { throw CheckFailure(description: "handoff bitmap") }
+        view.cacheDisplay(in: view.bounds, to: image)
+        guard let data = image.representation(using: .png, properties: [:]) else { throw CheckFailure(description: "handoff PNG") }
+        try data.write(to: output.deletingLastPathComponent().appendingPathComponent(name))
+        window.close()
+        print("RENDER \(name)")
+    }
+
     // Render the production setup view without opening an app or fetching models.
     let setup = VStack(alignment: .leading, spacing: 12) {
         Text("添加来源界面预览 · 未配置密钥、未请求服务")
@@ -590,6 +629,57 @@ struct MockModelCatalog: AIModelCatalogClient {
 }
 #endif
 
+@MainActor func checkSessionHandoffIsolationAndPersistence() async throws {
+    let fixture = try makeFixture("session-handoff")
+    let memoryPreview = try prepare(fixture, input: fixtureInput("memory-result"))
+    fixture.model.beginAnalysis(memoryPreview)
+    try await waitUntilIdle(fixture.model)
+    while fixture.model.reportLibrary.isSaving { try await Task.sleep(nanoseconds: 10_000_000) }
+    let memoryRecord = fixture.model.record
+    let session = DesktopAIModel(configurationStore: fixture.store, credentials: fixture.credentials,
+        coordinator: AIAnalysisCoordinator(client: fixture.client, credentials: fixture.credentials), reportLibrary: fixture.model.reportLibrary)
+    let summary = CodexSessionSummary(id: "s", sessionID: "s", fileURL: URL(fileURLWithPath: "/fixture/session.jsonl"), title: "Mock session",
+                                     startedAt: Date(timeIntervalSince1970: 100), updatedAt: Date(timeIntervalSince1970: 200))
+    let transcript = SessionTranscript(summary: summary, messages: [.init(id: "u", kind: .user, text: "继续实现搜索功能")])
+    let module = try SessionHandoffAIModule(transcript: transcript, context: "mock-session-context")
+    session.prepare(module: module, subjectLabels: module.subjectLabels, windowSelectionSeconds: 100)
+    let initialRequests = await fixture.client.captured().count
+    try expect(initialRequests == 1, "preparing session excerpts never sends")
+    guard let preview = session.preview else { throw CheckFailure(description: "session preview missing") }
+    try expect(preview.input == module.input && preview.subjectLabels == module.subjectLabels, "preview freezes text and local references")
+    session.beginAnalysis(preview)
+    try await waitUntilIdle(session)
+    while session.reportLibrary.isSaving { try await Task.sleep(nanoseconds: 10_000_000) }
+    try expect(session.analysisError == nil && session.reportSaveError == nil, "session AI and save complete")
+    try expect(session.record?.moduleID == SessionHandoffAIModule.moduleID, "session result uses separate module")
+    try expect(fixture.model.record == memoryRecord && fixture.model.recordInput?.moduleID == "fixture", "session analysis cannot replace memory result")
+    try expect(session.reportLibrary === fixture.model.reportLibrary && session.reportLibrary.reports.count == 2, "modules share one report history")
+    let saved = session.reportLibrary.reports.first { $0.input.moduleID == SessionHandoffAIModule.moduleID }
+    try expect(saved?.input == module.input && saved?.subjectLabels == module.subjectLabels, "history freezes excerpts and local source mapping")
+    let reopened = AIReportLibraryModel(store: session.reportLibrary.store)
+    reopened.loadIfNeeded()
+    while reopened.isLoading || reopened.isFiltering { try await Task.sleep(nanoseconds: 10_000_000) }
+    try expect(reopened.reports.contains { $0.id == saved?.id }, "session report survives reopening without AI calls")
+    let requestCount = await fixture.client.captured().count
+    try expect(requestCount == 2, "reopening is local-only")
+    let previous = session.record
+    let failing = try SessionHandoffAIModule(transcript: transcript, context: "fail")
+    session.prepare(module: failing, subjectLabels: failing.subjectLabels, windowSelectionSeconds: 100)
+    guard let failedPreview = session.preview else { throw CheckFailure(description: "failure preview missing") }
+    session.beginAnalysis(failedPreview)
+    try await waitUntilIdle(session)
+    try expect(session.analysisError != nil && session.record == previous, "failed handoff preserves previous result")
+    let slow = try SessionHandoffAIModule(transcript: transcript, context: "slow-old")
+    session.prepare(module: slow, subjectLabels: slow.subjectLabels, windowSelectionSeconds: 100)
+    guard let slowPreview = session.preview else { throw CheckFailure(description: "cancel preview missing") }
+    session.beginAnalysis(slowPreview)
+    try await waitForRequests(fixture.client, count: 4)
+    session.cancelAnalysis()
+    try await Task.sleep(nanoseconds: 450_000_000)
+    try expect(session.record == previous && session.reportLibrary.reports.count == 2, "cancelled completion cannot replace or save a handoff")
+    print("PASS session frozen preview, result isolation, shared report persistence, failure preservation and cancellation")
+}
+
 @MainActor func runChecks() async throws {
     try await checkProviderCRUD()
     try checkCorruptConfiguration()
@@ -602,7 +692,8 @@ struct MockModelCatalog: AIModelCatalogClient {
     try checkConfigurationConflict()
     try await checkOutputBudgetPreview()
     try await checkLengthLimitRecovery()
-    print("DESKTOP AI CHECKS PASSED: 11 workflows, \(assertionCount) assertions; mock providers and credentials only")
+    try await checkSessionHandoffIsolationAndPersistence()
+    print("DESKTOP AI CHECKS PASSED: 12 workflows, \(assertionCount) assertions; mock providers and credentials only")
     #if RENDER_AI
     if let output = ProcessInfo.processInfo.environment["GPT_DESKTOP_AI_RENDER_PATH"] {
         try await renderFixture(to: output)
@@ -665,7 +756,7 @@ def main() -> int:
         desktop = project / "Sources" / "GPTMemoryDesktop"
         sources = [desktop / "DesktopAIModel.swift", desktop / "AIReportLibraryModel.swift"]
         if output:
-            sources += [desktop / name for name in ["DesktopModel.swift", "Views.swift", "MemoryProcessActionsModel.swift", "MemoryProcessActionViews.swift", "AIViews.swift", "AIReportViews.swift", "AIProviderEditorModel.swift", "Style.swift", "SessionDesktopModel.swift", "SessionManagementModel.swift", "SessionManagementViews.swift", "SessionViews.swift", "SessionProjectViews.swift"]]
+            sources += [desktop / name for name in ["DesktopModel.swift", "Views.swift", "MemoryProcessActionsModel.swift", "MemoryProcessActionViews.swift", "AIViews.swift", "AIReportViews.swift", "AIProviderEditorModel.swift", "Style.swift", "SessionDesktopModel.swift", "SessionManagementModel.swift", "SessionManagementViews.swift", "SessionViews.swift", "SessionProjectViews.swift", "SessionHandoffAIViews.swift"]]
         architecture = platform.machine()
         if architecture not in {"arm64", "x86_64"}:
             raise RuntimeError(f"不支持的 macOS 架构：{architecture}")
