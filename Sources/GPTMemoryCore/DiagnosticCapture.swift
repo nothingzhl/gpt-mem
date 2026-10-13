@@ -2,12 +2,16 @@ import Foundation
 import Darwin
 import CNative
 
-public struct DiagnosticResult: Codable {
+public struct DiagnosticResult: Codable, Sendable {
     public var pid: Int
     public var outputPath: String
     public var exitCode: Int32
     public var timedOut: Bool
     public var partial: Bool
+    public init(pid: Int, outputPath: String, exitCode: Int32, timedOut: Bool, partial: Bool) {
+        self.pid = pid; self.outputPath = outputPath; self.exitCode = exitCode
+        self.timedOut = timedOut; self.partial = partial
+    }
 }
 
 public enum DiagnosticCapture {

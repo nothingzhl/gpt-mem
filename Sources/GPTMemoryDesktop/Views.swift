@@ -42,6 +42,7 @@ struct MemoryDesktopView: View {
     @State private var selectedPage: MemoryPage = .overview
     @State private var selectedRole: ProcessRole?
     @State private var minutes = 30
+    @State private var focusedProcessKey: String?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -56,13 +57,14 @@ struct MemoryDesktopView: View {
                         OverviewContent(snapshot: model.snapshot, history: model.history,
                                         analysis: model.analysis, minutes: $minutes,
                                         aiModel: model.aiModel, onAIAnalysis: model.prepareMemoryAIAnalysis,
-                                        onOpenReports: { selectedPage = .reports }) { role in
+                                        onOpenReports: { selectedPage = .reports }, onLocate: locateProcess) { role in
                             selectedRole = role; selectedPage = .processes
                         }.padding(.horizontal, 28).padding(.bottom, 28)
                     }
                 case .processes:
                     ProcessesContent(snapshot: model.snapshot, selectedRole: $selectedRole,
-                                     isBusy: model.isBusy) { model.diagnose(process: $0) }
+                                     isBusy: model.isBusy, focusedKey: $focusedProcessKey,
+                                     actions: model.processActions, history: model.history) { model.diagnose(process: $0) }
                         .padding(.horizontal, 28).padding(.bottom, 24)
                 case .history:
                     ScrollView {
@@ -70,7 +72,7 @@ struct MemoryDesktopView: View {
                                        minutes: $minutes, isBusy: model.isBusy,
                                        lastExportURL: model.lastExportURL,
                                        aiModel: model.aiModel, onAIAnalysis: model.prepareMemoryAIAnalysis,
-                                       onOpenReports: { selectedPage = .reports }) { model.exportReport() }
+                                       onOpenReports: { selectedPage = .reports }, onLocate: locateProcess) { model.exportReport() }
                             .padding(.horizontal, 28).padding(.bottom, 28)
                     }
                 case .sessions:
@@ -99,6 +101,14 @@ struct MemoryDesktopView: View {
             model.isSessionWorkspaceActive = value == .sessions
             model.isReportLibraryActive = value == .reports
         }
+    }
+
+    private func locateProcess(_ key: String) {
+        guard model.snapshot?.processes.contains(where: { $0.key == key }) == true else {
+            model.noticeMessage = "这个历史进程当前不在采样列表中；请刷新后核对，不能仅按旧 PID 操作。"
+            return
+        }
+        selectedRole = nil; focusedProcessKey = key; selectedPage = .processes
     }
 
     private var sidebar: some View {
@@ -225,11 +235,12 @@ private struct OverviewContent: View {
     let aiModel: DesktopAIModel
     let onAIAnalysis: () -> Void
     let onOpenReports: () -> Void
+    var onLocate: (String) -> Void = { _ in }
     let onRoleSelect: (ProcessRole) -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             metrics
-            AnalysisConclusionCard(analysis: analysis, minutes: minutes, findingLimit: 3)
+            AnalysisConclusionCard(analysis: analysis, minutes: minutes, findingLimit: 3, onLocate: onLocate)
             AIAnalysisCard(model: aiModel, hasInput: (analysis?.sampleCount ?? 0) >= 2, onPrepare: onAIAnalysis,
                            onOpenReports: onOpenReports)
             HStack(alignment: .top, spacing: 18) {
@@ -370,6 +381,7 @@ private struct AnalysisConclusionCard: View {
     let analysis: MemoryAnalysis?
     let minutes: Int
     var findingLimit: Int? = nil
+    var onLocate: (String) -> Void = { _ in }
 
     var body: some View {
         MemoryCard {
@@ -406,6 +418,12 @@ private struct AnalysisConclusionCard: View {
                                         Text(finding.title).font(.system(size: 12, weight: .medium))
                                         Text(finding.detail).font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
                                     }.textSelection(.enabled)
+                                    if let key = finding.processKey {
+                                        Spacer(minLength: 4)
+                                        Button { onLocate(key) } label: {
+                                            Text("定位进程").font(.system(size: 11)).frame(minHeight: 32).contentShape(Rectangle())
+                                        }.buttonStyle(.plain).foregroundStyle(MemoryStyle.accent)
+                                    }
                                 }
                             }
                             if findings.count < explanation.findings.count {
@@ -537,10 +555,14 @@ private struct ProcessTableRow: Identifiable {
     var startedAt: Date { sample.startedAt }
 }
 
-private struct ProcessesContent: View {
+struct ProcessesContent: View {
     let snapshot: MemorySnapshot?
     @Binding var selectedRole: ProcessRole?
     let isBusy: Bool
+    @Binding var focusedKey: String?
+    @ObservedObject var actions: MemoryProcessActionsModel
+    var history: [MemorySnapshot] = []
+    var initiallyExpandedActionHistory = false
     let onDiagnose: (ProcessSample) -> Void
     @State private var search = ""
     @State private var selection: String?
@@ -554,7 +576,7 @@ private struct ProcessesContent: View {
     private var selectedProcess: ProcessSample? { rows.first { $0.id == selection }?.sample }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 12) {
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass").foregroundStyle(MemoryStyle.secondary)
@@ -570,29 +592,59 @@ private struct ProcessesContent: View {
                 Spacer()
                 Text("\(rows.count) 个进程").font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
                 Button { if let selectedProcess { onDiagnose(selectedProcess) } } label: { Label("采集诊断", systemImage: "doc.text.magnifyingglass") }
-                    .disabled(selectedProcess == nil || isBusy).help("对选中的目标手动运行有界 vmmap 摘要")
+                    .disabled(selectedProcess == nil || isBusy || actions.isBusy || actions.isObserving).help("对选中的目标手动运行有界 vmmap 摘要")
+            }
+            HStack(spacing: 12) {
+                Button("请求退出") { if let selectedProcess { actions.prepare(selectedProcess, kind: .request, snapshot: snapshot, history: history) } }
+                    .disabled((selectedProcess.map { !actions.canRequest($0) } ?? true) || isBusy || actions.isBusy || actions.isObserving)
+                Button("强制结束…") { if let selectedProcess { actions.prepare(selectedProcess, kind: .force, snapshot: snapshot, history: history) } }
+                    .disabled(isBusy || (selectedProcess.map { !actions.canForce($0) } ?? true))
+                Text("先选择目标，正常退出后仍存活时可强制结束。")
+                    .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
+                Spacer()
+            }.controlSize(.large)
+            if let process = selectedProcess, !actions.canRequest(process) {
+                Text("目标可能已退出、归属未确认，或属于观察器及其父进程；请刷新核对。")
+                    .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
             }
             processTable
-            if let process = selectedProcess {
-                MemoryCard {
-                    HStack(alignment: .top, spacing: 20) {
-                        VStack(alignment: .leading, spacing: 7) {
-                            HStack { Text("PID \(process.pid)").font(.system(size: 14, weight: .semibold)); MemoryBadge(text: process.role.label) }
-                            Text("\(MemoryFormat.executable(process.executable)) · 父进程 \(process.parentPID) · \(MemoryFormat.date(process.startedAt)) 启动")
-                                .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary).textSelection(.enabled)
-                        }
-                        Spacer()
-                        VStack(alignment: .trailing, spacing: 5) {
-                            Text(MemoryFormat.bytes(process.footprintBytes)).font(.system(size: 20, weight: .semibold, design: .rounded))
-                            Text("会话归属未知").font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
+            if selectedProcess != nil || !actions.records.isEmpty || actions.message != nil || actions.recordError != nil {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    MemoryProcessActionHistory(model: actions, initiallyExpanded: initiallyExpandedActionHistory)
+                    if let process = selectedProcess {
+                        MemoryCard {
+                            HStack(alignment: .top, spacing: 20) {
+                                VStack(alignment: .leading, spacing: 7) {
+                                    HStack { Text("PID \(String(process.pid))").font(.system(size: 14, weight: .semibold)); MemoryBadge(text: process.role.label) }
+                                    Text("\(MemoryFormat.executable(process.executable)) · 父进程 \(String(process.parentPID)) · \(MemoryFormat.date(process.startedAt)) 启动")
+                                        .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary).textSelection(.enabled)
+                                    Text("程序：\(process.executable)").font(.system(size: 10)).textSelection(.enabled)
+                                    let root = snapshot?.processes.first(where: { $0.key == process.rootKey })
+                                    Text("所属应用：\(root.map { MemoryFormat.executable($0.executable) + " · PID " + String($0.pid) } ?? "当前无法确认主进程")")
+                                        .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
+                                    let children = snapshot?.processes.filter { $0.parentPID == process.pid }.map(\.pid) ?? []
+                                    Text("直接子进程：\(children.isEmpty ? "当前未发现" : children.map(String.init).joined(separator: ", "))")
+                                        .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
+                                }
+                                Spacer()
+                                VStack(alignment: .trailing, spacing: 5) {
+                                    Text(MemoryFormat.bytes(process.footprintBytes)).font(.system(size: 20, weight: .semibold, design: .rounded))
+                                    Text("会话归属未知").font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
+                                }
+                            }
                         }
                     }
                 }
+            }.frame(minHeight: 0, maxHeight: 220)
             }
-            Text("选择一行可手动采集诊断；采样不会停止目标进程。RSS 与 Footprint 口径不同，缺失 CPU 显示为未知。")
+            Text("采样保持只读；退出操作需单独确认。RSS 与 Footprint 口径不同，缺失 CPU 显示为未知。")
                 .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
         }.frame(maxHeight: .infinity, alignment: .topLeading)
             .onChange(of: selectedRole) { _, _ in selection = nil }
+            .onAppear { if let focusedKey { search = ""; selection = focusedKey; self.focusedKey = nil } }
+            .onChange(of: focusedKey) { _, value in if let value { search = ""; selection = value; focusedKey = nil } }
+            .sheet(item: $actions.pending) { request in MemoryProcessActionConfirmation(model: actions, request: request) }
     }
 
     @ViewBuilder private var processTable: some View {
@@ -616,7 +668,7 @@ private struct ProcessesContent: View {
             }.font(.system(size: 11)).tableStyle(.inset)
                 .background(MemoryStyle.surface).clipShape(RoundedRectangle(cornerRadius: 12))
                 .overlay(RoundedRectangle(cornerRadius: 12).stroke(MemoryStyle.border))
-                .frame(minHeight: 300, maxHeight: .infinity)
+                .frame(minHeight: 180, maxHeight: .infinity)
         }
     }
 }
@@ -630,6 +682,7 @@ private struct HistoryContent: View {
     let aiModel: DesktopAIModel
     let onAIAnalysis: () -> Void
     let onOpenReports: () -> Void
+    var onLocate: (String) -> Void = { _ in }
     let onExport: () -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -639,7 +692,7 @@ private struct HistoryContent: View {
                 Button(action: onExport) { Label("导出 HTML 报告", systemImage: "square.and.arrow.up") }
                     .buttonStyle(.borderedProminent).disabled(isBusy || (analysis?.sampleCount ?? 0) < 2)
             }
-            AnalysisConclusionCard(analysis: analysis, minutes: minutes)
+            AnalysisConclusionCard(analysis: analysis, minutes: minutes, onLocate: onLocate)
             AIAnalysisCard(model: aiModel, hasInput: (analysis?.sampleCount ?? 0) >= 2, onPrepare: onAIAnalysis,
                            onOpenReports: onOpenReports)
             GrowthAttribution(analysis: analysis)
@@ -813,7 +866,7 @@ private struct SettingsContent: View {
             MemoryCard {
                 VStack(alignment: .leading, spacing: 9) {
                     MemorySectionTitle(title: "观测边界")
-                    Text("内存采样只读取目标进程与系统内存指标；不停止目标进程、不保存聊天或原始命令行、不修改 Codex 配置。MCP 与 REPL 分开统计，会话归属未知。手动诊断只运行有时间与大小限制的 vmmap 摘要。AI 分析需先查看摘要并确认发送，不会自动读取诊断文件；活动说明由你决定是否填写。")
+                    Text("内存采样读取进程和系统指标，MCP 与 REPL 分开统计，会话归属未知。诊断手动运行有界 vmmap 摘要。退出操作需选中目标、核对身份并单独确认，随后检查效果；记录保存在本机。AI 分析需先查看摘要并确认发送，不会自动读取诊断文件；活动说明由你决定是否填写。")
                         .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
                     Text("Codex 会话只读原日志；标题、用量和用户提问的搜索摘要保存在本机，以加快再次打开。日志变更后更新摘要，索引损坏时重新读取。收藏、本地名称和备注单独保存在本机，重启后继续使用。")
                         .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)

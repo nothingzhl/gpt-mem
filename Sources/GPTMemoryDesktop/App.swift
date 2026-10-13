@@ -4,6 +4,7 @@ import AppKit
 final class ManagerAppDelegate: NSObject, NSApplicationDelegate {
     var reportLibrary: AIReportLibraryModel?
     var sessionManagement: SessionManagementModel?
+    var memoryModel: DesktopModel?
     private var terminationTask: Task<Void, Never>?
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -13,14 +14,17 @@ final class ManagerAppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let library = reportLibrary
         let management = sessionManagement
+        let memory = memoryModel
         guard library?.isSaving == true || library?.isRemoving == true || library?.isExporting == true
-                || management?.isSaving == true else { return .terminateNow }
+                || management?.isSaving == true || memory?.processActions.hasPendingWork == true
+                || memory?.isFileOperationInProgress == true else { return .terminateNow }
         // A completed AI response can still be queued for local persistence.
         // Let that bounded file operation finish before quitting the process.
         if terminationTask == nil {
             terminationTask = Task { @MainActor [weak self] in
                 while library?.isSaving == true || library?.isRemoving == true || library?.isExporting == true
-                        || management?.isSaving == true {
+                        || management?.isSaving == true || memory?.processActions.hasPendingWork == true
+                        || memory?.isFileOperationInProgress == true {
                     try? await Task.sleep(nanoseconds: 50_000_000)
                 }
                 self?.terminationTask = nil
@@ -43,6 +47,7 @@ struct GPTManagerApp: App {
                 .onAppear {
                     delegate.reportLibrary = model.aiModel.reportLibrary
                     delegate.sessionManagement = model.sessionModel.management
+                    delegate.memoryModel = model
                     model.startMonitoring()
                 }
                 .onDisappear { model.stopMonitoring() }

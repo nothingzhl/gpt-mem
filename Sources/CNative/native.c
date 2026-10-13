@@ -1,4 +1,5 @@
 #include "gpt_memory_native.h"
+#include <signal.h>
 #include <libproc.h>
 #include <sys/proc_info.h>
 #include <sys/resource.h>
@@ -116,6 +117,25 @@ int gpt_read_process(int pid, gpt_process_info *out) {
     if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &after, sizeof(after)) != sizeof(after) ||
         bsd.pbi_start_tvsec != after.pbi_start_tvsec || bsd.pbi_start_tvusec != after.pbi_start_tvusec) return -1;
     return 0;
+}
+
+/* Revalidate the instance immediately before signalling one positive PID.
+ * macOS has no pidfd; the final check and kill are not an atomic operation. */
+int gpt_validate_process(int pid, uint64_t birth, const char *executable) {
+    if (pid <= 1 || pid == getpid() || !birth || !executable) { errno = EINVAL; return -1; }
+    gpt_process_info live;
+    if (gpt_read_process(pid, &live) != 0) return -1;
+    if (live.start_ticks != birth || strcmp(live.executable, executable) != 0) { errno = ESRCH; return -1; }
+    struct proc_bsdinfo bsd;
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bsd, sizeof(bsd)) != sizeof(bsd)) return -1;
+    if (bsd.pbi_uid != getuid() || bsd.pbi_ruid != getuid()) { errno = EPERM; return -1; }
+    if (bsd.pbi_start_tvsec * 1000000ULL + bsd.pbi_start_tvusec != birth) { errno = ESRCH; return -1; }
+    return 0;
+}
+int gpt_signal_process(int pid, uint64_t birth, const char *executable, int signal_number) {
+    if (signal_number != SIGTERM && signal_number != SIGKILL) { errno = EINVAL; return -1; }
+    if (gpt_validate_process(pid, birth, executable) != 0) return -1;
+    return kill(pid, signal_number);
 }
 
 /* Caller asks for hints only for app-owned processes, minimizing argv reads. */

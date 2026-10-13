@@ -1,6 +1,6 @@
 import Foundation
 
-public enum ProcessRole: String, Codable, CaseIterable {
+public enum ProcessRole: String, Codable, CaseIterable, Sendable {
     case appMain = "app_main"
     case renderer, gpu
     case appService = "app_service"
@@ -33,7 +33,7 @@ public enum ProcessRole: String, Codable, CaseIterable {
     }
 }
 
-public struct ProcessSample: Codable, Equatable, Identifiable {
+public struct ProcessSample: Codable, Equatable, Identifiable, Sendable {
     public var bootID: String
     public var pid: Int
     public var parentPID: Int
@@ -73,7 +73,7 @@ public struct ProcessSample: Codable, Equatable, Identifiable {
     }
 }
 
-public struct SystemMemorySample: Codable, Equatable {
+public struct SystemMemorySample: Codable, Equatable, Sendable {
     public var physicalBytes: UInt64
     public var compressedPhysicalBytes: UInt64?
     public var swapUsedBytes: UInt64?
@@ -86,7 +86,7 @@ public struct SystemMemorySample: Codable, Equatable {
     }
 }
 
-public struct MemorySnapshot: Codable, Equatable {
+public struct MemorySnapshot: Codable, Equatable, Sendable {
     public var id: String
     public var capturedAt: Date
     public var processes: [ProcessSample]

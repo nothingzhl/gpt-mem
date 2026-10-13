@@ -37,7 +37,9 @@ final class DesktopModel: ObservableObject {
     let databaseURL: URL
     let aiModel: DesktopAIModel
     let sessionModel: SessionDesktopModel
+    let processActions: MemoryProcessActionsModel
     private var isPerformingFileOperation = false
+    var isFileOperationInProgress: Bool { isPerformingFileOperation }
 
     var displayedErrorMessage: String? {
         let messages = [errorMessage, historyErrorMessage].compactMap { $0 }
@@ -73,6 +75,8 @@ final class DesktopModel: ObservableObject {
         aiModel = DesktopAIModel(configurationStore: AIConfigurationStore(url: directory.appendingPathComponent("ai-services.json")))
         sessionModel = SessionDesktopModel(indexDirectoryURL: directory.appendingPathComponent("session-index", isDirectory: true),
             managementDirectoryURL: directory.appendingPathComponent("session-management", isDirectory: true))
+        processActions = MemoryProcessActionsModel(directoryURL: directory.appendingPathComponent("process-actions", isDirectory: true))
+        processActions.didRequestExit = { [weak self] in self?.refresh() }
         let saved = UserDefaults.standard.double(forKey: "samplingInterval")
         if [1.0, 2.0, 5.0, 10.0].contains(saved) { interval = saved }
     }
@@ -149,6 +153,8 @@ final class DesktopModel: ObservableObject {
         panel.allowedContentTypes = [.plainText]
         panel.nameFieldStringValue = "GPT-PID-\(process.pid)-\(Int(Date().timeIntervalSince1970)).txt"
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        let diagnosticSnapshot = snapshot
+        let diagnosticHistory = history
         isPerformingFileOperation = true; isBusy = true
         service.diagnose(process: process, output: url) { [weak self] result in
             DispatchQueue.main.async {
@@ -156,6 +162,8 @@ final class DesktopModel: ObservableObject {
                 self.isPerformingFileOperation = false; self.isBusy = false
                 switch result {
                 case .success(let diagnostic):
+                    self.processActions.recordDiagnostic(process: process, snapshot: diagnosticSnapshot,
+                                                         history: diagnosticHistory, result: diagnostic)
                     self.lastDiagnosticURL = url
                     self.noticeMessage = diagnostic.partial ? "摘要已保存；部分内存区域未能解析，结果不完整。" : "进程内存摘要已保存。"
                 case .failure(let error): self.errorMessage = String(describing: error)
