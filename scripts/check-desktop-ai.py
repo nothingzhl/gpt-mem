@@ -663,9 +663,9 @@ def main() -> int:
         swift_main.write_text(SWIFT_CHECKS, encoding="utf-8")
         executable = directory / "desktop-ai-checks"
         desktop = project / "Sources" / "GPTMemoryDesktop"
-        sources = [desktop / "DesktopAIModel.swift"]
+        sources = [desktop / "DesktopAIModel.swift", desktop / "AIReportLibraryModel.swift"]
         if output:
-            sources += [desktop / name for name in ["DesktopModel.swift", "Views.swift", "AIViews.swift", "AIProviderEditorModel.swift", "Style.swift", "SessionDesktopModel.swift", "SessionViews.swift", "SessionProjectViews.swift"]]
+            sources += [desktop / name for name in ["DesktopModel.swift", "Views.swift", "AIViews.swift", "AIReportViews.swift", "AIProviderEditorModel.swift", "Style.swift", "SessionDesktopModel.swift", "SessionViews.swift", "SessionProjectViews.swift"]]
         architecture = platform.machine()
         if architecture not in {"arm64", "x86_64"}:
             raise RuntimeError(f"不支持的 macOS 架构：{architecture}")

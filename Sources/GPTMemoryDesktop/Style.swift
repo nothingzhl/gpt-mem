@@ -146,6 +146,7 @@ enum MemoryFormat {
     }
     private static let timeFormatter = formatter("HH:mm:ss")
     private static let dateFormatter = formatter("MM-dd HH:mm:ss")
+    private static let fullDateFormatter = formatter("yyyy-MM-dd HH:mm:ss")
     static func bytes(_ bytes: UInt64) -> String {
         if bytes >= 1_073_741_824 { return String(format: "%.2f GiB", Double(bytes) / 1_073_741_824) }
         return String(format: "%.1f MiB", Double(bytes) / 1_048_576)
@@ -157,6 +158,9 @@ enum MemoryFormat {
     }
     static func date(_ date: Date) -> String {
         dateFormatter.string(from: date)
+    }
+    static func fullDate(_ date: Date) -> String {
+        fullDateFormatter.string(from: date)
     }
     static func pressure(_ value: Int?) -> String {
         switch value {

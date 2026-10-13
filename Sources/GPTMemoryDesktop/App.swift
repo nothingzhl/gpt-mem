@@ -2,11 +2,29 @@ import SwiftUI
 import AppKit
 
 final class ManagerAppDelegate: NSObject, NSApplicationDelegate {
+    var reportLibrary: AIReportLibraryModel?
+    private var terminationTask: Task<Void, Never>?
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let library = reportLibrary,
+              library.isSaving || library.isRemoving || library.isExporting else { return .terminateNow }
+        // A completed AI response can still be queued for local persistence.
+        // Let that bounded file operation finish before quitting the process.
+        if terminationTask == nil {
+            terminationTask = Task { @MainActor [weak self] in
+                while library.isSaving || library.isRemoving || library.isExporting {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
+                self?.terminationTask = nil
+                sender.reply(toApplicationShouldTerminate: true)
+            }
+        }
+        return .terminateLater
+    }
 }
 
 @main
@@ -18,7 +36,10 @@ struct GPTManagerApp: App {
         WindowGroup("GPT Manager") {
             MemoryDesktopView(model: model)
                 .frame(minWidth: 1000, minHeight: 680)
-                .onAppear { model.startMonitoring() }
+                .onAppear {
+                    delegate.reportLibrary = model.aiModel.reportLibrary
+                    model.startMonitoring()
+                }
                 .onDisappear { model.stopMonitoring() }
         }
         .defaultSize(width: 1160, height: 790)
@@ -26,9 +47,9 @@ struct GPTManagerApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
             CommandGroup(after: .toolbar) {
-                Button(model.isSessionWorkspaceActive ? "刷新 Codex 会话" : "刷新内存数据") { model.refreshCurrentPage() }
+                Button(model.isReportLibraryActive ? "刷新 AI 报告" : (model.isSessionWorkspaceActive ? "刷新 Codex 会话" : "刷新内存数据")) { model.refreshCurrentPage() }
                     .keyboardShortcut("r", modifiers: [.command])
-                    .disabled(!model.isSessionWorkspaceActive && model.isBusy)
+                    .disabled(!model.isSessionWorkspaceActive && !model.isReportLibraryActive && model.isBusy)
                 Button(model.isMonitoring ? "暂停采集" : "开始采集") {
                     model.isMonitoring ? model.stopMonitoring() : model.startMonitoring()
                 }.keyboardShortcut("p", modifiers: [.command, .shift])

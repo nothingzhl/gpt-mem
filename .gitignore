@@ -10,6 +10,7 @@ __pycache__/
 .DS_Store
 reports/
 ai-services.json
+ai-reports/
 .env
 .env.*
 !.env.example

@@ -31,6 +31,7 @@ final class DesktopModel: ObservableObject {
     @Published var windowSeconds: TimeInterval = 1800
     @Published var modeLabel = "准备就绪"
     @Published var isSessionWorkspaceActive = false
+    @Published var isReportLibraryActive = false
     @Published var lastExportURL: URL?
     @Published var lastDiagnosticURL: URL?
     let databaseURL: URL
@@ -81,7 +82,10 @@ final class DesktopModel: ObservableObject {
     func stopMonitoring() { service.stop() }
     func refresh() { isBusy = true; service.refresh(window: windowSeconds) }
     func refreshCurrentPage() {
-        if isSessionWorkspaceActive {
+        if isReportLibraryActive {
+            guard !aiModel.reportLibrary.isLoading else { return }
+            aiModel.reportLibrary.refresh()
+        } else if isSessionWorkspaceActive {
             guard !sessionModel.isLoading else { return }
             sessionModel.refresh()
         } else {

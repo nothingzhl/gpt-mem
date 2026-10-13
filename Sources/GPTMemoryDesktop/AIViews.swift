@@ -275,6 +275,7 @@ struct AIAnalysisCard: View {
     @ObservedObject var model: DesktopAIModel
     let hasInput: Bool
     let onPrepare: () -> Void
+    var onOpenReports: (() -> Void)? = nil
 
     var body: some View {
         MemoryCard {
@@ -282,6 +283,9 @@ struct AIAnalysisCard: View {
                 HStack(alignment: .top) {
                     MemorySectionTitle(title: "AI 深入分析", subtitle: "结合本地事实提出原因假设与检查建议，需进一步验证")
                     Spacer()
+                    if let onOpenReports {
+                        Button(action: onOpenReports) { Label("报告库", systemImage: "doc.text") }
+                    }
                     if model.isAnalyzing {
                         ProgressView().controlSize(.small)
                         Button("取消分析") { model.cancelAnalysis() }
@@ -340,6 +344,7 @@ struct AIAnalysisCard: View {
                 if let status = model.statusMessage {
                     Text(status).font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
                 }
+                AIReportSaveStatus(model: model.reportLibrary)
                 if let record = model.record {
                     AIAnalysisResultContent(record: record, input: model.recordInput,
                                             subjectLabels: model.recordSubjectLabels, isStale: model.resultIsStale)
@@ -424,27 +429,31 @@ private struct AIAnalysisPreviewView: View {
     }
 }
 
-private struct AIAnalysisResultContent: View {
+struct AIAnalysisResultContent: View {
     let record: AIAnalysisRecord
     let input: AIAnalysisInput?
     let subjectLabels: [String: String]
     let isStale: Bool
+    var isHistorical = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Divider().overlay(MemoryStyle.border)
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("\(record.providerName) · \(record.model) · \(MemoryFormat.date(record.generatedAt)) 生成")
+                    Text("\(record.providerName) · \(record.model) · \(displayDate(record.generatedAt)) 生成")
                         .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
-                    Text("分析窗口：\(MemoryFormat.date(record.windowStart)) → \(MemoryFormat.date(record.windowEnd))")
+                    Text("分析窗口：\(displayDate(record.windowStart)) → \(displayDate(record.windowEnd))")
                         .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
                 }
                 Spacer()
-                MemoryBadge(text: isStale ? "窗口 / 说明 / 来源已变化" : "本次窗口结果", color: isStale ? MemoryStyle.orange : MemoryStyle.accent)
+                MemoryBadge(text: isHistorical ? "历史快照" : (isStale ? "窗口 / 说明 / 来源已变化" : "本次窗口结果"), color: isStale ? MemoryStyle.orange : MemoryStyle.accent)
                 if record.wasCached { MemoryBadge(text: "缓存", color: MemoryStyle.secondary) }
             }
-            if isStale {
+            if isHistorical {
+                Text("这份报告保留生成时的结论和依据，请按上方标注的观察窗口阅读。检查建议中的对象状态也属于当时的记录。")
+                    .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
+            } else if isStale {
                 Text("窗口、活动说明或来源已变化；以下结论只适用于分析时的摘要和上方标注的窗口及来源。")
                     .font(.system(size: 11)).foregroundStyle(MemoryStyle.orange)
             }
@@ -492,6 +501,10 @@ private struct AIAnalysisResultContent: View {
                 }
             }
         }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func displayDate(_ date: Date) -> String {
+        isHistorical ? MemoryFormat.fullDate(date) : MemoryFormat.date(date)
     }
 
     private func evidence(_ ids: [String]) -> some View {

@@ -19,6 +19,7 @@ private struct FrozenAIAnalysisModule: AIAnalysisModule {
 /// Shared desktop state for provider settings and manual analysis of any module.
 @MainActor
 final class DesktopAIModel: ObservableObject {
+    let reportLibrary: AIReportLibraryModel
     @Published private(set) var settings = AISettings()
     @Published private(set) var configurationError: String?
     @Published private(set) var operationError: String?
@@ -42,15 +43,24 @@ final class DesktopAIModel: ObservableObject {
     private var requestID: UUID?
     private var recordWindowSelectionSeconds: TimeInterval?
     private var recordConfiguration: AIProviderConfiguration?
+    private var reportLibraryObservation: AnyCancellable?
 
     init(configurationStore: AIConfigurationStore,
          credentials: AICredentialStore = KeychainAICredentialStore(),
-         coordinator: AIAnalysisCoordinator? = nil) {
+         coordinator: AIAnalysisCoordinator? = nil,
+         reportLibrary: AIReportLibraryModel? = nil) {
         self.configurationStore = configurationStore
         self.credentials = credentials
         self.coordinator = coordinator ?? AIAnalysisCoordinator(credentials: credentials)
+        self.reportLibrary = reportLibrary ?? AIReportLibraryModel(store: AIReportStore(
+            directoryURL: configurationStore.url.deletingLastPathComponent().appendingPathComponent("ai-reports", isDirectory: true)))
+        reportLibraryObservation = self.reportLibrary.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
         reloadSettings()
     }
+
+    var reportSaveError: String? { reportLibrary.saveErrorMessage }
 
     var selectedProvider: AIProviderConfiguration? {
         settings.providers.first { $0.id == settings.selectedProviderID }
@@ -312,6 +322,9 @@ final class DesktopAIModel: ObservableObject {
                 self.recordConfiguration = prepared.configuration
                 self.recordWindowSelectionSeconds = prepared.windowSelectionSeconds
                 self.statusMessage = output.wasCached ? "已读取相同摘要的本机缓存。" : "分析完成。"
+                self.reportLibrary.save(record: output, input: prepared.input,
+                                        subjectLabels: prepared.subjectLabels,
+                                        windowSelectionSeconds: prepared.windowSelectionSeconds)
                 self.finishRequest(id)
             } catch {
                 guard let self, self.requestID == id else { return }

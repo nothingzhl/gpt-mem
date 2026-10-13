@@ -3,7 +3,7 @@ import Charts
 import GPTMemoryCore
 
 private enum MemoryPage: String, CaseIterable, Identifiable {
-    case overview, processes, history, sessions, settings
+    case overview, processes, history, sessions, reports, settings
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -11,6 +11,7 @@ private enum MemoryPage: String, CaseIterable, Identifiable {
         case .processes: return "进程明细"
         case .history: return "历史与报告"
         case .sessions: return "Codex 工作区"
+        case .reports: return "AI 报告库"
         case .settings: return "设置"
         }
     }
@@ -20,6 +21,7 @@ private enum MemoryPage: String, CaseIterable, Identifiable {
         case .processes: return "list.bullet.rectangle"
         case .history: return "clock.arrow.circlepath"
         case .sessions: return "folder"
+        case .reports: return "doc.text"
         case .settings: return "slider.horizontal.3"
         }
     }
@@ -29,6 +31,7 @@ private enum MemoryPage: String, CaseIterable, Identifiable {
         case .processes: return "按进程查看真实 Footprint，区分页面、MCP 与执行器。"
         case .history: return "用已有采样追踪进程变化，导出可离线查看的报告。"
         case .sessions: return "按项目查看会话、用量分布和活跃情况。"
+        case .reports: return "保存和回看 AI 分析结论、冻结的依据，导出离线报告。"
         case .settings: return "调整本机采样、历史记录和共用的 AI 分析来源。"
         }
     }
@@ -46,13 +49,14 @@ struct MemoryDesktopView: View {
             Rectangle().fill(MemoryStyle.border).frame(width: 1)
             VStack(alignment: .leading, spacing: 0) {
                 header.padding(.horizontal, 28).padding(.top, 28).padding(.bottom, 20)
-                if selectedPage != .sessions && (model.displayedErrorMessage != nil || model.noticeMessage != nil) { messageBanner.padding(.horizontal, 28).padding(.bottom, 16) }
+                if selectedPage != .sessions && selectedPage != .reports && (model.displayedErrorMessage != nil || model.noticeMessage != nil) { messageBanner.padding(.horizontal, 28).padding(.bottom, 16) }
                 switch selectedPage {
                 case .overview:
                     ScrollView {
                         OverviewContent(snapshot: model.snapshot, history: model.history,
                                         analysis: model.analysis, minutes: $minutes,
-                                        aiModel: model.aiModel, onAIAnalysis: model.prepareMemoryAIAnalysis) { role in
+                                        aiModel: model.aiModel, onAIAnalysis: model.prepareMemoryAIAnalysis,
+                                        onOpenReports: { selectedPage = .reports }) { role in
                             selectedRole = role; selectedPage = .processes
                         }.padding(.horizontal, 28).padding(.bottom, 28)
                     }
@@ -65,11 +69,15 @@ struct MemoryDesktopView: View {
                         HistoryContent(analysis: model.analysis, snapshot: model.snapshot,
                                        minutes: $minutes, isBusy: model.isBusy,
                                        lastExportURL: model.lastExportURL,
-                                       aiModel: model.aiModel, onAIAnalysis: model.prepareMemoryAIAnalysis) { model.exportReport() }
+                                       aiModel: model.aiModel, onAIAnalysis: model.prepareMemoryAIAnalysis,
+                                       onOpenReports: { selectedPage = .reports }) { model.exportReport() }
                             .padding(.horizontal, 28).padding(.bottom, 28)
                     }
                 case .sessions:
                     SessionWorkspaceHost(model: model.sessionModel).equatable()
+                        .padding(.horizontal, 28).padding(.bottom, 24)
+                case .reports:
+                    AIReportsContent(model: model.aiModel.reportLibrary)
                         .padding(.horizontal, 28).padding(.bottom, 24)
                 case .settings:
                     ScrollView {
@@ -87,7 +95,10 @@ struct MemoryDesktopView: View {
         .frame(minWidth: 1000, minHeight: 680)
         .onChange(of: minutes) { _, value in model.setWindow(seconds: Double(value * 60)) }
         .onChange(of: model.interval) { _, value in model.setInterval(value) }
-        .onChange(of: selectedPage) { _, value in model.isSessionWorkspaceActive = value == .sessions }
+        .onChange(of: selectedPage) { _, value in
+            model.isSessionWorkspaceActive = value == .sessions
+            model.isReportLibraryActive = value == .reports
+        }
     }
 
     private var sidebar: some View {
@@ -151,7 +162,7 @@ struct MemoryDesktopView: View {
                     else { model.prepareMemoryAIAnalysis() }
                 }
             }
-            if selectedPage != .sessions {
+            if selectedPage != .sessions && selectedPage != .reports {
                 if model.isBusy { ProgressView().controlSize(.small) }
                 Button { model.refresh() } label: { Image(systemName: "arrow.clockwise").frame(width: 24, height: 24) }
                     .buttonStyle(.bordered).controlSize(.regular).disabled(model.isBusy).help("刷新当前采样与历史").accessibilityLabel("刷新内存数据")
@@ -213,12 +224,14 @@ private struct OverviewContent: View {
     @Binding var minutes: Int
     let aiModel: DesktopAIModel
     let onAIAnalysis: () -> Void
+    let onOpenReports: () -> Void
     let onRoleSelect: (ProcessRole) -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             metrics
             AnalysisConclusionCard(analysis: analysis, minutes: minutes, findingLimit: 3)
-            AIAnalysisCard(model: aiModel, hasInput: (analysis?.sampleCount ?? 0) >= 2, onPrepare: onAIAnalysis)
+            AIAnalysisCard(model: aiModel, hasInput: (analysis?.sampleCount ?? 0) >= 2, onPrepare: onAIAnalysis,
+                           onOpenReports: onOpenReports)
             HStack(alignment: .top, spacing: 18) {
                 MemoryCard {
                     VStack(alignment: .leading, spacing: 20) {
@@ -616,6 +629,7 @@ private struct HistoryContent: View {
     let lastExportURL: URL?
     let aiModel: DesktopAIModel
     let onAIAnalysis: () -> Void
+    let onOpenReports: () -> Void
     let onExport: () -> Void
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -626,7 +640,8 @@ private struct HistoryContent: View {
                     .buttonStyle(.borderedProminent).disabled(isBusy || (analysis?.sampleCount ?? 0) < 2)
             }
             AnalysisConclusionCard(analysis: analysis, minutes: minutes)
-            AIAnalysisCard(model: aiModel, hasInput: (analysis?.sampleCount ?? 0) >= 2, onPrepare: onAIAnalysis)
+            AIAnalysisCard(model: aiModel, hasInput: (analysis?.sampleCount ?? 0) >= 2, onPrepare: onAIAnalysis,
+                           onOpenReports: onOpenReports)
             GrowthAttribution(analysis: analysis)
             if let analysis, analysis.sampleCount >= 2 {
                 candidates(analysis)
