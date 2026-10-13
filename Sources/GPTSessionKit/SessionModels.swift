@@ -1,7 +1,7 @@
 import Foundation
 
 /// Recorded counts only. Cached input is included in input; reasoning is included in output.
-public struct CodexTokenUsage: Equatable, Sendable {
+public struct CodexTokenUsage: Codable, Equatable, Sendable {
     public let input: Int?
     public let cachedInput: Int?
     public let output: Int?
@@ -125,7 +125,7 @@ private struct CheckedTokenCount {
     mutating func markOverflow() { total = nil; overflowed = true }
 }
 
-public struct CodexSessionSummary: Identifiable, Equatable, Sendable {
+public struct CodexSessionSummary: Codable, Identifiable, Equatable, Sendable {
     public let id: String
     public let sessionID: String
     public let fileURL: URL
@@ -240,5 +240,7 @@ public struct SessionReadMetrics: Equatable, Sendable {
     public var titleIndexBytesRead = 0
     public var parsedRolloutFiles = 0
     public var cachedRolloutFiles = 0
+    /// Summary hits hydrated from the optional private on-disk index during this read.
+    public var persistedRolloutFiles = 0
     public init() {}
 }

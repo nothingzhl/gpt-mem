@@ -11,6 +11,7 @@ __pycache__/
 reports/
 ai-services.json
 ai-reports/
+session-index/
 .env
 .env.*
 !.env.example

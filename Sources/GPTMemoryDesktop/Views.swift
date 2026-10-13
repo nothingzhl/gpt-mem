@@ -813,7 +813,9 @@ private struct SettingsContent: View {
             MemoryCard {
                 VStack(alignment: .leading, spacing: 9) {
                     MemorySectionTitle(title: "观测边界")
-                    Text("只读取目标进程与系统内存指标；不停止目标进程、不保存聊天或原始命令行、不修改 Codex 配置。MCP 与 REPL 分开统计，会话归属未知。手动诊断只运行有时间与大小限制的 vmmap 摘要。AI 分析需先查看摘要并确认发送，不会自动读取诊断文件；活动说明由你决定是否填写。")
+                    Text("内存采样只读取目标进程与系统内存指标；不停止目标进程、不保存聊天或原始命令行、不修改 Codex 配置。MCP 与 REPL 分开统计，会话归属未知。手动诊断只运行有时间与大小限制的 vmmap 摘要。AI 分析需先查看摘要并确认发送，不会自动读取诊断文件；活动说明由你决定是否填写。")
+                        .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
+                    Text("Codex 会话只读原日志；标题、用量和用户提问的搜索摘要保存在本机，以加快再次打开。日志变更后更新摘要，索引损坏时重新读取。")
                         .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
                 }.frame(maxWidth: .infinity, alignment: .leading)
             }

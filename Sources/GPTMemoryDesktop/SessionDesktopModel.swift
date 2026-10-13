@@ -202,8 +202,8 @@ final class SessionDesktopModel: ObservableObject {
     private var tokenTotals: [SessionTokenMetric: SessionTokenTotal] = [:]
     private var pendingSelectionReload = false
 
-    init(rootURL: URL = CodexSessionRepository.defaultRootURL) {
-        let repository = CodexSessionRepository(rootURL: rootURL)
+    init(rootURL: URL = CodexSessionRepository.defaultRootURL, indexDirectoryURL: URL? = nil) {
+        let repository = CodexSessionRepository(rootURL: rootURL, indexDirectoryURL: indexDirectoryURL)
         self.rootURL = rootURL
         catalogLoader = { try repository.loadCatalog() }
         transcriptLoader = { try repository.loadTranscript(for: $0) }

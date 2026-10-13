@@ -19,6 +19,9 @@ public enum SessionReadError: Error, LocalizedError {
 public final class CodexSessionRepository: SessionRepository, @unchecked Sendable {
     public let rootURL: URL
     private let limits: SessionReadLimits
+    private let indexStore: SessionIndexStore?
+    private var persistentIndexLoaded = false
+    private var persistentIndexDirty = false
     private let lock = NSLock()
     private var cache: [String: CacheEntry] = [:]
     private var transcriptCache: [String: TranscriptCacheEntry] = [:]
@@ -42,9 +45,12 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
         return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex", isDirectory: true)
     }
 
-    public init(rootURL: URL = CodexSessionRepository.defaultRootURL, limits: SessionReadLimits = .init()) {
-        self.rootURL = rootURL.standardizedFileURL.resolvingSymlinksInPath()
+    public init(rootURL: URL = CodexSessionRepository.defaultRootURL, limits: SessionReadLimits = .init(),
+                indexDirectoryURL: URL? = nil) {
+        let canonicalRoot = rootURL.standardizedFileURL.resolvingSymlinksInPath()
+        self.rootURL = canonicalRoot
         self.limits = limits
+        indexStore = indexDirectoryURL.map { SessionIndexStore(directoryURL: $0, rootURL: canonicalRoot, limits: limits) }
     }
 
     public func loadCatalog() throws -> SessionCatalog {
@@ -62,6 +68,7 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
             transcriptCache.removeAll(); transcriptAccessOrder.removeAll(); transcriptCacheBytes = 0
             titleIndexCache = nil
             catalogContinuation = nil
+            persistentIndexLoaded = false
             return SessionCatalog(warnings: ["尚未找到 Codex 根目录；首次使用 Codex 后刷新，或选择已有目录。"])
         }
         guard isDirectory.boolValue, FileManager.default.isReadableFile(atPath: rootURL.path) else {
@@ -115,7 +122,9 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
         if let continuation = catalogContinuation, !candidatePaths.contains(continuation.candidate.url.path) {
             catalogContinuation = nil
         }
+        if cache.keys.contains(where: { !candidatePaths.contains($0) }) { persistentIndexDirty = true }
         cache = cache.filter { candidatePaths.contains($0.key) }
+        let restoredPaths = try restoreIndex(for: candidates, warnings: &warnings)
         for path in transcriptAccessOrder where !candidatePaths.contains(path) { removeTranscript(at: path) }
         var sessions: [CodexSessionSummary] = []
         var missingMetadataPaths: Set<String> = []
@@ -123,12 +132,29 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
         for candidate in candidates {
             try Task.checkCancellation()
             if let cached = cache[candidate.url.path], cached.matches(candidate) {
-                readMetrics.cachedRolloutFiles += 1
-                sessions.append(cached.summary)
-                if cached.warnings.contains(where: { $0.contains("缺少有效 session_meta") }) { missingMetadataPaths.insert(candidate.url.path) }
-                cached.warnings.forEach { appendWarning("\(candidate.url.lastPathComponent)：\($0)", to: &warnings) }
+                // A disk index is only a shortcut to parsing. Validate the source
+                // through the same no-symlink open used by a fresh file read.
+                do {
+                    let handle = try safeHandle(for: candidate.url)
+                    defer { try? handle.close() }
+                    guard candidate.matches(descriptor: handle.fileDescriptor) else {
+                        cache.removeValue(forKey: candidate.url.path); persistentIndexDirty = true
+                        appendWarning("\(candidate.url.lastPathComponent)：读取期间文件发生变化，请刷新以更新。", to: &warnings)
+                        continue
+                    }
+                    readMetrics.cachedRolloutFiles += 1
+                    if restoredPaths.contains(candidate.url.path) { readMetrics.persistedRolloutFiles += 1 }
+                    sessions.append(cached.summary)
+                    if cached.warnings.contains(where: { $0.contains("缺少有效 session_meta") }) { missingMetadataPaths.insert(candidate.url.path) }
+                    cached.warnings.forEach { appendWarning("\(candidate.url.lastPathComponent)：\($0)", to: &warnings) }
+                } catch is CancellationError { throw CancellationError() }
+                catch {
+                    cache.removeValue(forKey: candidate.url.path); persistentIndexDirty = true
+                    appendWarning("\(candidate.url.lastPathComponent)：无法验证原日志，未使用保存的摘要。", to: &warnings)
+                }
                 continue
             }
+            if cache.removeValue(forKey: candidate.url.path) != nil { persistentIndexDirty = true }
             let remaining = limits.maximumCatalogReadBytes - readBytes
             guard remaining > 0 else {
                 appendWarning("本次索引读取已达 \(limits.maximumCatalogReadBytes / 1_024 / 1_024) MiB 上限；结果不完整，后续刷新会继续读取。", to: &warnings)
@@ -143,12 +169,15 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
                 sessions.append(parsed.transcript.summary)
                 if parsed.transcript.warnings.contains(where: { $0.contains("缺少有效 session_meta") }) { missingMetadataPaths.insert(candidate.url.path) }
                 // A catalog-budget truncation must be retried on the next refresh.
-                if !parsed.catalogBudgetTruncated {
+                if !parsed.catalogBudgetTruncated && parsed.sourceIsStable {
                     cache[candidate.url.path] = CacheEntry(candidate: candidate, summary: parsed.transcript.summary,
                                                           warnings: parsed.transcript.warnings)
+                    persistentIndexDirty = true
                     if catalogContinuation?.candidate.url == candidate.url { catalogContinuation = nil }
-                } else {
+                } else if parsed.sourceIsStable {
                     catalogContinuation = parsed.continuation
+                } else if catalogContinuation?.candidate.url == candidate.url {
+                    catalogContinuation = nil
                 }
                 parsed.transcript.warnings.forEach { appendWarning("\(candidate.url.lastPathComponent)：\($0)", to: &warnings) }
             } catch is CancellationError {
@@ -167,6 +196,7 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
         }
         let titles = try loadTitleIndex(for: Set(unique.map(\.sessionID)), warnings: &warnings)
         try Task.checkCancellation()
+        try persistIndex(warnings: &warnings)
         return SessionCatalog(sessions: unique.map { applyingTitle(titles[$0.sessionID], to: $0) }, warnings: warnings)
     }
 
@@ -202,9 +232,12 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
             removeTranscript(at: candidate.url.path)
             let parsed = try parse(candidate, byteBudget: limits.maximumFileBytes)
             transcript = parsed.transcript
-            cache[candidate.url.path] = CacheEntry(candidate: candidate, summary: transcript.summary, warnings: transcript.warnings)
+            if parsed.sourceIsStable {
+                cache[candidate.url.path] = CacheEntry(candidate: candidate, summary: transcript.summary, warnings: transcript.warnings)
+                persistentIndexDirty = true
+            }
             if catalogContinuation?.candidate.url == candidate.url { catalogContinuation = nil }
-            retainTranscript(transcript, for: candidate)
+            if parsed.sourceIsStable { retainTranscript(transcript, for: candidate) }
         }
         var warnings = transcript.warnings
         let titles = try loadTitleIndex(for: [transcript.summary.sessionID], warnings: &warnings)
@@ -339,11 +372,65 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
                                    isArchived: summary.isArchived, searchText: summary.searchText)
     }
 
+    /// Hydrate only real, currently matching files. Deleted or moved logs never
+    /// become visible merely because a previous app instance indexed them.
+    private func restoreIndex(for candidates: [Candidate], warnings: inout [String]) throws -> Set<String> {
+        guard let indexStore, !persistentIndexLoaded else { return [] }
+        do {
+            let snapshot = try indexStore.load()
+            snapshot.warnings.forEach { appendWarning($0, to: &warnings) }
+            let byPath = Dictionary(candidates.map { ($0.url.path, $0) }, uniquingKeysWith: { first, _ in first })
+            var restored: Set<String> = []
+            for entry in snapshot.entries {
+                try Task.checkCancellation()
+                let url = rootURL.appendingPathComponent(entry.relativePath).standardizedFileURL
+                guard let candidate = byPath[url.path], entry.revision == candidate.indexRevision,
+                      entry.summary.id == url.path, entry.summary.fileURL.standardizedFileURL == url,
+                      entry.summary.isArchived == candidate.archived,
+                      cache[url.path]?.matches(candidate) != true else {
+                    persistentIndexDirty = true
+                    continue
+                }
+                cache[url.path] = CacheEntry(candidate: candidate, summary: entry.summary, warnings: entry.warnings)
+                restored.insert(url.path)
+            }
+            persistentIndexLoaded = true
+            return restored
+        } catch is CancellationError { throw CancellationError() }
+        catch {
+            persistentIndexLoaded = true
+            persistentIndexDirty = true
+            appendWarning("保存的会话索引暂不可用，本次重新读取原日志。", to: &warnings)
+            return []
+        }
+    }
+
+    private func persistIndex(warnings: inout [String]) throws {
+        guard let indexStore, persistentIndexDirty else { return }
+        try Task.checkCancellation()
+        let entries = cache.values.sorted {
+            $0.candidate.modified == $1.candidate.modified ? $0.candidate.url.path < $1.candidate.url.path
+                : $0.candidate.modified > $1.candidate.modified
+        }.compactMap { cached -> SessionIndexEntry? in
+            guard let path = relativePath(cached.candidate.url), let revision = cached.candidate.indexRevision else { return nil }
+            return SessionIndexEntry(relativePath: path, summary: cached.summary, revision: revision, warnings: cached.warnings)
+        }
+        do {
+            let indexWarnings = try indexStore.save(entries: entries)
+            indexWarnings.forEach { appendWarning($0, to: &warnings) }
+            persistentIndexDirty = false
+        } catch is CancellationError { throw CancellationError() }
+        catch {
+            appendWarning("会话仍可查看，本地摘要索引保存失败；下次打开可能需要重新读取日志。", to: &warnings)
+        }
+    }
+
     private func parse(_ candidate: Candidate, byteBudget: Int, retainsMessages: Bool = true,
                        continuation: CatalogContinuation? = nil) throws -> ParsedFile {
         try Task.checkCancellation()
         let handle = try safeHandle(for: candidate.url)
         defer { try? handle.close() }
+        let beganWithMatchingSource = candidate.matches(descriptor: handle.fileDescriptor)
         var parser = continuation?.parser ?? CodexRolloutParser(fileURL: candidate.url, updatedAt: candidate.modified,
                                        isArchived: candidate.archived, limits: limits, retainsMessages: retainsMessages)
         if let continuation { try handle.seek(toOffset: UInt64(continuation.bytesRead)) }
@@ -399,13 +486,19 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
             ? CatalogContinuation(candidate: candidate, parser: parser, pending: pending, oversized: oversized,
                                   bytesRead: fileBytesRead, lineNumber: lineNumber) : nil
         var snapshot = parser
+        let sourceIsStable = beganWithMatchingSource && candidate.matches(descriptor: handle.fileDescriptor)
+            && candidate.matchesCurrentPath()
+        if !sourceIsStable {
+            snapshot.warn("读取期间日志发生变化，当前摘要可能不完整；请刷新以更新，本次未保存其索引。")
+        }
         if !reachedEOF {
             snapshot.warn(catalogBudgetTruncated
                 ? "本次索引读取达到大小上限；刷新会从当前位置继续，消息和 Token 暂不完整。"
                 : "读取达到文件大小上限，仅展示已完整读取的记录；消息和 Token 可能不完整。")
         }
         return ParsedFile(transcript: snapshot.finish(), bytesRead: bytesRead,
-                          catalogBudgetTruncated: catalogBudgetTruncated, continuation: nextContinuation)
+                          catalogBudgetTruncated: catalogBudgetTruncated, continuation: nextContinuation,
+                          sourceIsStable: sourceIsStable)
     }
 
     private func relativePath(_ url: URL) -> String? {
@@ -500,12 +593,38 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
         let revision: FileRevision?
 
         init(url: URL, bytes: Int, modified: Date, archived: Bool) {
-            self.url = url; self.bytes = bytes; self.modified = modified; self.archived = archived
+            self.url = url; self.archived = archived
             var info = stat()
-            revision = Darwin.lstat(url.path, &info) == 0
-                ? FileRevision(device: info.st_dev, inode: info.st_ino,
-                               changedSeconds: info.st_ctimespec.tv_sec, changedNanoseconds: info.st_ctimespec.tv_nsec)
-                : nil
+            if Darwin.lstat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG {
+                // The identity, length and displayed update time must describe
+                // one stat result, rather than two metadata reads across an edit.
+                self.bytes = Int(info.st_size)
+                self.modified = Date(timeIntervalSince1970: Double(info.st_mtimespec.tv_sec)
+                    + Double(info.st_mtimespec.tv_nsec) / 1_000_000_000)
+                revision = FileRevision(info)
+            } else {
+                self.bytes = bytes; self.modified = modified; revision = nil
+            }
+        }
+
+        var indexRevision: SessionIndexRevision? {
+            guard let revision, revision.bytes == bytes else { return nil }
+            return SessionIndexRevision(device: UInt64(bitPattern: Int64(revision.device)), inode: UInt64(revision.inode),
+                changedSeconds: Int64(revision.changedSeconds), changedNanoseconds: Int64(revision.changedNanoseconds),
+                modifiedSeconds: Int64(revision.modifiedSeconds), modifiedNanoseconds: Int64(revision.modifiedNanoseconds),
+                bytes: bytes, archived: archived)
+        }
+
+        func matches(descriptor: Int32) -> Bool {
+            var info = stat()
+            return Darwin.fstat(descriptor, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG
+                && revision != nil && revision == FileRevision(info) && Int(info.st_size) == bytes
+        }
+
+        func matchesCurrentPath() -> Bool {
+            var info = stat()
+            return Darwin.lstat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG
+                && revision != nil && revision == FileRevision(info) && Int(info.st_size) == bytes
         }
 
         func matches(_ value: Candidate) -> Bool {
@@ -517,6 +636,13 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
     }
     private struct FileRevision: Equatable {
         let device: dev_t; let inode: ino_t; let changedSeconds: Int; let changedNanoseconds: Int
+        let modifiedSeconds: Int; let modifiedNanoseconds: Int; let bytes: Int
+        init(_ info: stat) {
+            device = info.st_dev; inode = info.st_ino
+            changedSeconds = info.st_ctimespec.tv_sec; changedNanoseconds = info.st_ctimespec.tv_nsec
+            modifiedSeconds = info.st_mtimespec.tv_sec; modifiedNanoseconds = info.st_mtimespec.tv_nsec
+            bytes = Int(info.st_size)
+        }
     }
     private struct CacheEntry {
         let candidate: Candidate; let summary: CodexSessionSummary; let warnings: [String]
@@ -531,6 +657,7 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
     private struct ParsedFile {
         let transcript: SessionTranscript; let bytesRead: Int; let catalogBudgetTruncated: Bool
         let continuation: CatalogContinuation?
+        let sourceIsStable: Bool
     }
     private struct CatalogContinuation {
         let candidate: Candidate; let parser: CodexRolloutParser; let pending: Data; let oversized: Bool

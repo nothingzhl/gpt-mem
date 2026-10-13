@@ -36,7 +36,7 @@ final class DesktopModel: ObservableObject {
     @Published var lastDiagnosticURL: URL?
     let databaseURL: URL
     let aiModel: DesktopAIModel
-    let sessionModel = SessionDesktopModel()
+    let sessionModel: SessionDesktopModel
     private var isPerformingFileOperation = false
 
     var displayedErrorMessage: String? {
@@ -71,6 +71,7 @@ final class DesktopModel: ObservableObject {
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/gpt-mem")
         databaseURL = directory.appendingPathComponent("history.sqlite3")
         aiModel = DesktopAIModel(configurationStore: AIConfigurationStore(url: directory.appendingPathComponent("ai-services.json")))
+        sessionModel = SessionDesktopModel(indexDirectoryURL: directory.appendingPathComponent("session-index", isDirectory: true))
         let saved = UserDefaults.standard.double(forKey: "samplingInterval")
         if [1.0, 2.0, 5.0, 10.0].contains(saved) { interval = saved }
     }

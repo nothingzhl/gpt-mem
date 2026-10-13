@@ -336,7 +336,13 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
     state.select("retained")
     try await waitFor({ source.calls.transcripts.count == 1 }, "detail did not start before refresh")
     state.refresh()
-    try await waitFor({ !state.isLoading && !state.isFiltering && !state.isLoadingTranscript }, "failed refresh detail recovery timed out")
+    // Finishing the new read does not synchronize the old detached worker's
+    // cancellation catch. Observe both generations before checking exact counts.
+    try await waitFor({
+        let calls = source.calls
+        return !state.isLoading && !state.isFiltering && !state.isLoadingTranscript
+            && calls.cancelledTranscripts >= 1 && calls.transcripts.count >= 2
+    }, "failed refresh detail recovery or cooperative cancellation timed out")
     try expect(source.calls.cancelledTranscripts == 1 && source.calls.transcripts.count == 2,
                "failed refresh resumes the canceled selected-detail read using the preserved catalog")
     try expect(state.selectedSessionID == "retained" && state.transcript?.summary.id == "retained",
@@ -614,6 +620,116 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
     return state
 }
 
+@MainActor func checkPersistentRepositoryReopen() async throws {
+    let root = try fixtureRoot("persistent-model")
+    let index = try fixtureRoot("persistent-model-index")
+    let directory = root.appendingPathComponent("sessions", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let alpha = directory.appendingPathComponent("alpha.jsonl")
+    let beta = directory.appendingPathComponent("beta.jsonl")
+    let gamma = directory.appendingPathComponent("gamma.jsonl")
+
+    func writeRollout(_ url: URL, id: String, prompt: String, total: Int) throws {
+        let records: [[String: Any]] = [
+            ["type": "session_meta", "timestamp": "2026-10-12T10:00:00Z",
+             "payload": ["id": id, "cwd": "/workspace/persistent-fixture"]],
+            ["type": "event_msg", "payload": ["type": "user_message", "message": prompt]],
+            ["type": "event_msg", "payload": ["type": "agent_message", "message": "离线模拟回复"]],
+            ["type": "event_msg", "payload": ["type": "token_count",
+             "info": ["total_token_usage": ["total_tokens": total]]]]
+        ]
+        let lines = try records.map { String(decoding: try JSONSerialization.data(withJSONObject: $0), as: UTF8.self) }
+        try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    try writeRollout(alpha, id: "persistent-alpha", prompt: "old-marker 原始问题", total: 123)
+    try writeRollout(beta, id: "persistent-beta", prompt: "将被删除的模拟会话", total: 456)
+    let originalAlpha = try Data(contentsOf: alpha)
+    let initial = SessionDesktopModel(rootURL: root, indexDirectoryURL: index)
+    try await load(initial)
+    try expect(initial.sessions.count == 2 && initial.total(\.effectiveTotal).value == 579,
+               "production indexed model loads the initial fixture and statistics")
+    let indexFiles = FileManager.default.enumerator(at: index, includingPropertiesForKeys: [.isRegularFileKey])?
+        .allObjects.compactMap { $0 as? URL }.filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true } ?? []
+    try expect(!indexFiles.isEmpty, "production model creates a real isolated persistent index")
+
+    let reopened = SessionDesktopModel(rootURL: root, indexDirectoryURL: index)
+    try await load(reopened)
+    try expect(reopened.sessions == initial.sessions && reopened.total(\.effectiveTotal).value == 579,
+               "a new desktop model reopens the persisted catalog with correct statistics")
+    reopened.query = "old-marker"
+    try await filtered(reopened)
+    guard let alphaID = reopened.filteredSessions.first?.id else { throw CheckFailure(message: "persistent search missing") }
+    try expect(reopened.filteredSessions.count == 1, "search is immediately usable after reopening")
+    reopened.select(alphaID)
+    try await waitFor({ !reopened.isLoadingTranscript && !reopened.isFiltering }, "persistent detail timed out")
+    try expect(reopened.transcript?.messages.first?.text == "old-marker 原始问题",
+               "persisted summary still reads the current transcript from source")
+
+    let titleRecord: [String: Any] = ["id": "persistent-alpha", "thread_name": "仅更新的会话标题"]
+    let titleData = try JSONSerialization.data(withJSONObject: titleRecord)
+    try (String(decoding: titleData, as: UTF8.self) + "\n").write(
+        to: root.appendingPathComponent("session_index.jsonl"), atomically: true, encoding: .utf8)
+    reopened.refresh()
+    try await waitFor({ !reopened.isLoading && !reopened.isFiltering && !reopened.isLoadingTranscript },
+                      "persistent title refresh timed out")
+    try expect(reopened.sessions.first { $0.id == alphaID }?.title == "仅更新的会话标题",
+               "title-only changes update an existing persisted summary")
+    let unchangedAlpha = try Data(contentsOf: alpha)
+    try expect(unchangedAlpha == originalAlpha, "index creation and title refresh never rewrite the source log")
+
+    try writeRollout(alpha, id: "persistent-alpha", prompt: "new-marker 更新后的问题", total: 900)
+    try FileManager.default.removeItem(at: beta)
+    try writeRollout(gamma, id: "persistent-gamma", prompt: "新加入的模拟会话", total: 100)
+    reopened.query = ""
+    try await filtered(reopened)
+    reopened.refresh()
+    try await waitFor({ !reopened.isLoading && !reopened.isFiltering && !reopened.isLoadingTranscript },
+                      "persistent source update timed out")
+    try expect(Set(reopened.sessions.map(\.sessionID)) == ["persistent-alpha", "persistent-gamma"],
+               "refresh replaces changed source, removes missing source and includes new source")
+    try expect(reopened.total(\.effectiveTotal).value == 1000,
+               "statistics update from current sources instead of old persisted totals")
+    try expect(reopened.transcript?.messages.first?.text == "new-marker 更新后的问题",
+               "selected detail reloads changed source without reintroducing old summary")
+
+    let updatedReopen = SessionDesktopModel(rootURL: root, indexDirectoryURL: index)
+    try await load(updatedReopen)
+    try expect(updatedReopen.sessions == reopened.sessions, "a later instance reopens updated persisted summaries")
+    updatedReopen.query = "old-marker"
+    try await filtered(updatedReopen)
+    try expect(updatedReopen.filteredSessions.isEmpty, "search after reopening drops removed source text")
+    updatedReopen.query = "new-marker"
+    try await filtered(updatedReopen)
+    try expect(updatedReopen.filteredSessions.map(\.sessionID) == ["persistent-alpha"],
+               "search after reopening includes updated source text")
+
+    let backup = root.deletingLastPathComponent().appendingPathComponent("persistent-model-backup", isDirectory: true)
+    let retainedSessions = reopened.sessions
+    let retainedTranscript = reopened.transcript
+    try FileManager.default.moveItem(at: root, to: backup)
+    do {
+        try Data("模拟无法读取的根目录".utf8).write(to: root)
+        reopened.refresh()
+        try await waitFor({ !reopened.isLoading && !reopened.isFiltering }, "persistent failed refresh timed out")
+        try expect(reopened.errorMessage != nil && reopened.sessions == retainedSessions,
+                   "failed refresh retains the last visible catalog without replacing it with stale persisted data")
+        try expect(reopened.transcript == retainedTranscript, "failed refresh preserves the completed selected transcript")
+        try FileManager.default.removeItem(at: root)
+        try FileManager.default.moveItem(at: backup, to: root)
+    } catch {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.moveItem(at: backup, to: root)
+        throw error
+    }
+    reopened.refresh()
+    try await waitFor({ !reopened.isLoading && !reopened.isFiltering && !reopened.isLoadingTranscript },
+                      "persistent recovery timed out")
+    try expect(reopened.errorMessage == nil && reopened.sessions == retainedSessions,
+               "manual refresh recovers after source access returns")
+    print("PASS persistent desktop reopening, title/source updates, deleted/new sources, search, detail and failed refresh recovery")
+}
+
 @MainActor func checkChunkPoolBoundaries() throws {
     let root = try fixtureRoot("chunk-pool-boundaries")
     let directory = root.appendingPathComponent("sessions", isDirectory: true)
@@ -726,8 +842,9 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
     let warnings = try await checkLargeWarningPresentation()
     let errors = try await checkLongErrorPresentation()
     let state = try await checkRepositoryIntegration()
+    try await checkPersistentRepositoryReopen()
     try checkChunkPoolBoundaries()
-    print("DESKTOP SESSION CHECKS PASSED: 15 workflows, \(assertionCount) assertions; isolated fixtures only")
+    print("DESKTOP SESSION CHECKS PASSED: 16 workflows, \(assertionCount) assertions; isolated fixtures only")
     #if RENDER_SESSIONS
     if let output = ProcessInfo.processInfo.environment["GPT_DESKTOP_SESSION_RENDER_PATH"] {
         try await render(state, projects: projects, indexed: indexed, warnings: warnings, errors: errors, to: output)

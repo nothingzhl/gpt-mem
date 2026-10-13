@@ -113,7 +113,7 @@ struct SessionsContent: View {
                     Label(model.isLoading ? "读取中" : "刷新", systemImage: "arrow.clockwise")
                 }.disabled(model.isLoading)
             }
-            Text("本地只读 · 用量按完整会话汇总，缓存属于输入、推理属于输出；数据缺失时显示已知合计。")
+            Text("日志只读 · 摘要保存在本机，加快再次打开。用量按完整会话汇总；缓存属于输入、推理属于输出，缺失时显示已知合计。")
                 .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
                 .textSelection(.enabled).lineLimit(2)
         }
