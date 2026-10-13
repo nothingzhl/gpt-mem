@@ -89,6 +89,9 @@ public struct SessionHandoffAIModule: AIAnalysisModule {
             lines += ["\(index + 1). \(step.action)", "   目的：\(step.purpose)"]
         }
         lines += ["", "## 限制与需要核对的内容", ""] + result.limitations.map { "- " + $0 }
+        if let prompt = input.prompt {
+            lines += ["", "## 使用提示词", "", prompt.title + (prompt.revision.map { " · v\($0)" } ?? "") + (prompt.isModified ? " · 本次已调整" : ""), "", prompt.text]
+        }
         lines += ["", input.presentation?.interpretation ?? "请核对历史摘录与当前状态。"]
         return lines.joined(separator: "\n")
     }

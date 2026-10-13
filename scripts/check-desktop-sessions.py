@@ -1564,7 +1564,7 @@ def main() -> int:
         desktop = project / "Sources" / "GPTMemoryDesktop"
         sources = [desktop / "SessionManagementModel.swift", desktop / "SessionDesktopModel.swift"]
         if output:
-            sources += [desktop / "SessionViews.swift", desktop / "SessionProjectViews.swift", desktop / "SessionManagementViews.swift", desktop / "Style.swift", desktop / "SessionHandoffAIViews.swift", desktop / "DesktopAIModel.swift", desktop / "AIReportLibraryModel.swift", desktop / "AIViews.swift", desktop / "AIReportViews.swift", desktop / "AIProviderEditorModel.swift"]
+            sources += [desktop / "SessionViews.swift", desktop / "SessionProjectViews.swift", desktop / "SessionManagementViews.swift", desktop / "Style.swift", desktop / "SessionHandoffAIViews.swift", desktop / "DesktopAIModel.swift", desktop / "AIReportLibraryModel.swift", desktop / "AIViews.swift", desktop / "AIReportViews.swift", desktop / "AIProviderEditorModel.swift", desktop / "PromptTemplateViews.swift", desktop / "PromptTemplateLibraryModel.swift"]
         command = ["swiftc", "-swift-version", "5", "-target", f"{architecture}-apple-macosx14.0",
                    "-module-cache-path", str(directory / "module-cache"), "-I", str(release / "Modules"),
                    "-I", str(release / "CNative.build"), "-o", str(executable)]

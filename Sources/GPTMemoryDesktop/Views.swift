@@ -839,6 +839,7 @@ private struct SettingsContent: View {
                 }
             }
             AISettingsView(model: aiModel)
+            PromptTemplateSettingsCard(library: aiModel.promptLibrary)
             MemoryCard {
                 VStack(alignment: .leading, spacing: 18) {
                     MemorySectionTitle(title: "采集器开销", subtitle: snapshot?.observer?.pid == Int(ProcessInfo.processInfo.processIdentifier) ? "桌面自身单列，避免把观察开销误认成 GPT 增长" : "当前显示历史记录的采集器，PID 不一定是这个桌面窗口")

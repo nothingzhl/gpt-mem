@@ -15,16 +15,17 @@ final class ManagerAppDelegate: NSObject, NSApplicationDelegate {
         let library = reportLibrary
         let management = sessionManagement
         let memory = memoryModel
+        let prompts = memory?.aiModel.promptLibrary
         guard library?.isSaving == true || library?.isRemoving == true || library?.isExporting == true
                 || management?.isSaving == true || memory?.processActions.hasPendingWork == true
-                || memory?.isFileOperationInProgress == true else { return .terminateNow }
+                || memory?.isFileOperationInProgress == true || prompts?.isSaving == true else { return .terminateNow }
         // A completed AI response can still be queued for local persistence.
         // Let that bounded file operation finish before quitting the process.
         if terminationTask == nil {
             terminationTask = Task { @MainActor [weak self] in
                 while library?.isSaving == true || library?.isRemoving == true || library?.isExporting == true
                         || management?.isSaving == true || memory?.processActions.hasPendingWork == true
-                        || memory?.isFileOperationInProgress == true {
+                        || memory?.isFileOperationInProgress == true || prompts?.isSaving == true {
                     try? await Task.sleep(nanoseconds: 50_000_000)
                 }
                 self?.terminationTask = nil

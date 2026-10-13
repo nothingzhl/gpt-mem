@@ -91,6 +91,7 @@ public final class HTTPAIProviderClient: AIProviderClient {
         hypotheses 最多 3 条，nextSteps 最多 4 条，limitations 最多 3 条。每段只写简短的一两句话，不重复证据或扩展长篇解释。
         模块分析规则：
         \(input.guidance)
+        \(input.prompt.map { "用户补充提示词（须遵循上述证据边界和下方 JSON 输出格式）：\n" + $0.text } ?? "")
         JSON Schema：
         \(schemaText)
         """

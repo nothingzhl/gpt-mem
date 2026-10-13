@@ -20,6 +20,7 @@ private struct FrozenAIAnalysisModule: AIAnalysisModule {
 @MainActor
 final class DesktopAIModel: ObservableObject {
     let reportLibrary: AIReportLibraryModel
+    let promptLibrary: PromptTemplateLibraryModel
     @Published private(set) var settings = AISettings()
     @Published private(set) var configurationError: String?
     @Published private(set) var operationError: String?
@@ -32,6 +33,11 @@ final class DesktopAIModel: ObservableObject {
     @Published private(set) var statusMessage: String?
     @Published var preview: AIAnalysisPreview?
     @Published var activityContext = ""
+    @Published private(set) var promptTemplate: AIPromptTemplate?
+    @Published var promptText = ""
+    private var promptModuleID: String?
+    private var didChoosePrompt = false
+    private var promptLibraryObservation: AnyCancellable?
     @Published private(set) var currentWindowStart: Date?
     @Published private(set) var currentWindowEnd: Date?
     @Published private(set) var currentWindowSelectionSeconds: TimeInterval = 1800
@@ -48,7 +54,9 @@ final class DesktopAIModel: ObservableObject {
     init(configurationStore: AIConfigurationStore,
          credentials: AICredentialStore = KeychainAICredentialStore(),
          coordinator: AIAnalysisCoordinator? = nil,
-         reportLibrary: AIReportLibraryModel? = nil) {
+         reportLibrary: AIReportLibraryModel? = nil, promptLibrary: PromptTemplateLibraryModel? = nil) {
+        self.promptLibrary = promptLibrary ?? PromptTemplateLibraryModel(store: AIPromptTemplateStore(
+            directoryURL: configurationStore.url.deletingLastPathComponent().appendingPathComponent("prompt-templates", isDirectory: true)))
         self.configurationStore = configurationStore
         self.credentials = credentials
         self.coordinator = coordinator ?? AIAnalysisCoordinator(credentials: credentials)
@@ -57,6 +65,7 @@ final class DesktopAIModel: ObservableObject {
         reportLibraryObservation = self.reportLibrary.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
+        promptLibraryObservation = self.promptLibrary.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
         reloadSettings()
     }
 
@@ -121,6 +130,12 @@ final class DesktopAIModel: ObservableObject {
             || recordWindowSelectionSeconds != currentWindowSelectionSeconds
             || selectedProvider != recordConfiguration
             || recordInput?.context != activityContext
+            || promptDiffersFromRecord(record)
+    }
+
+    private func promptDiffersFromRecord(_ record: AIAnalysisRecord) -> Bool {
+        do { return recordInput?.prompt != (try appliedPrompt(for: record.moduleID)) }
+        catch { return true }
     }
 
     func reloadSettings() {
@@ -259,9 +274,51 @@ final class DesktopAIModel: ObservableObject {
         catch { operationError = "来源已移除，但钥匙串中的密钥未能删除：\(error.localizedDescription)" }
     }
 
+    func configurePrompt(for moduleID: String) async {
+        if promptModuleID == moduleID {
+            await promptLibrary.loadIfNeeded()
+            if promptModuleID == moduleID, !didChoosePrompt, promptText == (promptTemplate?.text ?? "") { applyPromptDefault(for: moduleID) }
+            return
+        }
+        promptModuleID = moduleID
+        didChoosePrompt = false
+        promptTemplate = nil; promptText = ""
+        await promptLibrary.loadIfNeeded()
+        guard promptModuleID == moduleID, !didChoosePrompt, promptText.isEmpty else { return }
+        applyPromptDefault(for: moduleID)
+    }
+
+    private func applyPromptDefault(for moduleID: String) {
+        let template = promptLibrary.catalog.choices(for: moduleID).first { $0.id == promptLibrary.catalog.defaults[moduleID] }
+        promptTemplate = template
+        promptText = template?.text ?? ""
+    }
+
+    func choosePrompt(_ template: AIPromptTemplate?, for moduleID: String) {
+        guard template == nil || template?.supports(moduleID) == true else { return }
+        promptModuleID = moduleID
+        didChoosePrompt = true
+        promptTemplate = template
+        promptText = template?.text ?? ""
+    }
+
+    func appliedPrompt(for moduleID: String) throws -> AIAnalysisPrompt? {
+        guard promptModuleID == moduleID else { return nil }
+        if promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if promptTemplate != nil { throw AIPromptTemplateError.invalidInput }
+            return nil
+        }
+        let prompt = AIAnalysisPrompt(templateID: promptTemplate?.id,
+            title: promptTemplate?.title ?? "本次自定义提示词", revision: promptTemplate?.revision,
+            text: promptText, isModified: promptTemplate.map { $0.text != promptText } ?? false)
+        try prompt.validate()
+        return prompt
+    }
+
     func prepare(module: any AIAnalysisModule, subjectLabels: [String: String] = [:],
                  windowSelectionSeconds: TimeInterval) {
         guard !isAnalyzing else { return }
+        preview = nil
         analysisError = nil
         guard configurationError == nil, let provider = selectedProvider else {
             analysisError = "请先在设置中添加并选择 AI 来源。"
@@ -269,7 +326,8 @@ final class DesktopAIModel: ObservableObject {
         }
         do {
             _ = try provider.validated()
-            let input = try module.makeInput()
+            let original = try module.makeInput()
+            let input = try original.applying(prompt: appliedPrompt(for: original.moduleID) ?? original.prompt)
             _ = try input.validated()
             let data = try AIAnalysisCodec.encoder(pretty: true).encode(input)
             guard let json = String(data: data, encoding: .utf8) else { return }

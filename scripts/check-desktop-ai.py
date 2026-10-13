@@ -604,6 +604,36 @@ struct MockModelCatalog: AIModelCatalogClient {
         print("RENDER \(name)")
     }
 
+    let promptFixture = try makeFixture("render-prompts")
+    let promptLibrary = promptFixture.model.promptLibrary
+    await promptLibrary.loadIfNeeded()
+    let customPrompt = AIPromptTemplate(title: "我的交接标准", text: "先写当前目标和用户最后一次决定，再逐项列出已报告的进展、真实验证记录和待办。\n每项保留来源依据，优先标出验收缺口，结论简洁。", moduleID: "session.handoff")
+    let templateSaved = await promptLibrary.save(customPrompt, expected: nil)
+    try expect(templateSaved, "render prompt saved")
+    let managerView = AnyView(PromptTemplateManager(library: promptLibrary, initial: customPrompt))
+    let settingsView = AnyView(PromptTemplateSettingsCard(library: promptLibrary))
+    promptFixture.model.choosePrompt(AIPromptTemplate.builtIns[0], for: "fixture")
+    promptFixture.model.promptText += "优先给出可执行的检查清单。"
+    let promptPreview = try prepare(promptFixture, input: fixtureInput("模拟活动说明"))
+    let promptPreviewView = AnyView(AIAnalysisPreviewView(model: promptFixture.model, prepared: promptPreview))
+    for (name, rootView, width, height) in [("desktop-prompt-library.png", managerView, CGFloat(760), CGFloat(550)),
+                                           ("desktop-prompt-defaults.png", settingsView, CGFloat(760), CGFloat(220)),
+                                           ("desktop-prompt-confirmation.png", promptPreviewView, CGFloat(700), CGFloat(800))] {
+        let view = NSHostingView(rootView: rootView.background(MemoryStyle.surface).foregroundStyle(MemoryStyle.text).tint(MemoryStyle.accent))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: height), styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false; window.contentView = view
+        view.frame = NSRect(x: 0, y: 0, width: width, height: height)
+        view.layoutSubtreeIfNeeded()
+        try await Task.sleep(nanoseconds: 70_000_000)
+        view.layoutSubtreeIfNeeded()
+        guard let image = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { throw CheckFailure(description: "prompt bitmap") }
+        view.cacheDisplay(in: view.bounds, to: image)
+        guard let data = image.representation(using: .png, properties: [:]) else { throw CheckFailure(description: "prompt PNG") }
+        try data.write(to: output.deletingLastPathComponent().appendingPathComponent(name))
+        window.close()
+        print("RENDER \(name)")
+    }
+
     // Render the production setup view without opening an app or fetching models.
     let setup = VStack(alignment: .leading, spacing: 12) {
         Text("添加来源界面预览 · 未配置密钥、未请求服务")
@@ -637,7 +667,7 @@ struct MockModelCatalog: AIModelCatalogClient {
     while fixture.model.reportLibrary.isSaving { try await Task.sleep(nanoseconds: 10_000_000) }
     let memoryRecord = fixture.model.record
     let session = DesktopAIModel(configurationStore: fixture.store, credentials: fixture.credentials,
-        coordinator: AIAnalysisCoordinator(client: fixture.client, credentials: fixture.credentials), reportLibrary: fixture.model.reportLibrary)
+        coordinator: AIAnalysisCoordinator(client: fixture.client, credentials: fixture.credentials), reportLibrary: fixture.model.reportLibrary, promptLibrary: fixture.model.promptLibrary)
     let summary = CodexSessionSummary(id: "s", sessionID: "s", fileURL: URL(fileURLWithPath: "/fixture/session.jsonl"), title: "Mock session",
                                      startedAt: Date(timeIntervalSince1970: 100), updatedAt: Date(timeIntervalSince1970: 200))
     let transcript = SessionTranscript(summary: summary, messages: [.init(id: "u", kind: .user, text: "继续实现搜索功能")])
@@ -680,6 +710,90 @@ struct MockModelCatalog: AIModelCatalogClient {
     print("PASS session frozen preview, result isolation, shared report persistence, failure preservation and cancellation")
 }
 
+@MainActor func checkPromptTemplateDefaultsAndFrozenInput() async throws {
+    let fixture = try makeFixture("prompt-workflow")
+    let library = fixture.model.promptLibrary
+    await library.loadIfNeeded()
+    let template = AIPromptTemplate(title: "我的复盘", text: "先列出验收缺口")
+    let templateSaved = await library.save(template, expected: nil)
+    try expect(templateSaved, "save prompt template")
+    let defaultSaved = await library.setDefault(template.id, module: "fixture")
+    try expect(defaultSaved, "set module prompt default")
+    await fixture.model.configurePrompt(for: "fixture")
+    try expect(fixture.model.promptText == template.text, "default prompt applied")
+    let input = fixtureInput("prompt-result")
+    fixture.model.updateWindow(start: input.windowStart, end: input.windowEnd, selectionSeconds: 600)
+    fixture.model.activityContext = input.context
+    let prepared = try prepare(fixture, input: input)
+    let noRequests = await fixture.client.captured().count
+    try expect(noRequests == 0, "choosing, saving and previewing templates never calls AI")
+    try expect(prepared.input.prompt?.templateID == template.id && prepared.input.prompt?.text == template.text, "preview includes actual prompt and version")
+    fixture.model.promptText = "本次临时修改"
+    var edited = template; edited.text = "新版模板正文"
+    let editedSaved = await library.save(edited, expected: template)
+    try expect(editedSaved, "edit saved template")
+    fixture.model.beginAnalysis(prepared)
+    try await waitUntilIdle(fixture.model)
+    while fixture.model.reportLibrary.isSaving { try await Task.sleep(nanoseconds: 10_000_000) }
+    let requests = await fixture.client.captured()
+    try expect(requests.first?.input.prompt?.text == template.text, "confirmation sends frozen original prompt despite later edits")
+    try expect(fixture.model.resultIsStale, "changed prompt marks previous result stale")
+    try expect(fixture.model.reportLibrary.reports.first?.input.prompt?.text == template.text, "saved report preserves historical wording")
+    let secondPreview = try prepare(fixture, input: input)
+    try expect(secondPreview.input.prompt?.text == "本次临时修改" && secondPreview.input.prompt?.isModified == true, "temporary edits have explicit provenance")
+    fixture.model.beginAnalysis(secondPreview)
+    try await waitUntilIdle(fixture.model)
+    while fixture.model.reportLibrary.isSaving { try await Task.sleep(nanoseconds: 10_000_000) }
+    let nextRequests = await fixture.client.captured().count
+    try expect(nextRequests == 2 && fixture.model.reportLibrary.reports.count == 2, "changed prompt changes cache identity and report snapshot")
+    let reopened = DesktopAIModel(configurationStore: fixture.store, credentials: fixture.credentials,
+        coordinator: AIAnalysisCoordinator(client: fixture.client, credentials: fixture.credentials))
+    await reopened.configurePrompt(for: "fixture")
+    try expect(reopened.promptText == edited.text && reopened.promptTemplate?.revision == 2, "reopening uses stored default and latest version")
+    let memoryDefaultSaved = await reopened.promptLibrary.setDefault("builtin.memory.inspect", module: "memory")
+    try expect(memoryDefaultSaved, "memory default independently saved")
+    let session = DesktopAIModel(configurationStore: fixture.store, credentials: fixture.credentials,
+        coordinator: AIAnalysisCoordinator(client: fixture.client, credentials: fixture.credentials), promptLibrary: reopened.promptLibrary)
+    await session.configurePrompt(for: "memory")
+    try expect(session.promptTemplate?.id == "builtin.memory.inspect" && reopened.promptTemplate?.id == template.id,
+               "modules share templates while retaining separate selections")
+    let finalRequestCount = await fixture.client.captured().count
+    try expect(finalRequestCount == 2, "reloading defaults is local only")
+    fixture.model.promptText = String(repeating: "x", count: 9_000)
+    fixture.model.prepare(module: MutableFixtureModule(input), windowSelectionSeconds: 600)
+    try expect(fixture.model.preview == nil && fixture.model.analysisError != nil, "invalid prompt cannot leave an old sendable preview")
+    print("PASS prompt persistence/defaults, zero-request reuse, exact frozen wording, temporary edits, cache identity and module isolation")
+}
+
+@MainActor func checkPromptLibraryCorruptionAndDefaultUpdates() async throws {
+    let fixture = try makeFixture("prompt-library-recovery")
+    let library = fixture.model.promptLibrary
+    await library.loadIfNeeded()
+    await fixture.model.configurePrompt(for: "memory")
+    try expect(fixture.model.promptTemplate == nil, "empty library uses module-only guidance")
+    let initialDefaultSaved = await library.setDefault("builtin.memory.inspect", module: "memory")
+    try expect(initialDefaultSaved, "set a default after initial load")
+    await fixture.model.configurePrompt(for: "memory")
+    try expect(fixture.model.promptTemplate?.id == "builtin.memory.inspect", "untouched selection follows updated defaults")
+    fixture.model.promptText = "我的临时说明"
+    let changedDefaultSaved = await library.setDefault("builtin.concise", module: "memory")
+    try expect(changedDefaultSaved, "change stored default")
+    await fixture.model.configurePrompt(for: "memory")
+    try expect(fixture.model.promptText == "我的临时说明", "default changes cannot discard an edited draft")
+    let file = fixture.store.url.deletingLastPathComponent().appendingPathComponent("prompt-templates/library.json")
+    let good = try Data(contentsOf: file), broken = Data("broken".utf8)
+    try broken.write(to: file)
+    await library.refresh()
+    try expect(library.loadError != nil, "corrupt templates show an error")
+    let rejected = await library.setDefault(nil, module: "memory")
+    let retainedBytes = try Data(contentsOf: file)
+    try expect(!rejected && retainedBytes == broken, "corrupt data cannot be overwritten")
+    try good.write(to: file)
+    await library.refresh()
+    try expect(library.loadError == nil && library.catalog.defaults["memory"] == "builtin.concise", "repaired library can be reloaded")
+    print("PASS prompt default refresh, retained dirty draft, corrupt-file preservation and recovery")
+}
+
 @MainActor func runChecks() async throws {
     try await checkProviderCRUD()
     try checkCorruptConfiguration()
@@ -693,7 +807,9 @@ struct MockModelCatalog: AIModelCatalogClient {
     try await checkOutputBudgetPreview()
     try await checkLengthLimitRecovery()
     try await checkSessionHandoffIsolationAndPersistence()
-    print("DESKTOP AI CHECKS PASSED: 12 workflows, \(assertionCount) assertions; mock providers and credentials only")
+    try await checkPromptTemplateDefaultsAndFrozenInput()
+    try await checkPromptLibraryCorruptionAndDefaultUpdates()
+    print("DESKTOP AI CHECKS PASSED: 14 workflows, \(assertionCount) assertions; mock providers and credentials only")
     #if RENDER_AI
     if let output = ProcessInfo.processInfo.environment["GPT_DESKTOP_AI_RENDER_PATH"] {
         try await renderFixture(to: output)
@@ -754,9 +870,9 @@ def main() -> int:
         swift_main.write_text(SWIFT_CHECKS, encoding="utf-8")
         executable = directory / "desktop-ai-checks"
         desktop = project / "Sources" / "GPTMemoryDesktop"
-        sources = [desktop / "DesktopAIModel.swift", desktop / "AIReportLibraryModel.swift"]
+        sources = [desktop / "DesktopAIModel.swift", desktop / "PromptTemplateLibraryModel.swift", desktop / "AIReportLibraryModel.swift"]
         if output:
-            sources += [desktop / name for name in ["DesktopModel.swift", "Views.swift", "MemoryProcessActionsModel.swift", "MemoryProcessActionViews.swift", "AIViews.swift", "AIReportViews.swift", "AIProviderEditorModel.swift", "Style.swift", "SessionDesktopModel.swift", "SessionManagementModel.swift", "SessionManagementViews.swift", "SessionViews.swift", "SessionProjectViews.swift", "SessionHandoffAIViews.swift"]]
+            sources += [desktop / name for name in ["DesktopModel.swift", "Views.swift", "MemoryProcessActionsModel.swift", "MemoryProcessActionViews.swift", "AIViews.swift", "AIReportViews.swift", "AIProviderEditorModel.swift", "Style.swift", "SessionDesktopModel.swift", "SessionManagementModel.swift", "SessionManagementViews.swift", "SessionViews.swift", "SessionProjectViews.swift", "SessionHandoffAIViews.swift", "PromptTemplateViews.swift"]]
         architecture = platform.machine()
         if architecture not in {"arm64", "x86_64"}:
             raise RuntimeError(f"不支持的 macOS 架构：{architecture}")

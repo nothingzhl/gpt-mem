@@ -421,10 +421,10 @@ def main() -> int:
         command = ["swiftc", "-swift-version", "5", "-target", f"{architecture}-apple-macosx14.0",
                    "-module-cache-path", str(directory / "module-cache"), "-I", str(release / "Modules"),
                    "-I", str(release / "CNative.build"), "-o", str(executable)]
-        command += [str(desktop / "AIReportLibraryModel.swift"), str(desktop / "DesktopAIModel.swift"), str(swift)]
+        command += [str(desktop / "AIReportLibraryModel.swift"), str(desktop / "DesktopAIModel.swift"), str(desktop / "PromptTemplateLibraryModel.swift"), str(swift)]
         if output:
             command += ["-D", "RENDER_REPORT_LIBRARY"]
-            command += [str(desktop / name) for name in ["AIReportViews.swift", "AIViews.swift", "AIProviderEditorModel.swift", "Style.swift"]]
+            command += [str(desktop / name) for name in ["AIReportViews.swift", "AIViews.swift", "AIProviderEditorModel.swift", "Style.swift", "PromptTemplateViews.swift", "SessionViews.swift", "SessionProjectViews.swift", "SessionManagementViews.swift", "SessionDesktopModel.swift", "SessionManagementModel.swift", "SessionHandoffAIViews.swift"]]
         command += [str(obj) for obj in objects] + ["-lproc", "-lsqlite3"]
         print("编译报告库本地检查（使用现有 Release 产物）", flush=True)
         subprocess.run(command, cwd=project, check=True, timeout=60)

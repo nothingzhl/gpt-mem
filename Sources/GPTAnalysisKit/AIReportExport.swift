@@ -32,6 +32,10 @@ public enum AIReportExport {
         }
         lines += ["", "## 限制", ""]
         for limitation in result.limitations { lines.append("- \(escape(limitation))") }
+        if let prompt = input.prompt {
+            lines += ["", "## 使用提示词", "", escape(prompt.title) + (prompt.revision.map { " · v\($0)" } ?? "") + (prompt.isModified ? " · 本次已调整" : ""),
+                      "", escape(prompt.text)]
+        }
         lines += ["", "## 活动说明", "", input.context.isEmpty ? "未填写活动说明。" : escape(input.context),
                   "", "## 分析说明", "", escape(input.guidance), "", "## 匿名对象", ""]
         if input.subjects.isEmpty { lines.append("本次没有独立匿名对象。") }
@@ -69,7 +73,8 @@ public enum AIReportExport {
                                     facts: report.input.facts, subjects: report.input.subjects,
                                     result: report.record.result,
                                     interpretation: report.input.presentation?.interpretation ?? "AI 原因假设需要后续验证；对象状态与证据反映生成时的观察窗口。",
-                                    presentation: report.input.presentation)
+                                    presentation: report.input.presentation,
+                                    prompt: report.input.prompt.map { PublicPrompt(title: $0.title, revision: $0.revision, text: $0.text, isModified: $0.isModified) })
         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         // Numeric Unix times preserve subsecond windows in a portable, explicit form.
         encoder.dateEncodingStrategy = .secondsSince1970
@@ -98,6 +103,14 @@ public enum AIReportExport {
         let result: AIAnalysisResult
         let interpretation: String
         let presentation: AIAnalysisPresentation?
+        let prompt: PublicPrompt?
+    }
+
+    private struct PublicPrompt: Encodable {
+        let title: String
+        let revision: Int?
+        let text: String
+        let isModified: Bool
     }
 
     private static func safeJSONText(_ value: String) -> String {

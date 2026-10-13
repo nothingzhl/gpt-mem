@@ -79,15 +79,24 @@ public struct AIAnalysisInput: Codable, Equatable {
     public let subjects: [AIAnalysisSubject]
     public let context: String
     public let presentation: AIAnalysisPresentation?
+    public let prompt: AIAnalysisPrompt?
 
     public init(moduleID: String, moduleTitle: String, promptVersion: String, guidance: String,
-                windowStart: Date, windowEnd: Date, facts: [AIAnalysisFact], subjects: [AIAnalysisSubject], context: String = "", presentation: AIAnalysisPresentation? = nil) {
+                windowStart: Date, windowEnd: Date, facts: [AIAnalysisFact], subjects: [AIAnalysisSubject], context: String = "", presentation: AIAnalysisPresentation? = nil, prompt: AIAnalysisPrompt? = nil) {
         self.moduleID = moduleID; self.moduleTitle = moduleTitle; self.promptVersion = promptVersion
         self.guidance = guidance; self.windowStart = windowStart; self.windowEnd = windowEnd
-        self.facts = facts; self.subjects = subjects; self.context = context; self.presentation = presentation
+        self.facts = facts; self.subjects = subjects; self.context = context; self.presentation = presentation; self.prompt = prompt
+    }
+
+    public func applying(prompt: AIAnalysisPrompt?) throws -> AIAnalysisInput {
+        try prompt?.validate()
+        return AIAnalysisInput(moduleID: moduleID, moduleTitle: moduleTitle, promptVersion: promptVersion,
+            guidance: guidance, windowStart: windowStart, windowEnd: windowEnd, facts: facts,
+            subjects: subjects, context: context, presentation: presentation, prompt: prompt)
     }
 
     public func validated() throws -> Data {
+        try prompt?.validate()
         guard !moduleID.isEmpty, !moduleTitle.isEmpty, !promptVersion.isEmpty,
               windowStart.timeIntervalSince1970.isFinite, windowEnd.timeIntervalSince1970.isFinite,
               windowEnd > windowStart, presentation?.isValid != false, !facts.isEmpty, facts.count <= 100,

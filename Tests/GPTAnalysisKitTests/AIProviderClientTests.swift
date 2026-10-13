@@ -199,6 +199,34 @@ final class AIProviderClientTests: XCTestCase {
         XCTAssertNil(payload["response_format"])
     }
 
+    func testPromptTemplateIsSentToAllThreeProvidersWithoutReplacingModuleRules() throws {
+        let prompt = AIAnalysisPrompt(title: "人工设置", text: "优先列出验证缺口", isModified: true)
+        let original = try input()
+        let analysisInput = try original.applying(prompt: prompt)
+        for kind in AIProviderKind.allCases {
+            let config = try configuration(kind)
+            let data = try response(kind)
+            let requestBox = AIClientTestBox<URLRequest>()
+            let session = AIClientMockProtocol.session { request in
+                requestBox.store(.success(request))
+                return .init(data: data)
+            }
+            defer { session.invalidateAndCancel() }
+            _ = try run { try await HTTPAIProviderClient(session: session).analyze(input: analysisInput, configuration: config, apiKey: "fixture-key") }
+            let request = try XCTUnwrap(requestBox.read()).get()
+            let payload = try body(request)
+            let messages = try XCTUnwrap(payload[kind == .openAIResponses ? "input" : "messages"] as? [[String: Any]])
+            let system = try XCTUnwrap(messages.first?["content"] as? String)
+            XCTAssertTrue(system.contains(original.guidance))
+            XCTAssertTrue(system.contains(prompt.text))
+            XCTAssertTrue(system.contains("JSON Schema"))
+            let text = try XCTUnwrap(messages.last?["content"] as? String)
+            let frozen = try AIAnalysisCodec.decoder().decode(AIAnalysisInput.self, from: Data(text.utf8))
+            XCTAssertEqual(frozen.prompt, prompt)
+            XCTAssertEqual(frozen.facts, original.facts)
+        }
+    }
+
     func testJSONModeCanBeExplicitlyDisabledForAllProviders() throws {
         let analysisInput = try input()
         for kind in [AIProviderKind.openAIResponses, .openAICompatible, .ollama] {

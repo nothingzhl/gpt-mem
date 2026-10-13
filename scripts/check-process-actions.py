@@ -217,7 +217,7 @@ def main():
         sources = [desktop / 'MemoryProcessActionsModel.swift']
         if args.render:
             sources += [desktop / name for name in ['MemoryProcessActionViews.swift', 'DesktopModel.swift', 'Views.swift', 'AIViews.swift',
-                'AIReportViews.swift', 'AIProviderEditorModel.swift', 'DesktopAIModel.swift', 'AIReportLibraryModel.swift', 'Style.swift',
+                'AIReportViews.swift', 'AIProviderEditorModel.swift', 'DesktopAIModel.swift', 'PromptTemplateLibraryModel.swift', 'PromptTemplateViews.swift', 'SessionHandoffAIViews.swift', 'AIReportLibraryModel.swift', 'Style.swift',
                 'SessionDesktopModel.swift', 'SessionManagementModel.swift', 'SessionManagementViews.swift', 'SessionViews.swift', 'SessionProjectViews.swift']]
         command = ['swiftc', '-swift-version', '5', '-target', f'{platform.machine()}-apple-macosx14.0',
             '-module-cache-path', str(directory / 'module-cache'), '-I', str(release / 'Modules'), '-I', str(release / 'CNative.build'),

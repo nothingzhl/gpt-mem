@@ -75,7 +75,7 @@ final class DesktopModel: ObservableObject {
         databaseURL = directory.appendingPathComponent("history.sqlite3")
         aiModel = DesktopAIModel(configurationStore: AIConfigurationStore(url: directory.appendingPathComponent("ai-services.json")))
         sessionAIModel = DesktopAIModel(configurationStore: AIConfigurationStore(url: directory.appendingPathComponent("ai-services.json")),
-            reportLibrary: aiModel.reportLibrary)
+            reportLibrary: aiModel.reportLibrary, promptLibrary: aiModel.promptLibrary)
         sessionModel = SessionDesktopModel(indexDirectoryURL: directory.appendingPathComponent("session-index", isDirectory: true),
             managementDirectoryURL: directory.appendingPathComponent("session-management", isDirectory: true))
         processActions = MemoryProcessActionsModel(directoryURL: directory.appendingPathComponent("process-actions", isDirectory: true))
@@ -116,9 +116,13 @@ final class DesktopModel: ObservableObject {
     }
     func dismissMessage() { errorMessage = nil; historyErrorMessage = nil; noticeMessage = nil }
     func prepareMemoryAIAnalysis() {
-        guard let analysis, analysis.sampleCount >= 2 else { return }
-        let module = MemoryAIAnalysisModule(snapshots: history, analysis: analysis, context: aiModel.activityContext)
-        aiModel.prepare(module: module, subjectLabels: module.subjectLabels, windowSelectionSeconds: windowSeconds)
+        Task { @MainActor [weak self] in
+            guard let self, !self.aiModel.isAnalyzing else { return }
+            await self.aiModel.configurePrompt(for: "memory")
+            guard let analysis = self.analysis, analysis.sampleCount >= 2 else { return }
+            let module = MemoryAIAnalysisModule(snapshots: self.history, analysis: analysis, context: self.aiModel.activityContext)
+            self.aiModel.prepare(module: module, subjectLabels: module.subjectLabels, windowSelectionSeconds: self.windowSeconds)
+        }
     }
     func openDataDirectory() {
         let directory = databaseURL.deletingLastPathComponent()

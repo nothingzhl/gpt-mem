@@ -310,6 +310,7 @@ struct AIAnalysisCard: View {
                     Spacer()
                     if !hasInput { Text("至少需要两份历史采样").font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary) }
                 }
+                PromptTemplateSelectionControls(model: model, moduleID: "memory")
                 DisclosureGroup("补充活动说明（可选）") {
                     VStack(alignment: .leading, spacing: 6) {
                         TextField("例如：这段时间运行了一个长任务，随后打开新页面", text: $model.activityContext, axis: .vertical)
@@ -399,8 +400,16 @@ struct AIAnalysisPreviewView: View {
             }
             Text((prepared.input.presentation?.privacyNotice ?? "分析对象使用匿名编号，本地定位信息留在本机。") + "包含 \(prepared.input.facts.count) 条事实和 \(prepared.input.subjects.count) 个分析对象。")
                 .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
+            if let prompt = prepared.input.prompt {
+                Text("使用提示词：\(prompt.title)\(prompt.revision.map { " · v\($0)" } ?? "")\(prompt.isModified ? " · 本次已调整" : "")")
+                    .font(.system(size: 11, weight: .medium))
+            }
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
+                    if let prompt = prepared.input.prompt {
+                        Text("本次提示词").font(.system(size: 11, weight: .medium))
+                        Text(prompt.text).font(.system(size: 11)).textSelection(.enabled)
+                    }
                     ForEach(prepared.input.facts, id: \.id) { fact in
                         VStack(alignment: .leading, spacing: 4) {
                             Text("\(fact.id) · \(fact.title)").font(.system(size: 11, weight: .medium))
@@ -458,6 +467,11 @@ struct AIAnalysisResultContent: View {
             } else if isStale {
                 Text("窗口、活动说明或来源已变化；以下结论只适用于分析时的摘要和上方标注的窗口及来源。")
                     .font(.system(size: 11)).foregroundStyle(MemoryStyle.orange)
+            }
+            if let prompt = input?.prompt {
+                DisclosureGroup("使用提示词：" + prompt.title + (prompt.revision.map { " · v\($0)" } ?? "") + (prompt.isModified ? " · 本次已调整" : "")) {
+                    Text(prompt.text).font(.system(size: 11)).textSelection(.enabled)
+                }.font(.system(size: 11))
             }
             Text(record.result.summary).font(.system(size: 13, weight: .medium)).textSelection(.enabled)
             if !record.result.observations.isEmpty {

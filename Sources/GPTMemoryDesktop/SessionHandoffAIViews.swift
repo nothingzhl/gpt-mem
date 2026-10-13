@@ -14,7 +14,8 @@ struct SessionHandoffAIControls: View {
 
     private var matchingRecord: AIAnalysisRecord? {
         guard let record = model.record, let input = preparedInput,
-              model.recordInput == input, input.context == context else { return nil }
+              model.recordInput == input, input.context == context,
+              input.prompt == (try? model.appliedPrompt(for: SessionHandoffAIModule.moduleID)) else { return nil }
         return record
     }
 
@@ -34,6 +35,7 @@ struct SessionHandoffAIControls: View {
                         .disabled(model.selectedProvider == nil || model.configurationError != nil)
                 }
             }
+            PromptTemplateSelectionControls(model: model, moduleID: SessionHandoffAIModule.moduleID)
             TextField("补充目标与约束（可选，确认后随摘录发送）", text: $context).textFieldStyle(.roundedBorder)
                 .disabled(model.isAnalyzing)
             Text("先预览有限的真实消息摘录再发送；不读取工具输出、本地备注或编辑器内容。生成结果自动保存到 AI 报告库。")
@@ -62,7 +64,9 @@ struct SessionHandoffAIControls: View {
         }
         .task {
             model.reloadSettings()
-            preparedInput = try? SessionHandoffAIModule(transcript: transcript).input
+            await model.configurePrompt(for: SessionHandoffAIModule.moduleID)
+            preparedInput = try? SessionHandoffAIModule(transcript: transcript).input.applying(
+                prompt: model.appliedPrompt(for: SessionHandoffAIModule.moduleID))
         }
         .sheet(item: $model.preview) { preview in
             AIAnalysisPreviewView(model: model, prepared: preview)
@@ -70,15 +74,20 @@ struct SessionHandoffAIControls: View {
     }
 
     private func prepare() {
-        localError = nil
-        model.reloadSettings()
-        do {
-            let module = try SessionHandoffAIModule(transcript: transcript, context: context)
-            preparedInput = module.input
-            model.prepare(module: module, subjectLabels: module.subjectLabels,
-                          windowSelectionSeconds: max(1, min(31_536_000, module.input.windowEnd.timeIntervalSince(module.input.windowStart))))
-        } catch { localError = error.localizedDescription }
+        let frozenContext = context
+        Task { @MainActor in
+            localError = nil
+            model.reloadSettings()
+            await model.configurePrompt(for: SessionHandoffAIModule.moduleID)
+            do {
+                let module = try SessionHandoffAIModule(transcript: transcript, context: frozenContext)
+                model.prepare(module: module, subjectLabels: module.subjectLabels,
+                              windowSelectionSeconds: max(1, min(31_536_000, module.input.windowEnd.timeIntervalSince(module.input.windowStart))))
+                preparedInput = model.preview?.input
+            } catch { localError = error.localizedDescription }
+        }
     }
+
 }
 
 struct SessionHandoffBackgroundStatus: View {
