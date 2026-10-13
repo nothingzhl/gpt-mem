@@ -43,11 +43,11 @@ private struct SessionFilter: Equatable, Sendable {
     let project: String?
     let includeArchived: Bool
     let onlyFavoriteSessions: Bool
+    let projectTagKey: String?
 
     func includesMetadata(_ summary: CodexSessionSummary, management: SessionManagementIndex) -> Bool {
-        let path = summary.projectPath
-        let projectID = path.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
-            ?? SessionProjectSummary.unknownID
+        let projectID = SessionManagementIndex.projectPath(for: summary)
+        if let projectTagKey, !management.hasProjectTag(projectID, key: projectTagKey) { return false }
         return (includeArchived || !summary.isArchived) && (project == nil || project == projectID)
             && (!onlyFavoriteSessions || management.isFavorite(summary))
     }
@@ -71,6 +71,8 @@ private struct SessionFilterResult: Sendable {
                      previousMatches: Set<String>?, transcriptIndex: SessionTranscriptIndex?, selectedSessionID: String?,
                      management: SessionManagementIndex) -> SessionFilterResult? {
         var summaries: [CodexSessionSummary] = []
+        let terms = filter.query.split(whereSeparator: \.isWhitespace).map(String.init)
+        let tagTerms = terms.map(SessionManagementStore.tagKey)
         for summary in sessions {
             guard !Task.isCancelled else { return nil }
             guard filter.includesMetadata(summary, management: management) else { continue }
@@ -78,12 +80,13 @@ private struct SessionFilterResult: Sendable {
                 guard previousMatches.contains(summary.id) else { continue }
             } else if !filter.query.isEmpty {
                 let metadata = management.entry(for: summary)
-                let terms = filter.query.split(whereSeparator: \.isWhitespace)
-                let matches = terms.allSatisfy { term in
-                    let value = String(term)
+                let tagKeys = management.tagSearchKeys(SessionManagementIndex.projectPath(for: summary))
+                let matches = terms.indices.allSatisfy { term in
+                    let value = terms[term]
                     return summary.matches(query: value)
                         || (metadata?.displayName?.localizedCaseInsensitiveContains(value) ?? false)
                         || (metadata?.note?.localizedCaseInsensitiveContains(value) ?? false)
+                        || tagKeys.contains { $0.contains(tagTerms[term]) }
                 }
                 guard matches else { continue }
             }
@@ -197,12 +200,20 @@ final class SessionDesktopModel: ObservableObject {
     @Published private(set) var transcriptErrorMessage: String?
     @Published private(set) var selectedSessionID: String?
     @Published private(set) var projectPaths: [String] = []
+    @Published private(set) var availableProjectTags: [String] = []
     @Published private(set) var analytics = SessionAnalytics(sessions: [])
     @Published var query = "" { didSet { if query != oldValue { updateFilteredSessions(debounce: true) } } }
     @Published var selectedProject: String? { didSet { if selectedProject != oldValue { updateFilteredSessions() } } }
     @Published var includeArchived = false { didSet { if includeArchived != oldValue { updateFilteredSessions() } } }
     @Published var onlyFavoriteSessions = false { didSet { if onlyFavoriteSessions != oldValue { updateFilteredSessions() } } }
     @Published var onlyFavoriteProjects = false
+    @Published var selectedProjectTag: String? {
+        didSet {
+            guard selectedProjectTag != oldValue else { return }
+            updateTagChoices()
+            updateFilteredSessions()
+        }
+    }
 
     let rootURL: URL
     let management: SessionManagementModel
@@ -222,6 +233,7 @@ final class SessionDesktopModel: ObservableObject {
     private var lastMatchedIDs: Set<String> = []
     private var tokenTotals: [SessionTokenMetric: SessionTokenTotal] = [:]
     private var pendingSelectionReload = false
+    private var catalogProjectTags: [String] = []
 
     init(rootURL: URL = CodexSessionRepository.defaultRootURL, indexDirectoryURL: URL? = nil,
          managementDirectoryURL: URL? = nil) {
@@ -264,6 +276,30 @@ final class SessionDesktopModel: ObservableObject {
             if left != right { return left }
             return $0 < $1
         }
+        var labels: [String: String] = [:]
+        for path in projectPaths {
+            for tag in projectTags(path) {
+                let key = SessionManagementStore.tagKey(tag)
+                if let previous = labels[key] { labels[key] = min(previous, tag) }
+                else { labels[key] = tag }
+            }
+        }
+        catalogProjectTags = labels.values.sorted {
+            let left = SessionManagementStore.tagKey($0), right = SessionManagementStore.tagKey($1)
+            return left == right ? $0 < $1 : left < right
+        }
+        updateTagChoices()
+    }
+
+    private func updateTagChoices() {
+        var choices = catalogProjectTags
+        if let selectedProjectTag {
+            let key = SessionManagementStore.tagKey(selectedProjectTag)
+            if let index = choices.firstIndex(where: { SessionManagementStore.tagKey($0) == key }) {
+                choices[index] = selectedProjectTag
+            } else { choices.append(selectedProjectTag) }
+        }
+        availableProjectTags = choices
     }
 
     var displayedProjects: [SessionProjectSummary] {
@@ -278,6 +314,7 @@ final class SessionDesktopModel: ObservableObject {
     func note(for summary: CodexSessionSummary) -> String { management.index.entry(for: summary)?.note ?? "" }
     func isFavorite(_ summary: CodexSessionSummary) -> Bool { management.index.isFavorite(summary) }
     func isFavoriteProject(_ path: String) -> Bool { management.index.isFavoriteProject(path) }
+    func projectTags(_ path: String) -> [String] { management.index.entryForProject(path)?.tags ?? [] }
 
     /// Frozen editor targets can survive normal refreshes and detail loads, but
     /// may not write metadata for a file whose actual session identity changed.
@@ -311,9 +348,24 @@ final class SessionDesktopModel: ObservableObject {
         management.discardFailedDetails(itemID: summary.managementID)
     }
 
+    func saveProjectTags(_ path: String, tags: [String], baseline: SessionManagementEntry) async -> Bool {
+        guard !isLoading, projectPaths.contains(path) else {
+            management.reportProjectTagsError("项目正在刷新或来源已变化，请重新选择项目后编辑。",
+                                              itemID: SessionManagementIndex.projectID(path))
+            return false
+        }
+        guard !management.isSaving else { return false }
+        return await management.saveProjectTags(itemID: SessionManagementIndex.projectID(path), tags: tags, baseline: baseline)
+    }
+
+    func discardFailedProjectTags(_ path: String) {
+        management.discardFailedProjectTags(itemID: SessionManagementIndex.projectID(path))
+    }
+
     private var currentFilter: SessionFilter {
         SessionFilter(query: query.trimmingCharacters(in: .whitespacesAndNewlines),
-                      project: selectedProject, includeArchived: includeArchived, onlyFavoriteSessions: onlyFavoriteSessions)
+                      project: selectedProject, includeArchived: includeArchived, onlyFavoriteSessions: onlyFavoriteSessions,
+                      projectTagKey: selectedProjectTag.map(SessionManagementStore.tagKey))
     }
 
     private func updateFilteredSessions(debounce: Bool = false, reloadSelection: Bool = false,

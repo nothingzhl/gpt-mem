@@ -14,12 +14,29 @@ public struct SessionManagementEntry: Codable, Equatable, Identifiable, Sendable
     public let isFavorite: Bool
     public let displayName: String?
     public let note: String?
+    public let tags: [String]
     public var id: String { kind.rawValue + ":" + itemID }
 
     public init(kind: SessionManagementKind, itemID: String, isFavorite: Bool = false,
-                displayName: String? = nil, note: String? = nil) {
+                displayName: String? = nil, note: String? = nil, tags: [String] = []) {
         self.kind = kind; self.itemID = itemID; self.isFavorite = isFavorite
-        self.displayName = displayName; self.note = note
+        self.displayName = displayName; self.note = note; self.tags = tags
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case kind, itemID, isFavorite, displayName, note, tags
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decode(SessionManagementKind.self, forKey: .kind)
+        itemID = try container.decode(String.self, forKey: .itemID)
+        isFavorite = try container.decode(Bool.self, forKey: .isFavorite)
+        displayName = try container.decodeIfPresent(String.self, forKey: .displayName)
+        note = try container.decodeIfPresent(String.self, forKey: .note)
+        // Version 1 metadata has no tags. Explicit null or another type is
+        // malformed data rather than an absent legacy field.
+        tags = container.contains(.tags) ? try container.decode([String].self, forKey: .tags) : []
     }
 }
 
@@ -43,9 +60,10 @@ public enum SessionManagementChange: Sendable {
     case setFavorite(Bool)
     case setDisplayName(String?)
     case setNote(String?)
+    case setTags([String])
     case setDetails(displayName: String?, note: String?)
     case update(isFavorite: Bool?, displayName: SessionManagementTextChange = .unchanged,
-                note: SessionManagementTextChange = .unchanged)
+                note: SessionManagementTextChange = .unchanged, tags: [String]? = nil)
     case clear
 }
 
@@ -101,6 +119,9 @@ public final class SessionManagementStore: @unchecked Sendable {
     public static let maximumDisplayNameBytes = 1_024
     public static let maximumNoteCharacters = 4_000
     public static let maximumNoteBytes = 16 * 1_024
+    public static let maximumTags = 8
+    public static let maximumTagCharacters = 20
+    public static let maximumTagBytes = 256
     public let directoryURL: URL
     public let fileURL: URL
     private let sourceRootURL: URL
@@ -165,7 +186,7 @@ public final class SessionManagementStore: @unchecked Sendable {
         let old = index.map { entries[$0] } ?? .init(kind: kind, itemID: itemID)
         let updated = try Self.applying(change: normalized, to: old, expectedEntry: expectedEntry)
         if updated == old { return .init(revision: loaded.document.revision, entries: entries) }
-        let empty = !updated.isFavorite && updated.displayName == nil && updated.note == nil
+        let empty = !updated.isFavorite && updated.displayName == nil && updated.note == nil && updated.tags.isEmpty
         if let index {
             if empty { entries.remove(at: index) } else { entries[index] = updated }
         } else if !empty { entries.append(updated) }
@@ -173,7 +194,7 @@ public final class SessionManagementStore: @unchecked Sendable {
             throw SessionManagementStoreError.capacityExceeded
         }
         entries.sort { $0.kind.rawValue == $1.kind.rawValue ? $0.itemID < $1.itemID : $0.kind.rawValue < $1.kind.rawValue }
-        let document = Document(version: 1, rootPath: rootPath, revision: loaded.document.revision + 1, entries: entries)
+        let document = Document(version: 2, rootPath: rootPath, revision: loaded.document.revision + 1, entries: entries)
         try Task.checkCancellation()
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
         let bytes = try encoder.encode(document)
@@ -207,7 +228,7 @@ public final class SessionManagementStore: @unchecked Sendable {
         try validateDirectoryLocation(directory)
         let descriptor = openat(directory, fileURL.lastPathComponent, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard descriptor >= 0 else {
-            if errno == ENOENT { return .init(document: .init(version: 1, rootPath: rootPath, revision: 0, entries: []), identity: nil) }
+            if errno == ENOENT { return .init(document: .init(version: 2, rootPath: rootPath, revision: 0, entries: []), identity: nil) }
             if errno == ELOOP { throw SessionManagementStoreError.unsafeLocation }
             throw SessionManagementStoreError.unavailable(errno)
         }
@@ -236,7 +257,7 @@ public final class SessionManagementStore: @unchecked Sendable {
         let document: Document
         do { document = try JSONDecoder().decode(Document.self, from: data) }
         catch { throw SessionManagementStoreError.corruptData }
-        guard document.version == 1 else { throw SessionManagementStoreError.unsupportedVersion(document.version) }
+        guard document.version == 1 || document.version == 2 else { throw SessionManagementStoreError.unsupportedVersion(document.version) }
         guard document.rootPath == rootPath, document.revision > 0,
               document.entries.count <= limits.maximumEntries else { throw SessionManagementStoreError.corruptData }
         var keys = Set<String>()
@@ -245,8 +266,12 @@ public final class SessionManagementStore: @unchecked Sendable {
             do {
                 try Self.validateIdentity(entry.itemID)
                 let name = try Self.normalizeName(entry.displayName), note = try Self.normalizeNote(entry.note)
-                guard name == entry.displayName, note == entry.note,
-                      entry.isFavorite || name != nil || note != nil,
+                let tags = try Self.normalizedTags(entry.tags)
+                let canonicalTags = tags.count == entry.tags.count && zip(tags, entry.tags).allSatisfy {
+                    $0.utf8.elementsEqual($1.utf8)
+                }
+                guard name == entry.displayName, note == entry.note, canonicalTags,
+                      entry.isFavorite || name != nil || note != nil || !tags.isEmpty,
                       keys.insert(entry.id).inserted else { throw SessionManagementStoreError.corruptData }
             } catch is CancellationError { throw CancellationError() }
             catch { throw SessionManagementStoreError.corruptData }
@@ -300,22 +325,24 @@ public final class SessionManagementStore: @unchecked Sendable {
             guard baseline.kind == entry.kind, baseline.itemID == entry.itemID else {
                 throw SessionManagementStoreError.invalidInput("管理对象已变化，请重新打开编辑窗口。")
             }
-            let fields: (favorite: Bool, name: Bool, note: Bool)
+            let fields: (favorite: Bool, name: Bool, note: Bool, tags: Bool)
             switch change {
-            case .setFavorite: fields = (true, false, false)
-            case .setDisplayName: fields = (false, true, false)
-            case .setNote: fields = (false, false, true)
-            case .setDetails: fields = (false, true, true)
-            case .clear: fields = (true, true, true)
-            case .update(let favorite, let name, let note):
+            case .setFavorite: fields = (true, false, false, false)
+            case .setDisplayName: fields = (false, true, false, false)
+            case .setNote: fields = (false, false, true, false)
+            case .setTags: fields = (false, false, false, true)
+            case .setDetails: fields = (false, true, true, false)
+            case .clear: fields = (true, true, true, true)
+            case .update(let favorite, let name, let note, let tags):
                 let changesName: Bool, changesNote: Bool
                 switch name { case .unchanged: changesName = false; case .set: changesName = true }
                 switch note { case .unchanged: changesNote = false; case .set: changesNote = true }
-                fields = (favorite != nil, changesName, changesNote)
+                fields = (favorite != nil, changesName, changesNote, tags != nil)
             }
             if (fields.favorite && entry.isFavorite != baseline.isFavorite && entry.isFavorite != updated.isFavorite)
                 || (fields.name && entry.displayName != baseline.displayName && entry.displayName != updated.displayName)
-                || (fields.note && entry.note != baseline.note && entry.note != updated.note) {
+                || (fields.note && entry.note != baseline.note && entry.note != updated.note)
+                || (fields.tags && entry.tags != baseline.tags && entry.tags != updated.tags) {
                 throw SessionManagementStoreError.itemConflict
             }
         }
@@ -326,30 +353,68 @@ public final class SessionManagementStore: @unchecked Sendable {
         switch change {
         case .setDisplayName(let name): return .setDisplayName(try normalizeName(name))
         case .setNote(let note): return .setNote(try normalizeNote(note))
+        case .setTags(let tags): return .setTags(try normalizedTags(tags))
         case .setDetails(let name, let note): return .setDetails(displayName: try normalizeName(name), note: try normalizeNote(note))
-        case .update(let favorite, let name, let note):
+        case .update(let favorite, let name, let note, let tags):
             let cleanName: SessionManagementTextChange, cleanNote: SessionManagementTextChange
             switch name { case .unchanged: cleanName = .unchanged; case .set(let value): cleanName = .set(try normalizeName(value)) }
             switch note { case .unchanged: cleanNote = .unchanged; case .set(let value): cleanNote = .set(try normalizeNote(value)) }
-            return .update(isFavorite: favorite, displayName: cleanName, note: cleanNote)
+            return .update(isFavorite: favorite, displayName: cleanName, note: cleanNote,
+                           tags: try tags.map(normalizedTags))
         default: return change
         }
     }
 
     private static func apply(_ change: SessionManagementChange, to entry: SessionManagementEntry) -> SessionManagementEntry {
-        var favorite = entry.isFavorite, name = entry.displayName, note = entry.note
+        var favorite = entry.isFavorite, name = entry.displayName, note = entry.note, tags = entry.tags
         switch change {
         case .setFavorite(let value): favorite = value
         case .setDisplayName(let value): name = value
         case .setNote(let value): note = value
+        case .setTags(let value): tags = value
         case .setDetails(let newName, let newNote): name = newName; note = newNote
-        case .update(let value, let newName, let newNote):
+        case .update(let value, let newName, let newNote, let newTags):
             if let value { favorite = value }
             if case .set(let value) = newName { name = value }
             if case .set(let value) = newNote { note = value }
-        case .clear: favorite = false; name = nil; note = nil
+            if let newTags { tags = newTags }
+        case .clear: favorite = false; name = nil; note = nil; tags = []
         }
-        return .init(kind: entry.kind, itemID: entry.itemID, isFavorite: favorite, displayName: name, note: note)
+        return .init(kind: entry.kind, itemID: entry.itemID, isFavorite: favorite, displayName: name, note: note, tags: tags)
+    }
+
+    /// Tags use canonical Unicode and a fixed locale so case matching and
+    /// sorting do not change with the user's system language.
+    public static func tagKey(_ tag: String) -> String {
+        tag.precomposedStringWithCanonicalMapping
+            .folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .precomposedStringWithCanonicalMapping
+    }
+
+    /// Retain the first spelling of each case-insensitive label, then sort by
+    /// its key. Bound raw input as well as stored output before any disk write.
+    public static func normalizedTags(_ values: [String]) throws -> [String] {
+        guard values.count <= maximumTags * 16 else {
+            throw SessionManagementStoreError.invalidInput("一次最多输入 128 个标签，去重后最多保留 8 个。")
+        }
+        var labels: [String: String] = [:]
+        for value in values {
+            guard value.utf8.count <= maximumTagBytes * 16,
+                  !value.unicodeScalars.contains(where: { invalidSingleLineScalar($0) || $0 == "," || $0 == "，" }) else {
+                throw SessionManagementStoreError.invalidInput("标签请使用单行文本，不允许控制字符或逗号。")
+            }
+            let cleaned = value.trimmingCharacters(in: .whitespacesAndNewlines).precomposedStringWithCanonicalMapping
+            guard cleaned.utf8.count <= maximumTagBytes, cleaned.count <= maximumTagCharacters else {
+                throw SessionManagementStoreError.invalidInput("每个标签最多 20 个字符、256 字节。")
+            }
+            if cleaned.isEmpty { continue }
+            let key = tagKey(cleaned)
+            if labels[key] == nil { labels[key] = cleaned }
+            guard labels.count <= maximumTags else {
+                throw SessionManagementStoreError.invalidInput("每个项目最多保存 8 个不同标签。")
+            }
+        }
+        return labels.keys.sorted().compactMap { labels[$0] }
     }
 
     private static func validateIdentity(_ value: String) throws {

@@ -27,6 +27,7 @@ struct SessionsContent: View {
     @State private var messageRangeStart: Int
     @State private var showTokenDetails = false
     @State private var editingSession: CodexSessionSummary?
+    @State private var editingProject: SessionProjectSummary?
     private let initiallyExpandedWarnings: Bool
 
     init(model: SessionDesktopModel, initiallyExpandedMessageIDs: Set<String> = [],
@@ -53,7 +54,7 @@ struct SessionsContent: View {
                 }
             }
             controls
-            SessionManagementStatus(model: model.management, showsWriteError: editingSession == nil)
+            SessionManagementStatus(model: model.management, showsWriteError: editingSession == nil && editingProject == nil)
             if let error = model.errorMessage {
                 SessionWarningsDisclosure(title: "读取失败", warnings: [error], initiallyExpanded: true)
             }
@@ -63,7 +64,8 @@ struct SessionsContent: View {
             }
             if section != .sessions {
                 SessionProjectsContent(model: model, showStatistics: section == .statistics,
-                                       onShowStatistics: { section = .statistics }) { project in
+                                       onShowStatistics: { section = .statistics },
+                                       onEditProjectTags: { beginEditingTags($0) }) { project in
                     model.selectedProject = project.id
                     section = .sessions
                 }
@@ -92,6 +94,9 @@ struct SessionsContent: View {
             .sheet(item: $editingSession) { summary in
                 SessionMetadataEditor(model: model, summary: summary)
             }
+            .sheet(item: $editingProject) { project in
+                ProjectTagsEditor(model: model, project: project)
+            }
     }
 
     private var controls: some View {
@@ -119,20 +124,31 @@ struct SessionsContent: View {
                 }.disabled(model.isLoading)
             }
             HStack(spacing: 16) {
+                Picker("项目标签", selection: $model.selectedProjectTag) {
+                    Text("全部标签").tag(Optional<String>.none)
+                    ForEach(model.availableProjectTags, id: \.self) { tag in
+                        Text(tag).tag(Optional(tag))
+                    }
+                }.frame(maxWidth: 210).help("按项目标签筛选项目、会话与统计")
+                if model.selectedProjectTag != nil {
+                    Button { model.selectedProjectTag = nil } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.plain).foregroundStyle(MemoryStyle.secondary)
+                        .help("清除项目标签筛选").accessibilityLabel("清除项目标签筛选")
+                }
                 Toggle("会话仅显示收藏", isOn: $model.onlyFavoriteSessions).toggleStyle(.checkbox)
                 if section == .projects {
                     Toggle("项目列表仅显示收藏", isOn: $model.onlyFavoriteProjects).toggleStyle(.checkbox)
                 }
                 Spacer()
-                Text("收藏、名称和备注保存在本机；原始日志只读。")
-                    .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
             }.font(.system(size: 11))
             if section == .projects && model.onlyFavoriteProjects {
                 Text("收藏项目开关仅筛选项目列表；统计卡片包含全部匹配会话。")
                     .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
             }
-            Text("用量按完整会话汇总；缓存属于输入、推理属于输出，缺失时显示已知合计。")
-                .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary).lineLimit(1)
+            Text(model.selectedProjectTag == nil
+                 ? "收藏、标签、名称和备注保存在本机，日志只读。用量按完整会话汇总，缓存属于输入、推理属于输出。"
+                 : "标签筛选影响项目、会话与统计；用量按完整会话汇总，缓存属于输入、推理属于输出。")
+                .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary).lineLimit(2)
         }
     }
 
@@ -241,6 +257,11 @@ struct SessionsContent: View {
             $0.id == summary.id && $0.sessionID == summary.sessionID && $0.fileURL == summary.fileURL
         }) else { return }
         editingSession = summary
+    }
+
+    private func beginEditingTags(_ project: SessionProjectSummary) {
+        guard canManage, model.projectPaths.contains(project.id) else { return }
+        editingProject = project
     }
 
     private func row(_ session: CodexSessionSummary) -> some View {

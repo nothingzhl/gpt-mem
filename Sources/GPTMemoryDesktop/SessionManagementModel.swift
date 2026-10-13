@@ -6,50 +6,86 @@ import GPTSessionKit
 /// summaries remain unchanged, including their title and prompt search index.
 struct SessionManagementIndex: Sendable {
     let sessions: [String: SessionManagementEntry]
+    let projects: [String: SessionManagementEntry]
+    private let projectTagKeys: [String: Set<String>]
     let favoriteProjects: Set<String>
 
     init(snapshot: SessionManagementSnapshot = .init()) {
         var sessions: [String: SessionManagementEntry] = [:]
+        var projects: [String: SessionManagementEntry] = [:]
+        var tagKeys: [String: Set<String>] = [:]
         var favorites: Set<String> = []
         for entry in snapshot.entries {
             switch entry.kind {
             case .session: sessions[entry.itemID] = entry
-            case .project: if entry.isFavorite { favorites.insert(entry.itemID) }
+            case .project:
+                projects[entry.itemID] = entry
+                tagKeys[entry.itemID] = Set(entry.tags.map(SessionManagementStore.tagKey))
+                if entry.isFavorite { favorites.insert(entry.itemID) }
             }
         }
         self.sessions = sessions
+        self.projects = projects
+        projectTagKeys = tagKeys
         favoriteProjects = favorites
     }
 
     func entry(for summary: CodexSessionSummary) -> SessionManagementEntry? { sessions[summary.managementID] }
     func isFavorite(_ summary: CodexSessionSummary) -> Bool { entry(for: summary)?.isFavorite ?? false }
     func isFavoriteProject(_ path: String) -> Bool { favoriteProjects.contains(Self.projectID(path)) }
+    func entryForProject(_ path: String) -> SessionManagementEntry? { projects[Self.projectID(path)] }
+    func hasProjectTag(_ path: String, key: String) -> Bool { projectTagKeys[Self.projectID(path)]?.contains(key) ?? false }
+    func tagSearchKeys(_ path: String) -> Set<String> { projectTagKeys[Self.projectID(path)] ?? [] }
+
+    static func projectPath(for summary: CodexSessionSummary) -> String {
+        summary.projectPath.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+            ?? SessionProjectSummary.unknownID
+    }
 
     static func projectID(_ path: String) -> String {
         path == SessionProjectSummary.unknownID ? "group:unknown-project" : path
     }
 }
 
+private enum SessionManagementPurpose: Sendable { case automatic, details, tags }
+
 private struct SessionManagementOperation: Sendable {
     let kind: SessionManagementKind
     let itemID: String
     let change: SessionManagementChange
     let expectedEntry: SessionManagementEntry?
+    let purpose: SessionManagementPurpose
 
     var editsDetails: Bool {
+        if case .details = purpose { return true }
+        if case .tags = purpose { return false }
         switch change {
         case .setDisplayName, .setNote, .setDetails: return true
-        case .update(let favorite, _, _): return favorite == nil
+        case .update(let favorite, _, _, let tags): return favorite == nil && tags == nil
+        default: return false
+        }
+    }
+
+    var editsTags: Bool {
+        if case .tags = purpose { return true }
+        if case .details = purpose { return false }
+        switch change {
+        case .setTags: return true
+        case .update(let favorite, let name, let note, let tags):
+            guard favorite == nil, tags != nil else { return false }
+            if case .unchanged = name, case .unchanged = note { return true }
+            return false
         default: return false
         }
     }
 
     init(kind: SessionManagementKind, itemID: String, change: SessionManagementChange,
-         expectedEntry: SessionManagementEntry? = nil) {
+         expectedEntry: SessionManagementEntry? = nil, purpose: SessionManagementPurpose = .automatic) {
         self.kind = kind
         self.itemID = itemID
         self.change = change
         self.expectedEntry = expectedEntry
+        self.purpose = purpose
     }
 }
 
@@ -102,7 +138,7 @@ private actor SessionManagementIO {
         let changed = try SessionManagementStore.applying(change: operation.change,
             to: existing ?? .init(kind: operation.kind, itemID: operation.itemID), expectedEntry: operation.expectedEntry)
         entries.removeAll { $0.kind == operation.kind && $0.itemID == operation.itemID }
-        if changed.isFavorite || changed.displayName != nil || changed.note != nil {
+        if changed.isFavorite || changed.displayName != nil || changed.note != nil || !changed.tags.isEmpty {
             entries.append(changed)
         }
         memory = .init(revision: memory.revision &+ 1, entries: entries)
@@ -133,6 +169,7 @@ final class SessionManagementModel: ObservableObject {
     private var failedOperation: SessionManagementOperation?
     private var lastSaveError: String?
     private var directDetailsError: (itemID: String, message: String)?
+    private var directTagsError: (itemID: String, message: String)?
 
     init(directoryURL: URL?, sourceRootURL: URL) {
         io = SessionManagementIO(directoryURL: directoryURL, sourceRootURL: sourceRootURL)
@@ -196,6 +233,7 @@ final class SessionManagementModel: ObservableObject {
         isSaving = true
         errorMessage = nil
         directDetailsError = nil
+        directTagsError = nil
         let task = Task { [weak self, io] () -> Bool in
             _ = await previous?.value
             guard let self else { return false }
@@ -241,13 +279,30 @@ final class SessionManagementModel: ObservableObject {
             change = .setDetails(displayName: title, note: note)
         }
         guard let task = enqueue(.init(kind: .session, itemID: itemID,
-                                      change: change, expectedEntry: baseline)) else { return false }
+                                      change: change, expectedEntry: baseline, purpose: .details)) else { return false }
         return await task.value
     }
 
     func retryLastMutation() {
         guard !isSaving, let failedOperation else { return }
         _ = enqueue(failedOperation)
+    }
+
+    func saveProjectTags(itemID: String, tags: [String], baseline: SessionManagementEntry) async -> Bool {
+        let tagsChange: [String]?
+        do {
+            let normalized = try SessionManagementStore.normalizedTags(tags)
+            tagsChange = normalized == baseline.tags ? nil : normalized
+        } catch {
+            // Keep the validation failure in the same owned retry/discard path
+            // as a disk failure, without touching any file before validation.
+            guard let task = enqueue(.init(kind: .project, itemID: itemID,
+                                          change: .setTags(tags), expectedEntry: baseline, purpose: .tags)) else { return false }
+            return await task.value
+        }
+        guard let task = enqueue(.init(kind: .project, itemID: itemID,
+            change: .update(isFavorite: nil, tags: tagsChange), expectedEntry: baseline, purpose: .tags)) else { return false }
+        return await task.value
     }
 
     /// Discarding an editor draft is purely local. It must not leave that draft
@@ -269,9 +324,29 @@ final class SessionManagementModel: ObservableObject {
         }
     }
 
+    func discardFailedProjectTags(itemID: String) {
+        guard !isSaving else { return }
+        if let failedOperation, failedOperation.kind == .project,
+           failedOperation.itemID == itemID, failedOperation.editsTags {
+            let ownedError = lastSaveError
+            self.failedOperation = nil
+            lastSaveError = nil
+            hasPendingRetry = false
+            if errorMessage == ownedError { errorMessage = nil }
+        }
+        if let directTagsError, directTagsError.itemID == itemID {
+            self.directTagsError = nil
+            if errorMessage == directTagsError.message { errorMessage = lastSaveError }
+        }
+    }
+
     func dismissError() { errorMessage = nil }
     func reportError(_ message: String, detailsItemID: String? = nil) {
         if let detailsItemID { directDetailsError = (detailsItemID, message) }
+        errorMessage = message
+    }
+    func reportProjectTagsError(_ message: String, itemID: String) {
+        directTagsError = (itemID, message)
         errorMessage = message
     }
 

@@ -1114,9 +1114,216 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
     print("PASS editor-cancelled details never retry, committed values preserved, unrelated session/favorite retry and load error retained")
 }
 
+@MainActor func projectBaseline(_ state: SessionDesktopModel, _ path: String) -> SessionManagementEntry {
+    state.management.index.entryForProject(path)
+        ?? .init(kind: .project, itemID: SessionManagementIndex.projectID(path))
+}
+
+@MainActor func checkProjectTagFilteringAndPersistence() async throws -> SessionDesktopModel {
+    let root = try fixtureRoot("project-tags-source")
+    let directory = try fixtureRoot("project-tags-data")
+    let a = summary("tag-a", project: "/workspace/alpha/demo", tokens: .init(total: 10), metadataSessionID: "tag-a")
+    let b = summary("tag-b", project: "/workspace/beta/demo", tokens: .init(total: 20), metadataSessionID: "tag-b")
+    let unknown = summary("tag-unknown", project: "", tokens: .init(total: 30), metadataSessionID: "tag-unknown")
+    let archived = summary("tag-archived", project: a.projectPath!, archived: true, tokens: .init(total: 40), metadataSessionID: "tag-archived")
+    let catalog = SessionCatalog(sessions: [a, b, unknown, archived])
+    let source = FixtureSource(catalogs: [.init(delay: 0, result: .success(catalog))])
+    let state = managedModel(source, root: root, directory: directory)
+    try await load(state)
+    let savedA = await state.saveProjectTags(a.projectPath!, tags: [" Work ", "work", "Bug"], baseline: projectBaseline(state, a.projectPath!))
+    try expect(savedA, "project tags save using a frozen project baseline")
+    try await managementIdle(state)
+    let savedB = await state.saveProjectTags(b.projectPath!, tags: ["Personal"], baseline: projectBaseline(state, b.projectPath!))
+    try expect(savedB, "a same-basename project keeps its own tags")
+    try await managementIdle(state)
+    let savedUnknown = await state.saveProjectTags(SessionProjectSummary.unknownID, tags: ["待确认"],
+                                                  baseline: projectBaseline(state, SessionProjectSummary.unknownID))
+    try expect(savedUnknown, "unknown project tags use the reserved management grouping key")
+    try await managementIdle(state)
+    try expect(state.projectTags(a.projectPath!).count == 2 && state.projectTags(b.projectPath!) == ["Personal"],
+               "trimmed case variants deduplicate without merging same-basename projects")
+    try expect(state.availableProjectTags.count == 4, "tag choices combine current catalog projects with casefold deduplication")
+    let detailSaved = await state.saveSessionMetadata(a, title: "项目排错", note: "数据库连接池")
+    try expect(detailSaved, "tag search fixture includes local session details")
+    try await managementIdle(state)
+    state.toggleProjectFavorite(a.projectPath!)
+    try await managementIdle(state)
+    state.selectedProjectTag = "wOrK"
+    try await filtered(state)
+    try expect(state.filteredSessions.map(\.id) == [a.id] && state.analytics.projects.map(\.id) == [a.projectPath!]
+        && state.total(\.effectiveTotal).value == 10,
+               "casefold tag filter applies globally to session lists, projects, statistics and known totals")
+    try expect(state.availableProjectTags.contains("wOrK"), "tag picker includes the exact selected display variant")
+    state.includeArchived = true
+    try await filtered(state)
+    try expect(state.filteredSessions.count == 2 && state.total(\.effectiveTotal).value == 50,
+               "tag filter AND archive inclusion preserves recorded counters")
+    state.onlyFavoriteSessions = true
+    try await filtered(state)
+    try expect(state.filteredSessions.isEmpty, "tag and favorite-session filters combine with AND")
+    state.toggleSessionFavorite(a)
+    try await managementIdle(state)
+    try expect(state.filteredSessions.map(\.id) == [a.id] && state.total(\.effectiveTotal).value == 10,
+               "bookmark changes invalidate filtered tag results")
+    state.onlyFavoriteSessions = false
+    state.selectedProject = b.projectPath
+    try await filtered(state)
+    try expect(state.filteredSessions.isEmpty, "tag and exact project filters combine without matching sibling basenames")
+    state.selectedProject = nil
+    state.query = "WORK 连接池 second"
+    try await filtered(state)
+    try expect(state.filteredSessions.map(\.id) == [a.id], "query AND terms can span project tags, local notes and source prompts")
+    state.query = "不匹配"
+    state.query = "bug SECOND"
+    try await filtered(state)
+    try expect(state.filteredSessions.map(\.id) == [a.id, archived.id], "latest debounced tag-search generation wins")
+    state.query = ""
+    try await filtered(state)
+    let changedCase = await state.saveProjectTags(a.projectPath!, tags: ["work", "Bug"], baseline: projectBaseline(state, a.projectPath!))
+    try expect(changedCase, "tag display case can be changed without changing its filter identity")
+    try await managementIdle(state)
+    try expect(state.availableProjectTags.contains("wOrK") && state.filteredSessions.count == 2,
+               "case-only external metadata display changes keep a valid exact picker choice")
+    let removed = await state.saveProjectTags(a.projectPath!, tags: [], baseline: projectBaseline(state, a.projectPath!))
+    try expect(removed, "last project instance of a selected tag can be removed")
+    try await managementIdle(state)
+    try expect(state.selectedProjectTag == "wOrK" && state.availableProjectTags.contains("wOrK") && state.filteredSessions.isEmpty,
+               "removing the selected tag retains explicit empty filtering instead of silently broadening results")
+    state.selectedProjectTag = nil
+    try await filtered(state)
+    try expect(state.filteredSessions.count == 4 && state.total(\.effectiveTotal).value == 100,
+               "clearing an unavailable tag restores the intended archive/query scope")
+    state.selectedProjectTag = "待确认"
+    try await filtered(state)
+    try expect(state.filteredSessions.map(\.id) == [unknown.id] && state.analytics.projects.first?.id == SessionProjectSummary.unknownID,
+               "unknown-project labels filter only the unknown grouping")
+    state.selectedProjectTag = nil
+    try await filtered(state)
+    let previewTags = ["A" + String(repeating: "长", count: 19), "B" + String(repeating: "宽", count: 19), "工作", "后端", "待验证"]
+    let previewSaved = await state.saveProjectTags(a.projectPath!, tags: previewTags, baseline: projectBaseline(state, a.projectPath!))
+    try expect(previewSaved, "project tag preview fixture saved")
+    try await managementIdle(state)
+    let reopened = managedModel(source, root: root, directory: directory)
+    try await load(reopened)
+    try expect(reopened.projectTags(a.projectPath!) == state.projectTags(a.projectPath!)
+        && reopened.projectTags(b.projectPath!) == ["Personal"] && reopened.projectTags(SessionProjectSummary.unknownID) == ["待确认"],
+               "project tags persist across a desktop model restart")
+    try expect(reopened.isFavoriteProject(a.projectPath!) && reopened.displayTitle(for: a) == "项目排错",
+               "project tags preserve existing bookmarks and session details")
+    try expect(state.sessions == catalog.sessions, "project tagging never changes source summaries or token counters")
+    let inMemory = try model(source, name: "project-tags-memory")
+    try await load(inMemory)
+    let memorySaved = await inMemory.saveProjectTags(a.projectPath!, tags: ["内存夹具"], baseline: projectBaseline(inMemory, a.projectPath!))
+    try expect(memorySaved, "isolated in-memory backend accepts project tags")
+    try await managementIdle(inMemory)
+    let memoryReloaded = await inMemory.management.reload()
+    try expect(memoryReloaded && inMemory.projectTags(a.projectPath!) == ["内存夹具"],
+               "nonempty tags retain an otherwise empty in-memory management entry")
+    print("PASS project tag persistence, fixed-locale casefold, global AND filters/totals/search, missing picker choices, unknown groups and memory retention")
+    return state
+}
+
+@MainActor func checkProjectTagConflictFailureAndCancel() async throws {
+    let root = try fixtureRoot("project-tags-conflict-source")
+    let directory = try fixtureRoot("project-tags-conflict-data")
+    let a = summary("tag-conflict-a", project: "/workspace/tag-first", metadataSessionID: "tag-conflict-a")
+    let b = summary("tag-conflict-b", project: "/workspace/tag-second", metadataSessionID: "tag-conflict-b")
+    let source = FixtureSource(catalogs: [.init(delay: 0, result: .success(.init(sessions: [a, b])))])
+    let first = managedModel(source, root: root, directory: directory)
+    try await load(first)
+    let initial = await first.saveProjectTags(a.projectPath!, tags: ["原标签"], baseline: projectBaseline(first, a.projectPath!))
+    try expect(initial, "tag conflict baseline fixture saved")
+    try await managementIdle(first)
+    first.toggleProjectFavorite(a.projectPath!)
+    try await managementIdle(first)
+    let stale = projectBaseline(first, a.projectPath!)
+    let second = managedModel(source, root: root, directory: directory)
+    try await load(second)
+    let external = await second.saveProjectTags(a.projectPath!, tags: ["外部标签"], baseline: projectBaseline(second, a.projectPath!))
+    try expect(external, "second instance tag update saved")
+    try await managementIdle(second)
+    let unchanged = await first.saveProjectTags(a.projectPath!, tags: ["原标签"], baseline: stale)
+    try expect(unchanged && first.projectTags(a.projectPath!) == ["外部标签"] && first.isFavoriteProject(a.projectPath!),
+               "a stale unchanged tag draft does not overwrite newer tags or bookmarks")
+    try await managementIdle(first)
+    let conflictBaseline = projectBaseline(first, a.projectPath!)
+    let externalAgain = await second.saveProjectTags(a.projectPath!, tags: ["更新的外部标签"], baseline: projectBaseline(second, a.projectPath!))
+    try expect(externalAgain, "second instance advances the same tag field again")
+    try await managementIdle(second)
+    let conflict = await first.saveProjectTags(a.projectPath!, tags: ["本地草稿"], baseline: conflictBaseline)
+    try expect(!conflict && first.management.hasPendingRetry && first.projectTags(a.projectPath!) == ["外部标签"],
+               "changed-tag conflicts fail and preserve the previously committed UI value")
+    let store = try SessionManagementStore(directoryURL: directory, sourceRootURL: root)
+    let diskAfterConflict = try store.load().entry(kind: .project, itemID: a.projectPath!)
+    try expect(diskAfterConflict?.tags == ["更新的外部标签"] && diskAfterConflict?.isFavorite == true,
+               "a conflicting tag draft cannot overwrite external tags or unrelated bookmark state")
+    first.discardFailedProjectTags(b.projectPath!)
+    try expect(first.management.hasPendingRetry, "cancelling a different project's editor preserves the tag retry")
+    first.discardFailedProjectTags(a.projectPath!)
+    try expect(!first.management.hasPendingRetry && first.management.errorMessage == nil, "cancelling the matching tags editor clears its failed draft")
+    first.management.retryLastMutation()
+    try await managementIdle(first)
+    let afterCancel = try store.load().entry(kind: .project, itemID: a.projectPath!)
+    try expect(afterCancel?.tags == ["更新的外部标签"], "a later retry cannot revive cancelled project tags")
+    let reloaded = await first.management.reload()
+    try expect(reloaded, "tag editor can explicitly load a fresh baseline")
+    try await managementIdle(first)
+    let confirmed = await first.saveProjectTags(a.projectPath!, tags: ["确认后的草稿"], baseline: projectBaseline(first, a.projectPath!))
+    try expect(confirmed && first.projectTags(a.projectPath!) == ["确认后的草稿"], "explicit refreshed-baseline save commits a retained user draft")
+    try await managementIdle(first)
+    let invalid = await first.saveProjectTags(a.projectPath!, tags: [String(repeating: "长", count: 21)], baseline: projectBaseline(first, a.projectPath!))
+    try expect(!invalid && first.management.hasPendingRetry && first.projectTags(a.projectPath!) == ["确认后的草稿"],
+               "invalid tags preserve the saved value and expose an owned retryable failure")
+    first.discardFailedProjectTags(a.projectPath!)
+    try expect(!first.management.hasPendingRetry, "invalid cancelled tags are removed from retry state")
+    var goodBytes = try Data(contentsOf: store.fileURL)
+    let malformed = Data("broken project tag fixture".utf8)
+    try malformed.write(to: store.fileURL)
+    first.toggleProjectFavorite(a.projectPath!)
+    try await managementIdle(first)
+    first.discardFailedProjectTags(a.projectPath!)
+    try expect(first.management.hasPendingRetry, "tag-editor cancellation preserves a same-project favorite failure")
+    try goodBytes.write(to: store.fileURL)
+    first.management.retryLastMutation()
+    try await managementIdle(first)
+    try expect(!first.isFavoriteProject(a.projectPath!) && first.projectTags(a.projectPath!) == ["确认后的草稿"],
+               "the unaffected favorite operation can still retry without erasing tags")
+    goodBytes = try Data(contentsOf: store.fileURL)
+    try malformed.write(to: store.fileURL)
+    let failedDetails = await first.saveSessionMetadata(a, title: "会话详情待重试", note: "")
+    try expect(!failedDetails, "unrelated session-details failure fixture created")
+    first.discardFailedProjectTags(a.projectPath!)
+    try expect(first.management.hasPendingRetry, "tag cancellation preserves unrelated failed session details")
+    try goodBytes.write(to: store.fileURL)
+    first.management.retryLastMutation()
+    try await managementIdle(first)
+    try expect(first.displayTitle(for: a) == "会话详情待重试", "unrelated session details still save through their retry")
+    goodBytes = try Data(contentsOf: store.fileURL)
+    try malformed.write(to: store.fileURL)
+    let failedUnchanged = await first.saveProjectTags(a.projectPath!, tags: first.projectTags(a.projectPath!), baseline: projectBaseline(first, a.projectPath!))
+    try expect(!failedUnchanged, "an unchanged tag draft still reports an unreadable store")
+    let readFailed = await first.management.reload()
+    try expect(!readFailed, "tag cancellation fixture has a later load failure")
+    let readError = first.management.errorMessage
+    first.discardFailedProjectTags(a.projectPath!)
+    try expect(!first.management.hasPendingRetry && first.management.errorMessage == readError,
+               "cancelling even an unchanged failed tag operation preserves a later load error")
+    try goodBytes.write(to: store.fileURL)
+    let repaired = await first.management.reload()
+    try expect(repaired, "repaired tag fixture is readable")
+    let stalePath = "/workspace/no-longer-in-catalog"
+    let staleSave = await first.saveProjectTags(stalePath, tags: ["不得写入"], baseline: .init(kind: .project, itemID: stalePath))
+    try expect(!staleSave && first.management.errorMessage?.contains("来源已变化") == true,
+               "tag editor rejects projects absent from its current catalog")
+    first.discardFailedProjectTags(stalePath)
+    try expect(first.management.errorMessage == nil && !first.management.hasPendingRetry,
+               "cancelling stale project tags clears only their target-specific error")
+    print("PASS tag baseline conflict, unchanged-field preservation, explicit rebase, validation, narrow cancellation, unrelated retries/load errors and stale targets")
+}
+
 #if RENDER_SESSIONS
 @MainActor func render(_ state: SessionDesktopModel, projects: SessionDesktopModel, indexed: SessionDesktopModel,
-                       managed: SessionDesktopModel,
+                       managed: SessionDesktopModel, tagged: SessionDesktopModel,
                        warnings: SessionDesktopModel, errors: SessionDesktopModel, to path: String) async throws {
     _ = NSApplication.shared
     NSApplication.shared.setActivationPolicy(.prohibited)
@@ -1131,6 +1338,8 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
     let warningsOutput = output.deletingLastPathComponent().appendingPathComponent("desktop-warnings-preview.png")
     let errorsOutput = output.deletingLastPathComponent().appendingPathComponent("desktop-errors-preview.png")
     let managementOutput = output.deletingLastPathComponent().appendingPathComponent("desktop-management-preview.png")
+    let tagProjectsOutput = output.deletingLastPathComponent().appendingPathComponent("desktop-project-tags-preview.png")
+    let tagProjectsNarrowOutput = output.deletingLastPathComponent().appendingPathComponent("desktop-project-tags-narrow-preview.png")
     for (destination, height, section, previewModel) in [(output, CGFloat(620), SessionWorkspaceSection.sessions, state),
         (expandedOutput, CGFloat(1000), SessionWorkspaceSection.sessions, state),
         (projectsOutput, CGFloat(620), SessionWorkspaceSection.projects, projects),
@@ -1138,7 +1347,10 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
         (paginationOutput, CGFloat(620), SessionWorkspaceSection.sessions, indexed),
         (warningsOutput, CGFloat(620), SessionWorkspaceSection.sessions, warnings),
         (errorsOutput, CGFloat(620), SessionWorkspaceSection.sessions, errors),
-        (managementOutput, CGFloat(620), SessionWorkspaceSection.sessions, managed)] {
+        (managementOutput, CGFloat(620), SessionWorkspaceSection.sessions, managed),
+        (tagProjectsOutput, CGFloat(620), SessionWorkspaceSection.projects, tagged),
+        (tagProjectsNarrowOutput, CGFloat(620), SessionWorkspaceSection.projects, tagged)] {
+        let width: CGFloat = destination == tagProjectsNarrowOutput ? 744 : 888
         let content = VStack(alignment: .leading, spacing: 14) {
             Text(section == .sessions ? "Codex 会话 · 模拟数据预览" : "Codex 项目与统计 · 模拟数据预览")
                 .font(.system(size: 22, weight: .semibold))
@@ -1147,10 +1359,10 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
             SessionsContent(model: previewModel,
                 initiallyExpandedMessageIDs: expanded, initialSection: section,
                 initiallyExpandedWarnings: destination == warningsOutput)
-        }.padding(18).frame(width: 888, height: height, alignment: .topLeading)
+        }.padding(18).frame(width: width, height: height, alignment: .topLeading)
             .background(MemoryStyle.background).foregroundStyle(MemoryStyle.text).tint(MemoryStyle.accent)
         let hosting = NSHostingView(rootView: content)
-        hosting.frame = NSRect(x: 0, y: 0, width: 888, height: height)
+        hosting.frame = NSRect(x: 0, y: 0, width: width, height: height)
         hosting.layoutSubtreeIfNeeded()
         try await Task.sleep(nanoseconds: 70_000_000)
         hosting.layoutSubtreeIfNeeded()
@@ -1189,6 +1401,32 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
     }
     try editorPNG.write(to: editorOutput)
     print("RENDER \(editorOutput.lastPathComponent)")
+    guard let editedProject = tagged.analytics.projects.first(where: { tagged.projectTags($0.id).count > 2 }) else {
+        throw CheckFailure(message: "project tags editor preview fixture missing")
+    }
+    let tagsEditorOutput = output.deletingLastPathComponent().appendingPathComponent("desktop-project-tags-editor-preview.png")
+    let tagsEditorContent = ProjectTagsEditor(model: tagged, project: editedProject)
+        .frame(width: 540, height: 580).background(MemoryStyle.background)
+        .foregroundStyle(MemoryStyle.text).tint(MemoryStyle.accent)
+    let tagsEditorHosting = NSHostingView(rootView: tagsEditorContent)
+    let tagsEditorWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 580),
+                                    styleMask: .borderless, backing: .buffered, defer: false)
+    tagsEditorWindow.isReleasedWhenClosed = false
+    tagsEditorWindow.contentView = tagsEditorHosting
+    tagsEditorHosting.frame = NSRect(x: 0, y: 0, width: 540, height: 580)
+    defer { tagsEditorWindow.close() }
+    tagsEditorHosting.layoutSubtreeIfNeeded()
+    try await Task.sleep(nanoseconds: 70_000_000)
+    tagsEditorHosting.layoutSubtreeIfNeeded()
+    guard let tagsBitmap = tagsEditorHosting.bitmapImageRepForCachingDisplay(in: tagsEditorHosting.bounds) else {
+        throw CheckFailure(message: "could not create offscreen project tags editor image")
+    }
+    tagsEditorHosting.cacheDisplay(in: tagsEditorHosting.bounds, to: tagsBitmap)
+    guard let tagsPNG = tagsBitmap.representation(using: .png, properties: [:]) else {
+        throw CheckFailure(message: "could not encode project tags editor preview PNG")
+    }
+    try tagsPNG.write(to: tagsEditorOutput)
+    print("RENDER \(tagsEditorOutput.lastPathComponent)")
 }
 #endif
 
@@ -1214,10 +1452,12 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
     try await checkManagementIdentityAndPendingQuit()
     try await checkManagementEditorBaselineConflicts()
     try await checkManagementDiscardFailedDraft()
-    print("DESKTOP SESSION CHECKS PASSED: 21 workflows, \(assertionCount) assertions; isolated fixtures only")
+    let tagged = try await checkProjectTagFilteringAndPersistence()
+    try await checkProjectTagConflictFailureAndCancel()
+    print("DESKTOP SESSION CHECKS PASSED: 23 workflows, \(assertionCount) assertions; isolated fixtures only")
     #if RENDER_SESSIONS
     if let output = ProcessInfo.processInfo.environment["GPT_DESKTOP_SESSION_RENDER_PATH"] {
-        try await render(state, projects: projects, indexed: indexed, managed: managed,
+        try await render(state, projects: projects, indexed: indexed, managed: managed, tagged: tagged,
                          warnings: warnings, errors: errors, to: output)
     }
     #endif

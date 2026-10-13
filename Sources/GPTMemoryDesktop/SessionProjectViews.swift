@@ -7,6 +7,7 @@ struct SessionProjectsContent: View {
     @ObservedObject var model: SessionDesktopModel
     var showStatistics = false
     var onShowStatistics: () -> Void = {}
+    var onEditProjectTags: (SessionProjectSummary) -> Void = { _ in }
     let onOpenProject: (SessionProjectSummary) -> Void
     @State private var finderError: String?
 
@@ -21,7 +22,7 @@ struct SessionProjectsContent: View {
                 } else if model.isFiltering && model.analytics.projects.isEmpty {
                     MemoryEmptyState(icon: "folder", title: "正在筛选项目", detail: "正在后台更新项目和统计。")
                 } else if model.analytics.projects.isEmpty {
-                    MemoryEmptyState(icon: "folder", title: "没有匹配的项目", detail: "调整搜索词、归档开关或项目筛选。")
+                    MemoryEmptyState(icon: "folder", title: "没有匹配的项目", detail: "调整搜索词、标签、归档开关或项目筛选。")
                 } else if !showStatistics && model.displayedProjects.isEmpty {
                     MemoryEmptyState(icon: "star", title: "暂无收藏项目", detail: "关闭“项目列表仅显示收藏”，再点击项目旁的星标收藏。")
                 } else {
@@ -225,6 +226,13 @@ struct SessionProjectsContent: View {
                     guard canManage else { return }
                     model.toggleProjectFavorite(project.id)
                 }
+                Button {
+                    guard canManage, model.displayedProjects.contains(where: { $0.id == project.id }) else { return }
+                    onEditProjectTags(project)
+                } label: {
+                    Image(systemName: "tag").frame(width: 32, height: 32).contentShape(Rectangle())
+                }.buttonStyle(.plain).foregroundStyle(MemoryStyle.secondary).disabled(!canManage)
+                    .help("编辑项目标签").accessibilityLabel("编辑项目标签：\(project.projectPath ?? project.displayName)")
                 if let path = project.projectPath, path.hasPrefix("/") {
                     Button { revealProjectDirectory(path) } label: {
                         Image(systemName: "folder").frame(width: 32, height: 32).contentShape(Rectangle())
@@ -261,6 +269,18 @@ struct SessionProjectsContent: View {
             }
             Text(project.projectPath ?? "日志未记录项目路径").font(.system(size: 10))
                 .foregroundStyle(MemoryStyle.secondary).lineLimit(1).truncationMode(.middle)
+            if !model.projectTags(project.id).isEmpty {
+                HStack(spacing: 5) {
+                    ForEach(Array(model.projectTags(project.id).prefix(2)), id: \.self) { tag in
+                        ProjectTagChip(tag: tag)
+                    }
+                    if model.projectTags(project.id).count > 2 {
+                        Text("+\(model.projectTags(project.id).count - 2)")
+                            .font(.system(size: 9)).foregroundStyle(MemoryStyle.secondary)
+                    }
+                    Spacer(minLength: 0)
+                }
+            }
             HStack {
                 Text("\(project.sessionCount) 个会话 · \(project.modelCount) 个已记录模型")
                 Spacer()

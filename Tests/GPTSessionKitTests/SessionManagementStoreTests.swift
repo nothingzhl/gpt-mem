@@ -51,6 +51,154 @@ final class SessionManagementStoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: fixture.originalLog), fixture.originalBytes)
     }
 
+    func testVersionOneLoadsWithoutRewriteAndFirstChangeMigratesWithoutLosingDetails() throws {
+        let fixture = try ManagementFixture(); defer { fixture.remove() }
+        let store = try fixture.store()
+        let initial = try store.patch(kind: .session, itemID: "existing-session",
+                                      change: .update(isFavorite: true, displayName: .set("原名称"), note: .set("旧备注\n保留")))
+        _ = try store.patch(kind: .project, itemID: "/old-project", change: .setFavorite(true))
+        var document = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: store.fileURL)) as? [String: Any])
+        document["version"] = 1
+        document["entries"] = try XCTUnwrap(document["entries"] as? [[String: Any]]).map { value in
+            var value = value; value.removeValue(forKey: "tags"); return value
+        }
+        let legacyBytes = try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys])
+        try legacyBytes.write(to: store.fileURL)
+        let legacy = try fixture.store().load()
+        XCTAssertEqual(legacy.revision, 2)
+        XCTAssertEqual(legacy.entries.count, 2)
+        XCTAssertEqual(legacy.entry(kind: .session, itemID: "existing-session"), initial.entries.first)
+        XCTAssertTrue(legacy.entries.allSatisfy { $0.tags.isEmpty })
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), legacyBytes)
+        _ = try store.patch(kind: .project, itemID: "/old-project", change: .setFavorite(true))
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), legacyBytes)
+        let migrated = try store.patch(kind: .project, itemID: "/old-project", change: .setTags(["进行中"]))
+        XCTAssertEqual(migrated.revision, 3)
+        XCTAssertEqual(migrated.entry(kind: .session, itemID: "existing-session"), initial.entries.first)
+        XCTAssertEqual(migrated.entry(kind: .project, itemID: "/old-project")?.isFavorite, true)
+        XCTAssertEqual(migrated.entry(kind: .project, itemID: "/old-project")?.tags, ["进行中"])
+        let written = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: store.fileURL)) as? [String: Any])
+        XCTAssertEqual(written["version"] as? Int, 2)
+        XCTAssertTrue(try XCTUnwrap(written["entries"] as? [[String: Any]]).allSatisfy { $0["tags"] is [String] })
+        XCTAssertEqual(try fixture.store().load(), migrated)
+        XCTAssertEqual(try Data(contentsOf: fixture.originalLog), fixture.originalBytes)
+    }
+
+    func testTagNormalizationUsesCanonicalUnicodeFixedCaseMatchingAndFirstSpelling() throws {
+        XCTAssertEqual(SessionManagementStore.maximumTags, 8)
+        XCTAssertEqual(SessionManagementStore.maximumTagCharacters, 20)
+        XCTAssertEqual(SessionManagementStore.maximumTagBytes, 256)
+        XCTAssertEqual(try SessionManagementStore.normalizedTags(["zeta", " AI ", "ai", "研发", "开发", "", " É ", "E\u{0301}"]),
+                       ["AI", "zeta", "É", "开发", "研发"])
+        let canonical = try SessionManagementStore.normalizedTags(["e\u{0301}"])
+        XCTAssertEqual(canonical.first?.utf8.map { $0 }, Array("é".utf8))
+        XCTAssertEqual(SessionManagementStore.tagKey("É"), SessionManagementStore.tagKey("e\u{0301}"))
+        XCTAssertEqual(SessionManagementStore.tagKey("I"), "i")
+        XCTAssertNotEqual(SessionManagementStore.tagKey("résumé"), SessionManagementStore.tagKey("resume"))
+        let eight = (0..<8).map { "Tag\($0)" }
+        XCTAssertEqual(try SessionManagementStore.normalizedTags(eight + eight.map { $0.lowercased() }), eight)
+        XCTAssertEqual(try SessionManagementStore.normalizedTags(["   ", "", "　"]), [])
+        XCTAssertEqual(try SessionManagementStore.normalizedTags([String(repeating: "中", count: 20)]), [String(repeating: "中", count: 20)])
+    }
+
+    func testInvalidTagInputsDoNotCreateStorageAndRejectAtomically() throws {
+        let fixture = try ManagementFixture(); defer { fixture.remove() }
+        let store = try fixture.store()
+        let invalid = [[String(repeating: "a", count: 21)],
+                       [String(repeating: "👨‍👩‍👧‍👦", count: 11)],
+                       (0..<9).map { "Tag\($0)" },
+                       Array(repeating: "", count: 129),
+                       [String(repeating: " ", count: 4_097)],
+                       ["a,b"], ["a，b"], ["a\nb"], ["\ta"], ["a\0b"],
+                       ["a\u{2028}b"], ["a\u{2029}b"], ["a\u{0085}b"]]
+        for input in invalid {
+            XCTAssertThrowsError(try SessionManagementStore.normalizedTags(input))
+            XCTAssertThrowsError(try store.patch(kind: .project, itemID: "/a", change: .setTags(input)))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.directory.path))
+        }
+        _ = try store.patch(kind: .project, itemID: "/a", change: .setTags(["原标签"]))
+        let original = try Data(contentsOf: store.fileURL)
+        for input in invalid {
+            XCTAssertThrowsError(try store.patch(kind: .project, itemID: "/a",
+                                                 change: .update(isFavorite: true, note: .set("本次备注"), tags: input)))
+            XCTAssertEqual(try Data(contentsOf: store.fileURL), original)
+        }
+        XCTAssertEqual(try store.load().entry(kind: .project, itemID: "/a")?.isFavorite, false)
+        XCTAssertEqual(try store.load().entry(kind: .project, itemID: "/a")?.note, nil)
+        XCTAssertEqual(try Data(contentsOf: fixture.originalLog), fixture.originalBytes)
+    }
+
+    func testTagsOnlyEntryPersistsUntilTagsAreClearedAndClearRemovesAllFields() throws {
+        let fixture = try ManagementFixture(); defer { fixture.remove() }
+        let store = try fixture.store()
+        let first = try store.patch(kind: .project, itemID: "/tags-only", change: .setTags(["Beta", "alpha", " ALPHA "]))
+        XCTAssertEqual(first.entries.first, SessionManagementEntry(kind: .project, itemID: "/tags-only", tags: ["alpha", "Beta"]))
+        XCTAssertEqual(try fixture.store().load(), first)
+        XCTAssertEqual(try store.patch(kind: .project, itemID: "/tags-only", change: .setDetails(displayName: nil, note: nil)), first)
+        XCTAssertEqual(try store.patch(kind: .project, itemID: "/tags-only", change: .setTags(["alpha", "Beta"])), first)
+        let empty = try store.patch(kind: .project, itemID: "/tags-only", change: .update(isFavorite: nil, tags: []))
+        XCTAssertTrue(empty.entries.isEmpty)
+        XCTAssertEqual(empty.revision, 2)
+        let restored = try store.patch(kind: .project, itemID: "/tags-only",
+                                       change: .update(isFavorite: true, displayName: .set("名字"), note: .set("备注"), tags: ["tag"]))
+        XCTAssertEqual(restored.entries.count, 1)
+        let cleared = try store.patch(kind: .project, itemID: "/tags-only", change: .clear,
+                                     expectedEntry: restored.entries.first)
+        XCTAssertTrue(cleared.entries.isEmpty)
+        XCTAssertEqual(try fixture.store().load(), cleared)
+    }
+
+    func testTagPatchesPreserveConcurrentFieldsAndTagConflictsAreIdempotentOnlyAtDesiredValue() throws {
+        let fixture = try ManagementFixture(); defer { fixture.remove() }
+        let first = try fixture.store(), second = try fixture.store()
+        let initial = try first.patch(kind: .project, itemID: "/a",
+                                      change: .update(isFavorite: true, displayName: .set("原名称"), note: .set("旧备注"), tags: ["Base"]))
+        let baseline = try XCTUnwrap(initial.entries.first)
+        _ = try second.patch(kind: .project, itemID: "/a", change: .update(isFavorite: false, note: .set("另一窗口备注")))
+        let merged = try first.patch(kind: .project, itemID: "/a", change: .update(isFavorite: nil, tags: ["Mine"]), expectedEntry: baseline)
+        let latest = try XCTUnwrap(merged.entries.first)
+        XCTAssertEqual(latest.tags, ["Mine"])
+        XCTAssertEqual(latest.isFavorite, false)
+        XCTAssertEqual(latest.note, "另一窗口备注")
+        XCTAssertEqual(latest.displayName, "原名称")
+        _ = try second.patch(kind: .project, itemID: "/a", change: .setTags(["Other"]))
+        let before = try Data(contentsOf: first.fileURL)
+        XCTAssertThrowsError(try first.patch(kind: .project, itemID: "/a", change: .setTags(["My conflict"]), expectedEntry: latest))
+        XCTAssertEqual(try Data(contentsOf: first.fileURL), before)
+        let idempotent = try first.patch(kind: .project, itemID: "/a", change: .setTags([" Other "]), expectedEntry: latest)
+        XCTAssertEqual(idempotent.entry(kind: .project, itemID: "/a")?.tags, ["Other"])
+        XCTAssertEqual(try Data(contentsOf: first.fileURL), before)
+        let savedName = try first.patch(kind: .project, itemID: "/a",
+                                        change: .update(isFavorite: nil, displayName: .set("新名称")), expectedEntry: latest)
+        XCTAssertEqual(savedName.entry(kind: .project, itemID: "/a")?.tags, ["Other"])
+        XCTAssertEqual(savedName.entry(kind: .project, itemID: "/a")?.note, "另一窗口备注")
+        let memory = try SessionManagementStore.applying(change: .setTags([" Other "]),
+                                                         to: try XCTUnwrap(idempotent.entries.first), expectedEntry: latest)
+        XCTAssertEqual(memory, idempotent.entries.first)
+        XCTAssertThrowsError(try SessionManagementStore.applying(change: .clear, to: memory, expectedEntry: latest))
+    }
+
+    func testNonCanonicalOrMalformedStoredTagsNeverOverwriteOriginalMetadata() throws {
+        let fixture = try ManagementFixture(); defer { fixture.remove() }
+        let store = try fixture.store()
+        _ = try store.patch(kind: .project, itemID: "/a", change: .setTags(["Original"]))
+        let document = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: store.fileURL)) as? [String: Any])
+        let originalEntry = try XCTUnwrap(document["entries"] as? [[String: Any]])[0]
+        let corruptTags: [Any] = [[""], [" spaced "], ["b", "a"], ["AI", "ai"], ["e\u{0301}"],
+                                  ["line\nbreak"], ["a,b"], [String(repeating: "a", count: 21)],
+                                  (0..<9).map { "tag\($0)" }, NSNull(), "a", [1]]
+        for tags in corruptTags {
+            var broken = document, entry = originalEntry
+            entry["tags"] = tags; broken["entries"] = [entry]
+            let bytes = try JSONSerialization.data(withJSONObject: broken)
+            try bytes.write(to: store.fileURL)
+            XCTAssertThrowsError(try store.load())
+            XCTAssertThrowsError(try store.patch(kind: .project, itemID: "/a", change: .setTags(["Replacement"])))
+            XCTAssertEqual(try Data(contentsOf: store.fileURL), bytes)
+            XCTAssertEqual(try Data(contentsOf: fixture.originalLog), fixture.originalBytes)
+        }
+    }
+
     func testCrossInstancePatchesMergeLatestStateAndExplicitRevisionConflictPreservesFile() throws {
         let fixture = try ManagementFixture(); defer { fixture.remove() }
         let first = try fixture.store(), second = try fixture.store()
