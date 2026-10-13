@@ -128,6 +128,9 @@ private struct CheckedTokenCount {
 public struct CodexSessionSummary: Codable, Identifiable, Equatable, Sendable {
     public let id: String
     public let sessionID: String
+    /// Absent when the parser had to fall back to a file name. Management uses
+    /// a real recorded ID across archive moves, and a path for unidentified logs.
+    public let metadataSessionID: String?
     public let fileURL: URL
     public let title: String
     public let projectPath: String?
@@ -140,11 +143,18 @@ public struct CodexSessionSummary: Codable, Identifiable, Equatable, Sendable {
     public let isArchived: Bool
     public let searchText: String
 
+    public var managementID: String {
+        if let metadataSessionID { return "session:\(metadataSessionID)" }
+        return "file:\(fileURL.standardizedFileURL.path)"
+    }
+
     public init(id: String, sessionID: String, fileURL: URL, title: String,
                 projectPath: String? = nil, startedAt: Date? = nil, updatedAt: Date = Date(),
                 model: String? = nil, messageCount: Int = 0, toolCallCount: Int = 0,
-                tokens: CodexTokenUsage = .init(), isArchived: Bool = false, searchText: String = "") {
+                tokens: CodexTokenUsage = .init(), isArchived: Bool = false, searchText: String = "",
+                metadataSessionID: String? = nil) {
         self.id = id; self.sessionID = sessionID; self.fileURL = fileURL; self.title = title
+        self.metadataSessionID = metadataSessionID
         self.projectPath = projectPath; self.startedAt = startedAt; self.updatedAt = updatedAt
         self.model = model; self.messageCount = messageCount; self.toolCallCount = toolCallCount
         self.tokens = tokens; self.isArchived = isArchived; self.searchText = searchText

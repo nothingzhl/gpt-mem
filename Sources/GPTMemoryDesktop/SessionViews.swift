@@ -26,6 +26,7 @@ struct SessionsContent: View {
     @State private var section: SessionWorkspaceSection
     @State private var messageRangeStart: Int
     @State private var showTokenDetails = false
+    @State private var editingSession: CodexSessionSummary?
     private let initiallyExpandedWarnings: Bool
 
     init(model: SessionDesktopModel, initiallyExpandedMessageIDs: Set<String> = [],
@@ -52,6 +53,7 @@ struct SessionsContent: View {
                 }
             }
             controls
+            SessionManagementStatus(model: model.management, showsWriteError: editingSession == nil)
             if let error = model.errorMessage {
                 SessionWarningsDisclosure(title: "读取失败", warnings: [error], initiallyExpanded: true)
             }
@@ -87,6 +89,9 @@ struct SessionsContent: View {
                 // count changes must still move the page into the new valid range.
                 messageRangeStart = SessionMessagePage.latestStart(messageCount: model.transcript?.messages.count ?? 0)
             }
+            .sheet(item: $editingSession) { summary in
+                SessionMetadataEditor(model: model, summary: summary)
+            }
     }
 
     private var controls: some View {
@@ -113,9 +118,21 @@ struct SessionsContent: View {
                     Label(model.isLoading ? "读取中" : "刷新", systemImage: "arrow.clockwise")
                 }.disabled(model.isLoading)
             }
-            Text("日志只读 · 摘要保存在本机，加快再次打开。用量按完整会话汇总；缓存属于输入、推理属于输出，缺失时显示已知合计。")
-                .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
-                .textSelection(.enabled).lineLimit(2)
+            HStack(spacing: 16) {
+                Toggle("会话仅显示收藏", isOn: $model.onlyFavoriteSessions).toggleStyle(.checkbox)
+                if section == .projects {
+                    Toggle("项目列表仅显示收藏", isOn: $model.onlyFavoriteProjects).toggleStyle(.checkbox)
+                }
+                Spacer()
+                Text("收藏、名称和备注保存在本机；原始日志只读。")
+                    .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
+            }.font(.system(size: 11))
+            if section == .projects && model.onlyFavoriteProjects {
+                Text("收藏项目开关仅筛选项目列表；统计卡片包含全部匹配会话。")
+                    .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
+            }
+            Text("用量按完整会话汇总；缓存属于输入、推理属于输出，缺失时显示已知合计。")
+                .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary).lineLimit(1)
         }
     }
 
@@ -168,8 +185,7 @@ struct SessionsContent: View {
                 ScrollView {
                     LazyVStack(spacing: 4) {
                         ForEach(model.filteredSessions) { session in
-                            Button { model.select(session.id) } label: { row(session) }.buttonStyle(.plain)
-                                .disabled(model.isFiltering)
+                            sessionRow(session)
                         }
                     }.padding(8)
                 }
@@ -189,13 +205,48 @@ struct SessionsContent: View {
     private var emptyListDetail: String {
         if model.isLoading { return "会话索引在后台读取。" }
         if model.sessions.isEmpty { return "使用 Codex 后点击刷新；读取 sessions 和 archived_sessions 中的本地 JSONL。" }
-        return "调整搜索词、项目筛选，或打开“包含归档”。"
+        return "调整搜索词、收藏或项目筛选，或打开“包含归档”。"
+    }
+
+    private func sessionRow(_ session: CodexSessionSummary) -> some View {
+        HStack(alignment: .top, spacing: 0) {
+            Button { model.select(session.id) } label: { row(session) }
+                .buttonStyle(.plain).disabled(model.isFiltering)
+                .accessibilityLabel("查看会话：\(model.displayTitle(for: session))")
+            VStack(spacing: 2) {
+                SessionFavoriteButton(isFavorite: model.isFavorite(session),
+                                      targetLabel: model.displayTitle(for: session),
+                                      isEnabled: canManage) {
+                    guard canManage else { return }
+                    model.toggleSessionFavorite(session)
+                }
+                Menu {
+                    Button("编辑本地名称与备注") { beginEditing(session) }
+                } label: {
+                    Image(systemName: "ellipsis").frame(width: 32, height: 32).contentShape(Rectangle())
+                }.menuStyle(.borderlessButton).menuIndicator(.hidden)
+                    .fixedSize().disabled(!canManage)
+                    .help("管理会话").accessibilityLabel("管理会话：\(model.displayTitle(for: session))")
+            }.padding(.top, 5).padding(.trailing, 5)
+        }.background(model.selectedSessionID == session.id ? MemoryStyle.accentBackground : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var canManage: Bool {
+        model.management.hasLoaded && !model.management.isLoading && !model.management.isSaving && !model.isFiltering && !model.isLoading
+    }
+
+    private func beginEditing(_ summary: CodexSessionSummary) {
+        guard canManage, model.filteredSessions.contains(where: {
+            $0.id == summary.id && $0.sessionID == summary.sessionID && $0.fileURL == summary.fileURL
+        }) else { return }
+        editingSession = summary
     }
 
     private func row(_ session: CodexSessionSummary) -> some View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(alignment: .top, spacing: 6) {
-                Text(session.title).font(.system(size: 12, weight: .medium)).lineLimit(2)
+                Text(model.displayTitle(for: session)).font(.system(size: 12, weight: .medium)).lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 if session.isArchived { MemoryBadge(text: "归档", color: MemoryStyle.secondary) }
             }
@@ -208,9 +259,12 @@ struct SessionsContent: View {
             }.font(.system(size: 9)).foregroundStyle(MemoryStyle.secondary)
             Text("总 Token：\(tokenText(session.tokens.effectiveTotal))")
                 .font(.system(size: 9)).foregroundStyle(MemoryStyle.secondary)
+            if !model.note(for: session).isEmpty {
+                Label(model.note(for: session), systemImage: "note.text")
+                    .font(.system(size: 9)).foregroundStyle(MemoryStyle.secondary).lineLimit(1)
+            }
         }.padding(11).frame(maxWidth: .infinity, alignment: .leading)
-            .background(model.selectedSessionID == session.id ? MemoryStyle.accentBackground : Color.clear)
-            .clipShape(RoundedRectangle(cornerRadius: 8)).contentShape(Rectangle())
+            .contentShape(Rectangle())
     }
 
     @ViewBuilder private var detail: some View {
@@ -239,9 +293,30 @@ struct SessionsContent: View {
     private func metadata(_ summary: CodexSessionSummary) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top) {
-                Text(summary.title).font(.system(size: 15, weight: .semibold)).textSelection(.enabled)
+                Text(model.displayTitle(for: summary)).font(.system(size: 15, weight: .semibold)).textSelection(.enabled)
                 Spacer()
                 if summary.isArchived { MemoryBadge(text: "已归档", color: MemoryStyle.secondary) }
+                SessionFavoriteButton(isFavorite: model.isFavorite(summary),
+                                      targetLabel: model.displayTitle(for: summary), isEnabled: canManage) {
+                    guard canManage else { return }
+                    model.toggleSessionFavorite(summary)
+                }
+                Button { beginEditing(summary) } label: { Label("编辑", systemImage: "pencil") }
+                    .font(.system(size: 11)).disabled(!canManage)
+                    .help("编辑本地名称与备注").accessibilityLabel("编辑本地名称与备注")
+            }
+            if !model.localTitle(for: summary).isEmpty {
+                Text("日志原名：\(summary.title)").font(.system(size: 10))
+                    .foregroundStyle(MemoryStyle.secondary).textSelection(.enabled)
+            }
+            if !model.note(for: summary).isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("本地备注").font(.system(size: 10, weight: .medium)).foregroundStyle(MemoryStyle.secondary)
+                    ScrollView {
+                        Text(model.note(for: summary)).font(.system(size: 11)).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }.frame(maxHeight: 80)
+                }
             }
             Text(summary.projectPath ?? "项目未记录").font(.system(size: 10))
                 .foregroundStyle(MemoryStyle.secondary).textSelection(.enabled)

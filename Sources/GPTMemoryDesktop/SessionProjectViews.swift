@@ -1,12 +1,14 @@
 import SwiftUI
 import Charts
 import GPTSessionKit
+import AppKit
 
 struct SessionProjectsContent: View {
     @ObservedObject var model: SessionDesktopModel
     var showStatistics = false
     var onShowStatistics: () -> Void = {}
     let onOpenProject: (SessionProjectSummary) -> Void
+    @State private var finderError: String?
 
     var body: some View {
         ScrollView {
@@ -20,6 +22,8 @@ struct SessionProjectsContent: View {
                     MemoryEmptyState(icon: "folder", title: "正在筛选项目", detail: "正在后台更新项目和统计。")
                 } else if model.analytics.projects.isEmpty {
                     MemoryEmptyState(icon: "folder", title: "没有匹配的项目", detail: "调整搜索词、归档开关或项目筛选。")
+                } else if !showStatistics && model.displayedProjects.isEmpty {
+                    MemoryEmptyState(icon: "star", title: "暂无收藏项目", detail: "关闭“项目列表仅显示收藏”，再点击项目旁的星标收藏。")
                 } else {
                     overview
                     if showStatistics {
@@ -30,7 +34,9 @@ struct SessionProjectsContent: View {
                     activityChart
                     } else {
                     HStack {
-                        MemorySectionTitle(title: "项目", subtitle: "按最近活动排序，点击项目查看其中的会话。")
+                        MemorySectionTitle(title: "项目", subtitle: model.onlyFavoriteProjects
+                            ? "仅列出收藏项目；统计包含全部匹配会话。"
+                            : "收藏优先，其余按最近活动排序；点击项目查看会话。")
                         Spacer()
                         Button("查看统计图表", action: onShowStatistics)
                             .font(.system(size: 11)).buttonStyle(.link)
@@ -40,20 +46,19 @@ struct SessionProjectsContent: View {
                         }
                     }
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 320), spacing: 12)], spacing: 12) {
-                        ForEach(model.analytics.projects) { project in
-                            Button { onOpenProject(project) } label: { projectCard(project) }
-                                .buttonStyle(.plain).disabled(model.isFiltering)
-                        }
+                        ForEach(model.displayedProjects) { project in projectCard(project) }
                     }
                     }
                 }
             }.padding(.bottom, 12)
-        }
+        }.alert("无法显示项目目录", isPresented: Binding(get: { finderError != nil }, set: { if !$0 { finderError = nil } })) {
+            Button("知道了", role: .cancel) { finderError = nil }
+        } message: { Text(finderError ?? "") }
     }
 
     private var overview: some View {
         HStack(spacing: 12) {
-            compactMetric("项目", value: "\(model.analytics.projects.count)",
+            compactMetric("匹配项目", value: "\(model.analytics.projects.count)",
                           detail: "\(model.analytics.totalSessionCount) 个会话", icon: "folder")
             compactMetric("已记录用量", value: model.total(\.effectiveTotal).displayValue,
                           detail: "\(model.analytics.sessionsWithUsage) / \(model.analytics.totalSessionCount) 个会话有总用量", icon: "chart.bar")
@@ -206,6 +211,47 @@ struct SessionProjectsContent: View {
     }
 
     private func projectCard(_ project: SessionProjectSummary) -> some View {
+        HStack(alignment: .top, spacing: 0) {
+            Button {
+                guard !model.isFiltering, model.displayedProjects.contains(where: { $0.id == project.id }) else { return }
+                onOpenProject(project)
+            } label: { projectCardContents(project) }
+                .buttonStyle(.plain).disabled(model.isFiltering)
+                .accessibilityLabel("查看项目会话：\(project.projectPath ?? project.displayName)")
+            VStack(spacing: 4) {
+                SessionFavoriteButton(isFavorite: model.isFavoriteProject(project.id),
+                                      targetLabel: project.projectPath ?? project.displayName,
+                                      isEnabled: canManage) {
+                    guard canManage else { return }
+                    model.toggleProjectFavorite(project.id)
+                }
+                if let path = project.projectPath, path.hasPrefix("/") {
+                    Button { revealProjectDirectory(path) } label: {
+                        Image(systemName: "folder").frame(width: 32, height: 32).contentShape(Rectangle())
+                    }.buttonStyle(.plain).foregroundStyle(MemoryStyle.secondary)
+                        .disabled(model.isFiltering)
+                        .help("在 Finder 中显示项目").accessibilityLabel("在 Finder 中显示项目：\(path)")
+                }
+            }.padding(.top, 8).padding(.trailing, 8)
+        }.background(MemoryStyle.surface).clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(MemoryStyle.border))
+    }
+
+    private var canManage: Bool {
+        model.management.hasLoaded && !model.management.isLoading && !model.management.isSaving && !model.isFiltering && !model.isLoading
+    }
+
+    private func revealProjectDirectory(_ path: String) {
+        guard !model.isFiltering, model.projectPaths.contains(path) else { return }
+        var isDirectory: ObjCBool = false
+        guard path.hasPrefix("/"), FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            finderError = "项目目录已移动或不存在：\(path)"
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path, isDirectory: true)])
+    }
+
+    private func projectCardContents(_ project: SessionProjectSummary) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
                 Image(systemName: "folder.fill").font(.system(size: 18)).foregroundStyle(MemoryStyle.accent)
@@ -230,9 +276,9 @@ struct SessionProjectsContent: View {
                 Text("\(project.missingUsageSessionCount) 个会话未记录总用量")
                     .font(.system(size: 9)).foregroundStyle(MemoryStyle.secondary)
             }
-        }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
-            .background(MemoryStyle.surface).clipShape(RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).stroke(MemoryStyle.border))
+        }.padding(.leading, 16).padding(.trailing, 8).padding(.vertical, 16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
     }
 
     private func projectUsageText(_ project: SessionProjectSummary) -> String {

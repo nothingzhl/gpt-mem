@@ -3,6 +3,7 @@ import AppKit
 
 final class ManagerAppDelegate: NSObject, NSApplicationDelegate {
     var reportLibrary: AIReportLibraryModel?
+    var sessionManagement: SessionManagementModel?
     private var terminationTask: Task<Void, Never>?
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -10,13 +11,16 @@ final class ManagerAppDelegate: NSObject, NSApplicationDelegate {
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let library = reportLibrary,
-              library.isSaving || library.isRemoving || library.isExporting else { return .terminateNow }
+        let library = reportLibrary
+        let management = sessionManagement
+        guard library?.isSaving == true || library?.isRemoving == true || library?.isExporting == true
+                || management?.isSaving == true else { return .terminateNow }
         // A completed AI response can still be queued for local persistence.
         // Let that bounded file operation finish before quitting the process.
         if terminationTask == nil {
             terminationTask = Task { @MainActor [weak self] in
-                while library.isSaving || library.isRemoving || library.isExporting {
+                while library?.isSaving == true || library?.isRemoving == true || library?.isExporting == true
+                        || management?.isSaving == true {
                     try? await Task.sleep(nanoseconds: 50_000_000)
                 }
                 self?.terminationTask = nil
@@ -38,6 +42,7 @@ struct GPTManagerApp: App {
                 .frame(minWidth: 1000, minHeight: 680)
                 .onAppear {
                     delegate.reportLibrary = model.aiModel.reportLibrary
+                    delegate.sessionManagement = model.sessionModel.management
                     model.startMonitoring()
                 }
                 .onDisappear { model.stopMonitoring() }

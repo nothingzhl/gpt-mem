@@ -103,14 +103,14 @@ func fixtureRoot(_ name: String) throws -> URL {
 }
 
 func summary(_ id: String, project: String = "/workspace/mock", archived: Bool = false,
-             tokens: CodexTokenUsage = .init()) -> CodexSessionSummary {
+             tokens: CodexTokenUsage = .init(), metadataSessionID: String? = nil) -> CodexSessionSummary {
     CodexSessionSummary(id: id, sessionID: "session-\(id)",
         fileURL: URL(fileURLWithPath: "/fixture/sessions/\(id).jsonl"),
         title: "模拟会话 \(id)", projectPath: project,
         startedAt: Date(timeIntervalSince1970: 1_791_792_000),
         updatedAt: Date(timeIntervalSince1970: 1_791_792_060), model: "mock-codex",
         messageCount: 2, toolCallCount: 1, tokens: tokens, isArchived: archived,
-        searchText: "模拟用户日志\nsecond prompt \(id)")
+        searchText: "模拟用户日志\nsecond prompt \(id)", metadataSessionID: metadataSessionID)
 }
 
 @MainActor func model(_ source: FixtureSource, name: String) throws -> SessionDesktopModel {
@@ -128,7 +128,8 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
 
 @MainActor func load(_ model: SessionDesktopModel) async throws {
     model.loadIfNeeded()
-    try await waitFor({ !model.isLoading && !model.isFiltering }, "catalog loader timed out")
+    try await waitFor({ !model.isLoading && !model.isFiltering && model.management.hasLoaded
+        && !model.management.isLoading }, "catalog loader timed out")
 }
 
 @MainActor func filtered(_ model: SessionDesktopModel) async throws {
@@ -588,7 +589,8 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
 @MainActor func checkRepositoryIntegration() async throws -> SessionDesktopModel {
     let root = try fixtureRoot("repository")
     let directory = root.appendingPathComponent("sessions/2026/10/12", isDirectory: true)
-    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                           attributes: [.posixPermissions: 0o700])
     let url = directory.appendingPathComponent("mock-session.jsonl")
     let records: [[String: Any]] = [
         ["type": "session_meta", "timestamp": "2026-10-12T10:00:00Z", "payload": ["id": "mock-session", "cwd": "/workspace/mock-project", "timestamp": "2026-10-12T10:00:00Z"]],
@@ -776,8 +778,345 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
     print("PASS >64KiB multi-byte JSONL/title chunks, 20KiB continuation, final record and owned strings")
 }
 
+@MainActor func managedModel(_ source: FixtureSource, root: URL, directory: URL) -> SessionDesktopModel {
+    SessionDesktopModel(rootURL: root, catalogLoader: { try source.catalog() },
+        transcriptLoader: { try source.transcript($0) }, managementDirectoryURL: directory)
+}
+
+@MainActor func managementIdle(_ state: SessionDesktopModel) async throws {
+    try await waitFor({ !state.management.isSaving && !state.management.isLoading && !state.isFiltering },
+                      "management operation timed out")
+}
+
+@MainActor func checkManagementPersistenceAndFiltering() async throws -> SessionDesktopModel {
+    let root = try fixtureRoot("management-source")
+    let directory = try fixtureRoot("management-data")
+    let a = summary("managed-a", project: "/workspace/first/demo", tokens: .init(total: 10), metadataSessionID: "stable-a")
+    let b = summary("managed-b", project: "/workspace/second/demo", tokens: .init(total: 20), metadataSessionID: "stable-b")
+    let source = FixtureSource(catalogs: [.init(delay: 0, result: .success(.init(sessions: [a, b])))])
+    let state = managedModel(source, root: root, directory: directory)
+    try await load(state)
+    try expect(!FileManager.default.fileExists(atPath: directory.path), "empty metadata load creates no files")
+    state.toggleSessionFavorite(b)
+    try expect(state.management.isSaving, "favorite write is marked pending synchronously for quit handling")
+    try await managementIdle(state)
+    try expect(state.isFavorite(b) && !state.isFavorite(a), "favorite is tied to the intended recorded session")
+    try expect(state.filteredSessions.map(\.id) == [b.id, a.id], "favorite sessions appear first with stable source ordering")
+    let saved = await state.saveSessionMetadata(b, title: "  本地排错记录  ", note: "线索：数据库连接池\n等待复查")
+    try expect(saved, "local rename and notes commit together")
+    try await managementIdle(state)
+    try expect(state.displayTitle(for: b) == "本地排错记录" && state.note(for: b).contains("连接池"),
+               "committed local details are immediately visible")
+    try expect(state.sessions == [a, b] && state.sessions.last?.title == "模拟会话 managed-b",
+               "management does not change original summaries or prompt indexes")
+    state.query = "本地 连接池 SECOND"
+    try await filtered(state)
+    try expect(state.filteredSessions.map(\.id) == [b.id], "AND search terms match across original project, local name and note")
+    state.query = "不会匹配"
+    state.query = "等待复查"
+    try await filtered(state)
+    try expect(state.filteredSessions.map(\.id) == [b.id], "latest debounced metadata search wins")
+    let changedNote = await state.saveSessionMetadata(b, title: "本地排错记录", note: "已处理")
+    try expect(changedNote, "metadata edit under an active query succeeds")
+    try await managementIdle(state)
+    try expect(state.filteredSessions.isEmpty, "metadata changes invalidate old positive search matches")
+    let restoredNote = await state.saveSessionMetadata(b, title: "本地排错记录", note: "线索：数据库连接池\n等待复查")
+    try expect(restoredNote, "search fixture note can be restored")
+    try await managementIdle(state)
+    try expect(state.filteredSessions.map(\.id) == [b.id], "metadata changes invalidate old negative search matches")
+    state.query = ""
+    try await filtered(state)
+    state.select(a.id)
+    try await waitFor({ !state.isLoadingTranscript && !state.isFiltering }, "management selection timed out")
+    state.onlyFavoriteSessions = true
+    try await filtered(state)
+    try expect(state.filteredSessions.map(\.id) == [b.id] && state.selectedSessionID == nil && state.transcript == nil,
+               "favorite-only filtering clears hidden detail")
+    try expect(state.total(\.effectiveTotal).value == 20 && state.analytics.totalSessionCount == 1,
+               "favorite session filtering uses known counters from visible sessions only")
+    state.onlyFavoriteSessions = false
+    try await filtered(state)
+    state.toggleProjectFavorite(b.projectPath!)
+    try await managementIdle(state)
+    try expect(state.isFavoriteProject(b.projectPath!) && !state.isFavoriteProject(a.projectPath!),
+               "projects with the same basename keep separate bookmarks")
+    try expect(state.projectPaths == [b.projectPath!, a.projectPath!], "project picker keeps all choices with favorites first")
+    state.onlyFavoriteProjects = true
+    try expect(state.displayedProjects.map(\.id) == [b.projectPath!] && state.analytics.projects.count == 2,
+               "favorite projects filter only the project list, retaining complete analytics")
+    try expect(state.filteredSessions.count == 2 && state.projectPaths.count == 2,
+               "project-only bookmarks do not implicitly hide sessions or invalidate picker choices")
+    let reopened = managedModel(source, root: root, directory: directory)
+    try await load(reopened)
+    try expect(reopened.isFavorite(b) && reopened.isFavoriteProject(b.projectPath!), "bookmarks persist across model recreation")
+    try expect(reopened.displayTitle(for: b) == "本地排错记录" && reopened.note(for: b).contains("等待复查"),
+               "local names and notes persist across model recreation")
+    let reset = await reopened.saveSessionMetadata(b, title: "", note: "")
+    try expect(reset, "empty local details reset to source title without deleting the bookmark")
+    try await managementIdle(reopened)
+    try expect(reopened.displayTitle(for: b) == b.title && reopened.note(for: b).isEmpty && reopened.isFavorite(b),
+               "reset restores source display while retaining unrelated favorite state")
+    state.refresh()
+    try await waitFor({ !state.isLoading && !state.isFiltering && !state.management.isLoading }, "metadata refresh timed out")
+    try expect(state.displayTitle(for: b) == b.title && state.note(for: b).isEmpty,
+               "explicit refresh picks up metadata written by another model")
+    let retainedManagementTasks = Mirror(reflecting: state.management).children.filter {
+        ($0.label == "loadTask" || $0.label == "mutationTask") && !Mirror(reflecting: $0.value).children.isEmpty
+    }
+    try expect(retainedManagementTasks.isEmpty, "completed management tasks release their snapshot results")
+    #if RENDER_SESSIONS
+    let previewDetails = await state.saveSessionMetadata(b, title: "数据库连接池排查", note: "已找到重试入口，等待验证后关闭。")
+    try expect(previewDetails, "isolated management preview details saved")
+    try await managementIdle(state)
+    #endif
+    print("PASS persisted management, local details, cross-field debounced search, bookmarks, project-only filtering and reset")
+    return state
+}
+
+@MainActor func checkManagementFailureAndRetry() async throws {
+    let root = try fixtureRoot("management-failure-source")
+    let directory = try fixtureRoot("management-failure-data")
+    let item = summary("managed-failure", metadataSessionID: "stable-failure")
+    let source = FixtureSource(catalogs: [.init(delay: 0, result: .success(.init(sessions: [item])))])
+    let state = managedModel(source, root: root, directory: directory)
+    try await load(state)
+    let store = try SessionManagementStore(directoryURL: directory, sourceRootURL: root)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                           attributes: [.posixPermissions: 0o700])
+    let malformed = Data("{ malformed fixture }".utf8)
+    try malformed.write(to: store.fileURL)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: store.fileURL.path)
+    let failed = await state.saveSessionMetadata(item, title: "不应显示", note: "不应存储")
+    try expect(!failed && state.management.hasPendingRetry && state.management.errorMessage != nil,
+               "failed save exposes error and retry without pretending the editor succeeded")
+    try expect(state.displayTitle(for: item) == item.title && state.note(for: item).isEmpty,
+               "failed save leaves previous committed values visible")
+    let corruptedAfter = try Data(contentsOf: store.fileURL)
+    try expect(corruptedAfter == malformed, "corrupt management bytes are preserved")
+    try FileManager.default.removeItem(at: store.fileURL)
+    let repairedRead = await state.management.reload()
+    try await managementIdle(state)
+    try expect(repairedRead, "repaired private fixture directory can be read successfully")
+    try expect(state.management.hasPendingRetry && state.management.errorMessage != nil,
+               "rereading a repaired store does not hide the unsaved operation's retry status")
+    state.management.retryLastMutation()
+    try await managementIdle(state)
+    try expect(state.displayTitle(for: item) == "不应显示" && state.note(for: item) == "不应存储",
+               "explicit retry saves the retained failed operation after the underlying issue is repaired")
+    try expect(!state.management.hasPendingRetry && state.management.errorMessage == nil,
+               "successful retry clears only the reported failed operation")
+    let excessive = await state.saveSessionMetadata(item, title: String(repeating: "长", count: 121), note: "新备注")
+    try expect(!excessive && state.displayTitle(for: item) == "不应显示" && state.note(for: item) == "不应存储",
+               "validation rejects name and note together without a partial update")
+    let unsafe = managedModel(source, root: root, directory: root.appendingPathComponent("must-not-write"))
+    unsafe.loadIfNeeded()
+    try await waitFor({ !unsafe.isLoading && !unsafe.isFiltering && !unsafe.management.isLoading }, "unsafe metadata load timed out")
+    try expect(!unsafe.management.hasLoaded && unsafe.management.errorMessage != nil,
+               "unsafe store initialization remains a visible load failure")
+    let unsafeSave = await unsafe.saveSessionMetadata(item, title: "无权限", note: "")
+    try expect(!unsafeSave && !FileManager.default.fileExists(atPath: root.path),
+               "unsafe initialization does not silently fall back to in-memory or write the source tree")
+    print("PASS corrupt-store preservation, failed-save draft values, retry, atomic validation and unsafe-initialization rejection")
+}
+
+@MainActor func checkManagementIdentityAndPendingQuit() async throws {
+    let root = try fixtureRoot("management-identity-source")
+    let directory = try fixtureRoot("management-identity-data")
+    let original = summary("managed-original", metadataSessionID: "stable-move")
+    let moved = CodexSessionSummary(id: "managed-archived", sessionID: original.sessionID,
+        fileURL: URL(fileURLWithPath: "/fixture/archived_sessions/moved.jsonl"), title: original.title,
+        projectPath: original.projectPath, isArchived: true, metadataSessionID: "stable-move")
+    let unknownA = summary("unknown-a")
+    let unknownB = CodexSessionSummary(id: "unknown-b", sessionID: unknownA.sessionID,
+        fileURL: URL(fileURLWithPath: "/fixture/another/unknown-a.jsonl"), title: unknownA.title)
+    let source = FixtureSource(catalogs: [
+        .init(delay: 0, result: .success(.init(sessions: [original, unknownA, unknownB]))),
+        .init(delay: 0, result: .success(.init(sessions: [moved, unknownA, unknownB])))
+    ])
+    let state = managedModel(source, root: root, directory: directory)
+    try await load(state)
+    state.toggleSessionFavorite(original)
+    await state.management.waitForPendingMutations()
+    try expect(state.isFavorite(original) && !state.management.isSaving,
+               "pending quit wait observes the bookmark requested in the same main-actor turn")
+    try await managementIdle(state)
+    let saved = await state.saveSessionMetadata(original, title: "跨归档保留", note: "stable identity")
+    try expect(saved, "recorded identity details saved")
+    try await managementIdle(state)
+    state.toggleSessionFavorite(unknownA)
+    try await managementIdle(state)
+    try expect(state.isFavorite(unknownA) && !state.isFavorite(unknownB), "unknown-session filename collisions use full paths")
+    state.includeArchived = true
+    state.refresh()
+    try await waitFor({ !state.isLoading && !state.isFiltering }, "archive refresh timed out")
+    try expect(state.isFavorite(moved) && state.displayTitle(for: moved) == "跨归档保留", "real session IDs retain details across archive moves")
+    let staleSave = await state.saveSessionMetadata(original, title: "过期编辑", note: "")
+    try expect(!staleSave && state.management.errorMessage?.contains("来源已变化") == true,
+               "a frozen editor cannot write through an obsolete catalog target")
+    try expect(state.displayTitle(for: moved) == "跨归档保留", "stale editor rejection preserves the current committed value")
+    let otherRoot = try fixtureRoot("management-another-source")
+    let isolated = managedModel(FixtureSource(catalogs: [.init(delay: 0, result: .success(.init(sessions: [moved])))]),
+                                root: otherRoot, directory: directory)
+    isolated.includeArchived = true
+    try await load(isolated)
+    try expect(!isolated.isFavorite(moved) && isolated.displayTitle(for: moved) == moved.title,
+               "the same ID in a different source root never borrows another root's metadata")
+    print("PASS stable archive identity, full-path fallbacks, stale-target protection, source-root isolation and pending-quit wait")
+}
+
+@MainActor func checkManagementEditorBaselineConflicts() async throws {
+    let root = try fixtureRoot("management-editor-source")
+    let directory = try fixtureRoot("management-editor-data")
+    let item = summary("managed-editor", metadataSessionID: "stable-editor")
+    let source = FixtureSource(catalogs: [.init(delay: 0, result: .success(.init(sessions: [item])))])
+    let first = managedModel(source, root: root, directory: directory)
+    try await load(first)
+    let initial = await first.saveSessionMetadata(item, title: "初始名称", note: "初始备注")
+    try expect(initial, "editor baseline fixture saved")
+    try await managementIdle(first)
+    let second = managedModel(source, root: root, directory: directory)
+    try await load(second)
+    guard let firstBaseline = first.management.index.entry(for: item),
+          let secondBaseline = second.management.index.entry(for: item) else {
+        throw CheckFailure(message: "editor baseline fixture missing")
+    }
+    let externalNote = await second.saveSessionMetadata(item, title: "初始名称", note: "另一实例的新备注", baseline: secondBaseline)
+    try expect(externalNote, "other instance updates its dirty note field")
+    try await managementIdle(second)
+    first.toggleSessionFavorite(item)
+    try await managementIdle(first)
+    let localTitle = await first.saveSessionMetadata(item, title: "本地新名称", note: "初始备注", baseline: firstBaseline)
+    try expect(localTitle, "a stale editor changing only title can save independently of a changed note")
+    try await managementIdle(first)
+    try expect(first.displayTitle(for: item) == "本地新名称" && first.note(for: item) == "另一实例的新备注" && first.isFavorite(item),
+               "title-only save preserves newer external notes and current favorite state")
+    guard let frozen = first.management.index.entry(for: item) else { throw CheckFailure(message: "updated editor baseline missing") }
+    let secondLoaded = await second.management.reload()
+    try expect(secondLoaded, "explicit editor reread reports its actual success")
+    try await managementIdle(second)
+    guard let freshSecond = second.management.index.entry(for: item) else { throw CheckFailure(message: "refreshed baseline missing") }
+    let externalTitle = await second.saveSessionMetadata(item, title: "另一实例的新名称", note: "另一实例的新备注", baseline: freshSecond)
+    try expect(externalTitle, "another editor changes the same title field")
+    try await managementIdle(second)
+    let conflicted = await first.saveSessionMetadata(item, title: "尚未保存的草稿", note: "另一实例的新备注", baseline: frozen)
+    try expect(!conflicted && first.management.errorMessage?.contains("其他操作更新") == true && first.management.hasPendingRetry,
+               "same-field baseline conflicts return failure and preserve the unsaved draft operation")
+    try expect(first.displayTitle(for: item) == "本地新名称" && first.note(for: item) == "另一实例的新备注",
+               "conflict keeps the last successfully committed UI values")
+    let store = try SessionManagementStore(directoryURL: directory, sourceRootURL: root)
+    let onDisk = try store.load().entry(kind: .session, itemID: item.managementID)
+    try expect(onDisk?.displayName == "另一实例的新名称" && onDisk?.note == "另一实例的新备注" && onDisk?.isFavorite == true,
+               "conflict does not overwrite the external edit or unrelated bookmark")
+    let reread = await first.management.reload()
+    try expect(reread && first.displayTitle(for: item) == "另一实例的新名称", "a successful explicit reread provides the latest baseline")
+    try await managementIdle(first)
+    guard let freshFirst = first.management.index.entry(for: item) else { throw CheckFailure(message: "new editor baseline missing") }
+    let retriedDraft = await first.saveSessionMetadata(item, title: "尚未保存的草稿", note: "另一实例的新备注", baseline: freshFirst)
+    try expect(retriedDraft, "a user can save the retained dirty draft after explicitly rebasing to the latest entry")
+    try await managementIdle(first)
+    try expect(first.displayTitle(for: item) == "尚未保存的草稿" && first.note(for: item) == "另一实例的新备注"
+        && first.management.errorMessage == nil && !first.management.hasPendingRetry,
+               "confirmed rebase saves the intended field and clears the old conflict")
+    let identicalResult = await second.saveSessionMetadata(item, title: "尚未保存的草稿", note: "另一实例的新备注", baseline: freshSecond)
+    try expect(identicalResult, "a concurrent field already equal to the intended value is an idempotent success")
+    try await managementIdle(second)
+    guard let whitespaceBaseline = second.management.index.entry(for: item) else { throw CheckFailure(message: "whitespace baseline missing") }
+    let newestTitle = await first.saveSessionMetadata(item, title: "更新后的外部名称", note: "另一实例的新备注")
+    try expect(newestTitle, "external whitespace fixture update succeeds")
+    try await managementIdle(first)
+    let whitespaceOnly = await second.saveSessionMetadata(item, title: "  尚未保存的草稿  ", note: "另一实例的新备注", baseline: whitespaceBaseline)
+    try expect(whitespaceOnly && second.displayTitle(for: item) == "更新后的外部名称",
+               "semantically unchanged whitespace in a stale name does not overwrite or conflict with the new external name")
+    let malformed = Data("broken fixture".utf8)
+    try malformed.write(to: store.fileURL)
+    let failedRead = await first.management.reload()
+    try expect(!failedRead && first.management.hasLoaded && first.displayTitle(for: item) == "更新后的外部名称",
+               "reload reports real failure while preserving an earlier successful load and committed display")
+    print("PASS dirty-field baseline save, concurrent note preservation, same-field conflict, explicit rebase, idempotence and reload failure")
+}
+
+@MainActor func checkManagementDiscardFailedDraft() async throws {
+    let root = try fixtureRoot("management-discard-source")
+    let directory = try fixtureRoot("management-discard-data")
+    let a = summary("discard-a", metadataSessionID: "stable-discard-a")
+    let b = summary("discard-b", metadataSessionID: "stable-discard-b")
+    let source = FixtureSource(catalogs: [.init(delay: 0, result: .success(.init(sessions: [a, b])))])
+    let state = managedModel(source, root: root, directory: directory)
+    try await load(state)
+    let seeded = await state.saveSessionMetadata(a, title: "已保存的名称", note: "已保存的备注")
+    try expect(seeded, "discard fixture has committed values")
+    try await managementIdle(state)
+    let store = try SessionManagementStore(directoryURL: directory, sourceRootURL: root)
+    var goodBytes = try Data(contentsOf: store.fileURL)
+    let malformed = Data("malformed discard fixture".utf8)
+    try malformed.write(to: store.fileURL)
+    let failedA = await state.saveSessionMetadata(a, title: "应该丢弃的草稿", note: "未保存的备注")
+    try expect(!failedA && state.management.hasPendingRetry, "failed details remain available while the editor is open")
+    state.discardFailedSessionMetadata(a)
+    try expect(!state.management.hasPendingRetry && state.management.errorMessage == nil,
+               "cancelling the matching failed editor clears only its queued details and save error")
+    let afterDiscard = try Data(contentsOf: store.fileURL)
+    try expect(afterDiscard == malformed && state.displayTitle(for: a) == "已保存的名称" && state.note(for: a) == "已保存的备注",
+               "discarding a draft neither writes storage nor changes committed display values")
+    try goodBytes.write(to: store.fileURL)
+    state.management.retryLastMutation()
+    try await managementIdle(state)
+    let afterNoop = try store.load().entry(kind: .session, itemID: a.managementID)
+    try expect(afterNoop?.displayName == "已保存的名称" && afterNoop?.note == "已保存的备注",
+               "a later retry cannot revive cancelled details")
+
+    try malformed.write(to: store.fileURL)
+    let failedB = await state.saveSessionMetadata(b, title: "另一个会话的草稿", note: "还要重试")
+    try expect(!failedB, "other-session failure fixture created")
+    let otherError = state.management.errorMessage
+    state.discardFailedSessionMetadata(a)
+    try expect(state.management.hasPendingRetry && state.management.errorMessage == otherError,
+               "cancelling one session does not discard another session's failed details")
+    try goodBytes.write(to: store.fileURL)
+    state.management.retryLastMutation()
+    try await managementIdle(state)
+    try expect(state.displayTitle(for: b) == "另一个会话的草稿" && state.note(for: b) == "还要重试",
+               "the other session can still retry its retained failed details")
+    goodBytes = try Data(contentsOf: store.fileURL)
+
+    try malformed.write(to: store.fileURL)
+    state.toggleSessionFavorite(a)
+    try await managementIdle(state)
+    let favoriteError = state.management.errorMessage
+    state.discardFailedSessionMetadata(a)
+    try expect(state.management.hasPendingRetry && state.management.errorMessage == favoriteError && !state.isFavorite(a),
+               "cancelling details never discards a favorite failure for the same session")
+    try goodBytes.write(to: store.fileURL)
+    state.management.retryLastMutation()
+    try await managementIdle(state)
+    try expect(state.isFavorite(a) && state.displayTitle(for: a) == "已保存的名称",
+               "favorite retry remains usable and preserves existing details")
+    goodBytes = try Data(contentsOf: store.fileURL)
+
+    try malformed.write(to: store.fileURL)
+    let beforeReadFailure = await state.saveSessionMetadata(a, title: "取消后的读取失败", note: "")
+    try expect(!beforeReadFailure, "details failure exists before a later read failure")
+    let failedReload = await state.management.reload()
+    try expect(!failedReload && state.management.errorMessage?.hasPrefix("读取收藏与备注失败") == true,
+               "a later unrelated load failure has its own visible error")
+    let readError = state.management.errorMessage
+    state.discardFailedSessionMetadata(a)
+    try expect(!state.management.hasPendingRetry && state.management.errorMessage == readError,
+               "discarding matching failed details retains the unrelated read error")
+    try goodBytes.write(to: store.fileURL)
+    state.management.retryLastMutation()
+    try await managementIdle(state)
+    let afterReadDiscard = try store.load().entry(kind: .session, itemID: a.managementID)
+    try expect(afterReadDiscard?.displayName == "已保存的名称" && afterReadDiscard?.isFavorite == true,
+               "a discarded operation stays absent after repairing storage")
+    let reloaded = await state.management.reload()
+    try expect(reloaded && state.management.errorMessage == nil, "explicit successful load clears the repaired read error")
+    print("PASS editor-cancelled details never retry, committed values preserved, unrelated session/favorite retry and load error retained")
+}
+
 #if RENDER_SESSIONS
 @MainActor func render(_ state: SessionDesktopModel, projects: SessionDesktopModel, indexed: SessionDesktopModel,
+                       managed: SessionDesktopModel,
                        warnings: SessionDesktopModel, errors: SessionDesktopModel, to path: String) async throws {
     _ = NSApplication.shared
     NSApplication.shared.setActivationPolicy(.prohibited)
@@ -791,13 +1130,15 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
     let paginationOutput = output.deletingLastPathComponent().appendingPathComponent("desktop-pagination-preview.png")
     let warningsOutput = output.deletingLastPathComponent().appendingPathComponent("desktop-warnings-preview.png")
     let errorsOutput = output.deletingLastPathComponent().appendingPathComponent("desktop-errors-preview.png")
+    let managementOutput = output.deletingLastPathComponent().appendingPathComponent("desktop-management-preview.png")
     for (destination, height, section, previewModel) in [(output, CGFloat(620), SessionWorkspaceSection.sessions, state),
         (expandedOutput, CGFloat(1000), SessionWorkspaceSection.sessions, state),
         (projectsOutput, CGFloat(620), SessionWorkspaceSection.projects, projects),
         (statisticsOutput, CGFloat(880), SessionWorkspaceSection.statistics, projects),
         (paginationOutput, CGFloat(620), SessionWorkspaceSection.sessions, indexed),
         (warningsOutput, CGFloat(620), SessionWorkspaceSection.sessions, warnings),
-        (errorsOutput, CGFloat(620), SessionWorkspaceSection.sessions, errors)] {
+        (errorsOutput, CGFloat(620), SessionWorkspaceSection.sessions, errors),
+        (managementOutput, CGFloat(620), SessionWorkspaceSection.sessions, managed)] {
         let content = VStack(alignment: .leading, spacing: 14) {
             Text(section == .sessions ? "Codex 会话 · 模拟数据预览" : "Codex 项目与统计 · 模拟数据预览")
                 .font(.system(size: 22, weight: .semibold))
@@ -824,6 +1165,30 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
         try png.write(to: destination)
         print("RENDER \(destination.lastPathComponent)")
     }
+    guard let editedSummary = managed.filteredSessions.first else { throw CheckFailure(message: "management editor preview fixture missing") }
+    let editorOutput = output.deletingLastPathComponent().appendingPathComponent("desktop-management-editor-preview.png")
+    let editorContent = SessionMetadataEditor(model: managed, summary: editedSummary)
+        .frame(width: 588, height: 650).background(MemoryStyle.background)
+        .foregroundStyle(MemoryStyle.text).tint(MemoryStyle.accent)
+    let editorHosting = NSHostingView(rootView: editorContent)
+    let editorWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 588, height: 650),
+                                styleMask: .borderless, backing: .buffered, defer: false)
+    editorWindow.isReleasedWhenClosed = false
+    editorWindow.contentView = editorHosting
+    editorHosting.frame = NSRect(x: 0, y: 0, width: 588, height: 650)
+    defer { editorWindow.close() }
+    editorHosting.layoutSubtreeIfNeeded()
+    try await Task.sleep(nanoseconds: 70_000_000)
+    editorHosting.layoutSubtreeIfNeeded()
+    guard let editorBitmap = editorHosting.bitmapImageRepForCachingDisplay(in: editorHosting.bounds) else {
+        throw CheckFailure(message: "could not create offscreen management editor image")
+    }
+    editorHosting.cacheDisplay(in: editorHosting.bounds, to: editorBitmap)
+    guard let editorPNG = editorBitmap.representation(using: .png, properties: [:]) else {
+        throw CheckFailure(message: "could not encode management editor preview PNG")
+    }
+    try editorPNG.write(to: editorOutput)
+    print("RENDER \(editorOutput.lastPathComponent)")
 }
 #endif
 
@@ -844,10 +1209,16 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
     let state = try await checkRepositoryIntegration()
     try await checkPersistentRepositoryReopen()
     try checkChunkPoolBoundaries()
-    print("DESKTOP SESSION CHECKS PASSED: 16 workflows, \(assertionCount) assertions; isolated fixtures only")
+    let managed = try await checkManagementPersistenceAndFiltering()
+    try await checkManagementFailureAndRetry()
+    try await checkManagementIdentityAndPendingQuit()
+    try await checkManagementEditorBaselineConflicts()
+    try await checkManagementDiscardFailedDraft()
+    print("DESKTOP SESSION CHECKS PASSED: 21 workflows, \(assertionCount) assertions; isolated fixtures only")
     #if RENDER_SESSIONS
     if let output = ProcessInfo.processInfo.environment["GPT_DESKTOP_SESSION_RENDER_PATH"] {
-        try await render(state, projects: projects, indexed: indexed, warnings: warnings, errors: errors, to: output)
+        try await render(state, projects: projects, indexed: indexed, managed: managed,
+                         warnings: warnings, errors: errors, to: output)
     }
     #endif
 }
@@ -904,9 +1275,9 @@ def main() -> int:
         main_swift.write_text(SWIFT_CHECKS, encoding="utf-8")
         executable = directory / "session-checks"
         desktop = project / "Sources" / "GPTMemoryDesktop"
-        sources = [desktop / "SessionDesktopModel.swift"]
+        sources = [desktop / "SessionManagementModel.swift", desktop / "SessionDesktopModel.swift"]
         if output:
-            sources += [desktop / "SessionViews.swift", desktop / "SessionProjectViews.swift", desktop / "Style.swift"]
+            sources += [desktop / "SessionViews.swift", desktop / "SessionProjectViews.swift", desktop / "SessionManagementViews.swift", desktop / "Style.swift"]
         command = ["swiftc", "-swift-version", "5", "-target", f"{architecture}-apple-macosx14.0",
                    "-module-cache-path", str(directory / "module-cache"), "-I", str(release / "Modules"),
                    "-I", str(release / "CNative.build"), "-o", str(executable)]

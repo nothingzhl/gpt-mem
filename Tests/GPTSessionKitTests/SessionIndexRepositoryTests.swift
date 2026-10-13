@@ -3,6 +3,60 @@ import XCTest
 @testable import GPTSessionKit
 
 final class SessionIndexRepositoryTests: XCTestCase {
+    func testRecordedUnicodeIdentityUsesParserCharacterLimitAcrossIndexRestart() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let identifier = String(repeating: "会话🧪", count: 80)
+        let file = f.root.appendingPathComponent("sessions/unicode.jsonl")
+        try Data([record("session_meta", ["id":identifier]),
+                  record("event_msg", ["type":"user_message", "message":"Unicode identity"])].joined(separator:"\n").appending("\n").utf8)
+            .write(to: file)
+        let cold = try f.repository().loadCatalog()
+        XCTAssertEqual(cold.sessions.first?.metadataSessionID, identifier)
+        let warm = f.repository()
+        XCTAssertEqual(try warm.loadCatalog(), cold)
+        XCTAssertEqual(warm.lastReadMetrics.rolloutBytesRead, 0)
+        XCTAssertEqual(warm.lastReadMetrics.persistedRolloutFiles, 1)
+    }
+
+    func testRecordedManagementIdentitySurvivesRenameIndexRestartAndArchiveMove() throws {
+        let f = try Fixture(); defer { f.remove() }
+        let source = try f.write("stable", "Original")
+        try Data((json(["id":"stable", "thread_name":"Renamed in title index"]) + "\n").utf8)
+            .write(to: f.root.appendingPathComponent("session_index.jsonl"))
+        let first = try XCTUnwrap(f.repository().loadCatalog().sessions.first)
+        XCTAssertEqual(first.metadataSessionID, "stable")
+        XCTAssertEqual(first.managementID, "session:stable")
+        let warm = f.repository(); let reopened = try XCTUnwrap(warm.loadCatalog().sessions.first)
+        XCTAssertEqual(reopened.managementID, first.managementID)
+        XCTAssertEqual(warm.lastReadMetrics.rolloutBytesRead, 0)
+        let archive = f.root.appendingPathComponent("archived_sessions/changed-file-name.jsonl")
+        try FileManager.default.createDirectory(at: archive.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.moveItem(at: source, to: archive)
+        let moved = try XCTUnwrap(f.repository().loadCatalog().sessions.first)
+        XCTAssertEqual(moved.metadataSessionID, "stable")
+        XCTAssertEqual(moved.managementID, first.managementID)
+        XCTAssertNotEqual(moved.id, first.id)
+        XCTAssertTrue(moved.isArchived)
+        XCTAssertEqual(moved.title, "Renamed in title index")
+    }
+
+    func testUnidentifiedSameNamedLogsUseDistinctPathManagementIdentities() throws {
+        let f = try Fixture(); defer { f.remove() }
+        for name in ["one", "two"] {
+            let directory = f.root.appendingPathComponent("sessions/\(name)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data((record("event_msg", ["type":"user_message", "message":"Unknown \(name)"]) + "\n").utf8)
+                .write(to: directory.appendingPathComponent("same.jsonl"))
+        }
+        let entries = try f.repository().loadCatalog().sessions
+        XCTAssertEqual(entries.count, 2)
+        XCTAssertTrue(entries.allSatisfy { $0.metadataSessionID == nil })
+        XCTAssertEqual(Set(entries.map(\.sessionID)).count, 1)
+        XCTAssertEqual(Set(entries.map(\.managementID)).count, 2)
+        XCTAssertTrue(entries.allSatisfy { $0.managementID.hasPrefix("file:") })
+        XCTAssertEqual(try f.repository().loadCatalog().sessions, entries)
+    }
+
     func testRestartReusesSummariesWithoutReadingRolloutsOrSavingToolBodies() throws {
         let f = try Fixture(); defer { f.remove() }
         _ = try f.write("a", "Alpha", extra: [record("event_msg", ["type":"agent_message", "message":"PRIVATE_ASSISTANT_BODY"]),

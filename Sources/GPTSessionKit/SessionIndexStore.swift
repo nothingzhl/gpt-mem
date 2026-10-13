@@ -75,7 +75,7 @@ public enum SessionIndexStoreError: Error, LocalizedError {
 public final class SessionIndexStore: @unchecked Sendable {
     // Bump whenever rollout parsing/token/search semantics change, even when
     // the JSON cache schema remains compatible. Old summaries must be rescanned.
-    private static let parserVersion = 1
+    private static let parserVersion = 2
     public let directoryURL: URL
     public let fileURL: URL
     private let safeURL: URL
@@ -290,6 +290,10 @@ public final class SessionIndexStore: @unchecked Sendable {
               summary.isArchived == (parts.first == "archived_sessions"), summary.isArchived == revision.archived,
               !summary.id.isEmpty, summary.id.utf8.count <= 8_192,
               !summary.sessionID.isEmpty, summary.sessionID.utf8.count <= 4_096,
+              summary.metadataSessionID == nil || (summary.metadataSessionID == summary.sessionID
+                  && !(summary.metadataSessionID?.isEmpty ?? true)
+                  && (summary.metadataSessionID?.count ?? 0) <= 256
+                  && (summary.metadataSessionID?.utf8.count ?? 0) <= 4_096),
               summary.title.utf8.count <= 65_536, (summary.projectPath?.utf8.count ?? 0) <= 16_384,
               (summary.model?.utf8.count ?? 0) <= 4_096,
               summary.searchText.count <= readLimits.maximumSearchCharacters,

@@ -369,7 +369,8 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
                                    title: title, projectPath: summary.projectPath, startedAt: summary.startedAt,
                                    updatedAt: summary.updatedAt, model: summary.model, messageCount: summary.messageCount,
                                    toolCallCount: summary.toolCallCount, tokens: summary.tokens,
-                                   isArchived: summary.isArchived, searchText: summary.searchText)
+                                   isArchived: summary.isArchived, searchText: summary.searchText,
+                                   metadataSessionID: summary.metadataSessionID)
     }
 
     /// Hydrate only real, currently matching files. Deleted or moved logs never

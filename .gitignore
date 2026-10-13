@@ -12,6 +12,7 @@ reports/
 ai-services.json
 ai-reports/
 session-index/
+session-management/
 .env
 .env.*
 !.env.example

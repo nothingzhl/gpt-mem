@@ -171,7 +171,8 @@ struct CodexRolloutParser {
                                          updatedAt: fileUpdatedAt, model: model,
                                          messageCount: messageCount,
                                          toolCallCount: toolCallCount,
-                                         tokens: tokens, isArchived: isArchived, searchText: searchText)
+                                         tokens: tokens, isArchived: isArchived, searchText: searchText,
+                                         metadataSessionID: sessionID)
         return SessionTranscript(summary: summary, messages: messages, warnings: warnings)
     }
 
