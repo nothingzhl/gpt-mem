@@ -135,6 +135,57 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
     try await waitFor({ !model.isFiltering }, "background filter timed out")
 }
 
+/// Inspect task ownership without exposing diagnostics in the shipping model.
+/// Completed Task results must not outlive the published catalog/detail values.
+@MainActor func retainedTaskHandles(_ model: SessionDesktopModel) -> [String] {
+    let names: Set<String> = ["catalogTask", "catalogOperation", "transcriptTask", "transcriptOperation",
+                              "filterTask", "filterOperation"]
+    return Mirror(reflecting: model).children.compactMap { child in
+        guard let name = child.label, names.contains(name) else { return nil }
+        return Mirror(reflecting: child.value).children.isEmpty ? nil : name
+    }
+}
+
+@MainActor func checkTaskResultOwnership() async throws {
+    let item = summary("task-ownership")
+    let messages = [SessionMessage(id: "owned-prompt", kind: .user, text: "保留可见正文"),
+                    SessionMessage(id: "owned-result", kind: .toolResult,
+                                   text: String(repeating: "离线模拟工具内容", count: 1_000))]
+    let failure = CheckFailure(message: "模拟读取失败")
+    let source = FixtureSource(catalogs: [
+        .init(delay: 0, result: .success(.init(sessions: [item]))),
+        .init(delay: 0, result: .failure(failure))
+    ], transcripts: [item.id: [
+        .init(delay: 0, result: .success(.init(summary: item, messages: messages))),
+        .init(delay: 0, result: .failure(failure)),
+        .init(delay: 0.5, result: .success(.init(summary: item, messages: messages)))
+    ]])
+    let state = try model(source, name: "task-ownership")
+    try await load(state)
+    try expect(retainedTaskHandles(state).isEmpty, "completed catalog/filter task results are released")
+    state.select(item.id)
+    try await waitFor({ !state.isLoadingTranscript && !state.isFiltering }, "ownership transcript timed out")
+    try expect(state.transcript?.messages == messages, "releasing task handles preserves published messages")
+    try expect(state.transcriptIndex?.index(of: "owned-result") == 1, "published transcript index remains usable")
+    try expect(retainedTaskHandles(state).isEmpty, "completed transcript/filter task results are released")
+    state.select(item.id, forceReload: true)
+    try await waitFor({ !state.isLoadingTranscript }, "ownership failure timed out")
+    try expect(state.transcriptErrorMessage?.contains(failure.message) == true, "failed detail still reports its error")
+    try expect(retainedTaskHandles(state).isEmpty, "failed transcript task result is released")
+    state.select(item.id, forceReload: true)
+    try await waitFor({ source.calls.transcripts.count == 3 }, "pending detail did not start")
+    state.clearSelection()
+    try expect(state.transcript == nil && state.transcriptIndex == nil, "clearing selection releases visible detail")
+    try expect(retainedTaskHandles(state).isEmpty, "clearing selection drops cancelled task handles immediately")
+    try await waitFor({ source.calls.cancelledTranscripts == 1 }, "cancelled detail read did not stop")
+    state.refresh()
+    try await waitFor({ !state.isLoading }, "ownership catalog failure timed out")
+    try expect(state.errorMessage?.contains(failure.message) == true && state.sessions == [item],
+               "failed refresh preserves the existing catalog")
+    try expect(retainedTaskHandles(state).isEmpty, "failed catalog task result is released")
+    print("PASS completed/failed/cancelled task result ownership, retained visible content and cooperative cancellation")
+}
+
 @MainActor func checkLazyLoadAndFiltering() async throws {
     let a = summary("a", tokens: .init(input: 10, cachedInput: 2, output: 4, reasoningOutput: 1))
     let b = summary("b", project: "/workspace/other")
@@ -563,6 +614,52 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
     return state
 }
 
+@MainActor func checkChunkPoolBoundaries() throws {
+    let root = try fixtureRoot("chunk-pool-boundaries")
+    let directory = root.appendingPathComponent("sessions", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let url = directory.appendingPathComponent("chunk-session.jsonl")
+    let prompt = String(repeating: "跨块🙂", count: 8_000)
+    let title = String(repeating: "标题🙂", count: 8_000)
+    let records: [[String: Any]] = [
+        ["type": "session_meta", "payload": ["id": "chunk-session", "cwd": "/fixture/chunks"]],
+        ["type": "event_msg", "payload": ["type": "user_message", "message": prompt]],
+        ["type": "event_msg", "payload": ["type": "agent_message", "message": "完整的跨块回复"]],
+        ["type": "event_msg", "payload": ["type": "token_count", "info": ["total_token_usage": ["total_tokens": 321]]]]
+    ]
+    let lines = try records.map { String(decoding: try JSONSerialization.data(withJSONObject: $0), as: UTF8.self) }
+    let original = Data(lines.joined(separator: "\n").utf8) // Also exercise final record without newline.
+    try original.write(to: url)
+    let titleData = try JSONSerialization.data(withJSONObject: ["id": "chunk-session", "thread_name": title])
+    try titleData.write(to: root.appendingPathComponent("session_index.jsonl"))
+    try expect(original.count > 64 * 1_024 && titleData.count > 64 * 1_024,
+               "multi-byte rollout and title fixture span FileHandle chunk boundaries")
+    let budget = 20 * 1_024
+    let repository = CodexSessionRepository(rootURL: root, limits: .init(maximumCatalogReadBytes: budget))
+    var catalog = SessionCatalog()
+    var refreshCount = 0
+    for _ in 0..<10 {
+        catalog = try repository.loadCatalog()
+        refreshCount += 1
+        try expect(repository.lastReadMetrics.rolloutBytesRead <= budget + 1,
+                   "pool boundaries preserve per-refresh byte budget and EOF probe")
+        if catalog.sessions.first?.tokens.total == 321 { break }
+    }
+    guard let summary = catalog.sessions.first else { throw CheckFailure(message: "chunk catalog missing") }
+    try expect(refreshCount > 1 && summary.searchText.contains(prompt),
+               "continuation retains complete multi-byte prompt across chunk pools and catalog refreshes")
+    try expect(summary.title == String(title.prefix(140)) && summary.tokens.total == 321,
+               "title index and final token record survive drained Foundation pools")
+    let transcript = try repository.loadTranscript(for: summary)
+    try expect(transcript.messages.map(\.text) == [prompt, "完整的跨块回复"],
+               "detail load retains full Swift-owned message strings across chunk pools")
+    try expect(transcript.summary.title == summary.title && transcript.summary.tokens == summary.tokens,
+               "catalog and detail agree after bounded continuation completes")
+    let after = try Data(contentsOf: url)
+    try expect(after == original, "chunk pool reads leave source file untouched")
+    print("PASS >64KiB multi-byte JSONL/title chunks, 20KiB continuation, final record and owned strings")
+}
+
 #if RENDER_SESSIONS
 @MainActor func render(_ state: SessionDesktopModel, projects: SessionDesktopModel, indexed: SessionDesktopModel,
                        warnings: SessionDesktopModel, errors: SessionDesktopModel, to path: String) async throws {
@@ -616,6 +713,7 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
 
 @MainActor func runChecks() async throws {
     try await checkLazyLoadAndFiltering()
+    try await checkTaskResultOwnership()
     try await checkRefreshGenerations()
     try await checkTranscriptGenerations()
     try await checkRefreshDuringPendingTranscript()
@@ -628,7 +726,8 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
     let warnings = try await checkLargeWarningPresentation()
     let errors = try await checkLongErrorPresentation()
     let state = try await checkRepositoryIntegration()
-    print("DESKTOP SESSION CHECKS PASSED: 13 workflows, \(assertionCount) assertions; isolated fixtures only")
+    try checkChunkPoolBoundaries()
+    print("DESKTOP SESSION CHECKS PASSED: 15 workflows, \(assertionCount) assertions; isolated fixtures only")
     #if RENDER_SESSIONS
     if let output = ProcessInfo.processInfo.environment["GPT_DESKTOP_SESSION_RENDER_PATH"] {
         try await render(state, projects: projects, indexed: indexed, warnings: warnings, errors: errors, to: output)

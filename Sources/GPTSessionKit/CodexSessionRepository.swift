@@ -48,6 +48,12 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
     }
 
     public func loadCatalog() throws -> SessionCatalog {
+        // Return owned Swift values while draining filesystem/URL temporaries
+        // created during directory enumeration and metadata inspection.
+        try autoreleasepool { try readCatalog() }
+    }
+
+    private func readCatalog() throws -> SessionCatalog {
         try acquireReadLock(); defer { lock.unlock() }
         readMetrics = .init()
         var isDirectory: ObjCBool = false
@@ -165,6 +171,10 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
     }
 
     public func loadTranscript(for summary: CodexSessionSummary) throws -> SessionTranscript {
+        try autoreleasepool { try readTranscript(for: summary) }
+    }
+
+    private func readTranscript(for summary: CodexSessionSummary) throws -> SessionTranscript {
         try acquireReadLock(); defer { lock.unlock() }
         readMetrics = .init()
         var fileURL = summary.fileURL
@@ -252,6 +262,9 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
             var bytesRead = 0, lines = 0
             var reachedEOF = false, lineLimitReached = false
             func consume(_ data: Data, final: Bool) {
+                autoreleasepool { consumeRecord(data, final: final) }
+            }
+            func consumeRecord(_ data: Data, final: Bool) {
                 guard !data.isEmpty, !data.allSatisfy({ $0 == 32 || $0 == 9 || $0 == 13 }) else { return }
                 guard let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                     appendWarning(final ? "标题索引末行未完整写入或格式无效，已保留之前的标题。"
@@ -267,34 +280,38 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
                 titles[id] = String(name.prefix(140))
             }
             while bytesRead < byteBudget, !lineLimitReached {
-                try Task.checkCancellation()
-                let chunk = try handle.read(upToCount: min(64 * 1_024, byteBudget - bytesRead)) ?? Data()
-                if chunk.isEmpty { reachedEOF = true; break }
-                bytesRead += chunk.count
-                readMetrics.titleIndexBytesRead += chunk.count
-                var start = chunk.startIndex
-                while start < chunk.endIndex {
+                let chunkReachedEOF = try autoreleasepool { () throws -> Bool in
                     try Task.checkCancellation()
-                    let newline = chunk[start...].firstIndex(of: 10)
-                    let end = newline ?? chunk.endIndex
-                    if !oversized {
-                        if pending.count + chunk.distance(from: start, to: end) > limits.maximumLineBytes {
-                            oversized = true; pending.removeAll(keepingCapacity: true)
-                            appendWarning("标题索引单行超过读取上限，已跳过该记录。", to: &warnings)
-                        } else { pending.append(contentsOf: chunk[start..<end]) }
-                    }
-                    if let newline {
-                        lines += 1
-                        if !oversized { consume(pending, final: false) }
-                        pending.removeAll(keepingCapacity: true); oversized = false
-                        if lines >= 50_000 {
-                            lineLimitReached = true
-                            appendWarning("标题索引已达 50000 行上限，部分标题可能未更新。", to: &warnings)
-                            break
+                    let chunk = try handle.read(upToCount: min(64 * 1_024, byteBudget - bytesRead)) ?? Data()
+                    guard !chunk.isEmpty else { return true }
+                    bytesRead += chunk.count
+                    readMetrics.titleIndexBytesRead += chunk.count
+                    var start = chunk.startIndex
+                    while start < chunk.endIndex {
+                        try Task.checkCancellation()
+                        let newline = chunk[start...].firstIndex(of: 10)
+                        let end = newline ?? chunk.endIndex
+                        if !oversized {
+                            if pending.count + chunk.distance(from: start, to: end) > limits.maximumLineBytes {
+                                oversized = true; pending.removeAll(keepingCapacity: true)
+                                appendWarning("标题索引单行超过读取上限，已跳过该记录。", to: &warnings)
+                            } else { pending.append(contentsOf: chunk[start..<end]) }
                         }
-                        start = chunk.index(after: newline)
-                    } else { break }
+                        if let newline {
+                            lines += 1
+                            if !oversized { consume(pending, final: false) }
+                            pending.removeAll(keepingCapacity: true); oversized = false
+                            if lines >= 50_000 {
+                                lineLimitReached = true
+                                appendWarning("标题索引已达 50000 行上限，部分标题可能未更新。", to: &warnings)
+                                break
+                            }
+                            start = chunk.index(after: newline)
+                        } else { break }
+                    }
+                    return false
                 }
+                if chunkReachedEOF { reachedEOF = true; break }
             }
             if !reachedEOF, !lineLimitReached, bytesRead == byteBudget {
                 let probe = try handle.read(upToCount: 1) ?? Data()
@@ -337,30 +354,36 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
         var lineNumber = continuation?.lineNumber ?? 0
         var reachedEOF = false
         while bytesRead < byteBudget {
-            try Task.checkCancellation()
-            let count = min(64 * 1_024, byteBudget - bytesRead)
-            let chunk = try handle.read(upToCount: count) ?? Data()
-            if chunk.isEmpty { reachedEOF = true; break }
-            bytesRead += chunk.count
-            readMetrics.rolloutBytesRead += chunk.count
-            var start = chunk.startIndex
-            while start < chunk.endIndex {
+            // FileHandle returns bridged NSData; a pool around consume alone
+            // would still accumulate every read chunk until the whole scan ends.
+            let chunkReachedEOF = try autoreleasepool { () throws -> Bool in
                 try Task.checkCancellation()
-                let newline = chunk[start...].firstIndex(of: 10)
-                let end = newline ?? chunk.endIndex
-                if !oversized {
-                    if pending.count + chunk.distance(from: start, to: end) > limits.maximumLineBytes {
-                        oversized = true; pending.removeAll(keepingCapacity: true)
-                        parser.warn("单行超过 \(limits.maximumLineBytes / 1_024) KiB，已跳过该记录。")
-                    } else { pending.append(contentsOf: chunk[start..<end]) }
+                let count = min(64 * 1_024, byteBudget - bytesRead)
+                let chunk = try handle.read(upToCount: count) ?? Data()
+                guard !chunk.isEmpty else { return true }
+                bytesRead += chunk.count
+                readMetrics.rolloutBytesRead += chunk.count
+                var start = chunk.startIndex
+                while start < chunk.endIndex {
+                    try Task.checkCancellation()
+                    let newline = chunk[start...].firstIndex(of: 10)
+                    let end = newline ?? chunk.endIndex
+                    if !oversized {
+                        if pending.count + chunk.distance(from: start, to: end) > limits.maximumLineBytes {
+                            oversized = true; pending.removeAll(keepingCapacity: true)
+                            parser.warn("单行超过 \(limits.maximumLineBytes / 1_024) KiB，已跳过该记录。")
+                        } else { pending.append(contentsOf: chunk[start..<end]) }
+                    }
+                    if let newline {
+                        lineNumber += 1
+                        if !oversized { parser.consume(pending, line: lineNumber, isFinalLine: false) }
+                        pending.removeAll(keepingCapacity: true); oversized = false
+                        start = chunk.index(after: newline)
+                    } else { break }
                 }
-                if let newline {
-                    lineNumber += 1
-                    if !oversized { parser.consume(pending, line: lineNumber, isFinalLine: false) }
-                    pending.removeAll(keepingCapacity: true); oversized = false
-                    start = chunk.index(after: newline)
-                } else { break }
+                return false
             }
+            if chunkReachedEOF { reachedEOF = true; break }
         }
         if !reachedEOF, bytesRead == byteBudget {
             let probe = try handle.read(upToCount: 1) ?? Data()

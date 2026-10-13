@@ -206,7 +206,12 @@ public final class MemoryStore {
                 throw MemoryError.message("历史快照数据为空或损坏。")
             }
             do {
-                let snapshot = try decoder.decode(MemorySnapshot.self, from: Data(bytes: bytes, count: length))
+                // JSONDecoder and Data can create autoreleased Foundation objects.
+                // Drain each row's temporaries while keeping the decoded Swift value
+                // alive, rather than retaining a full window's decoding scratch space.
+                let snapshot = try autoreleasepool {
+                    try decoder.decode(MemorySnapshot.self, from: Data(bytes: bytes, count: length))
+                }
                 snapshots.append(snapshot); lastReadMetrics.decodedSnapshots += 1
                 if let id, length <= decodedCacheByteLimit - cachedPayloadBytes {
                     decodedCache[id] = (snapshot, length); cachedPayloadBytes += length

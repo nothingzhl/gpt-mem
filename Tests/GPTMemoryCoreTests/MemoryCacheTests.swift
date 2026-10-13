@@ -62,4 +62,30 @@ final class MemoryCacheTests: XCTestCase {
         XCTAssertEqual(try store.load(since: origin.addingTimeInterval(-9 * 86400)).map(\.id), ["new"])
         XCTAssertEqual(store.lastReadMetrics.reusedSnapshots, 0)
     }
+
+    func testDecodedHistoryRetainsMetadataAfterTemporaryPoolsDrain() throws {
+        let url = database(); defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = try MemoryStore(url: url, decodedCacheByteLimit: 1_048_576)
+        let longPath = "/Applications/" + String(repeating: "测试应用/", count: 40) + "Codex"
+        let samples = (0..<24).map { index -> MemorySnapshot in
+            var value = sample(String(index), Double(index), UInt64(index + 100))
+            value.processes[0].executable = longPath
+            value.processes[0].roleHint = "页面渲染角色"
+            value.processes[0].rootKey = "birth:777:1800000000000000"
+            value.warnings = ["指标缺失的详细说明：" + String(repeating: "保留实际样本。", count: 30)]
+            return value
+        }
+        for value in samples { try store.save(value) }
+        let firstRead = try autoreleasepool { try store.load(since: origin) }
+        XCTAssertEqual(firstRead, samples)
+        XCTAssertEqual(store.lastReadMetrics.decodedSnapshots, samples.count)
+        // Exercise retained cached strings and process arrays after the decoder's
+        // pool and caller's pool have both drained, including the baseline row.
+        let narrowed = try autoreleasepool { try store.load(since: origin.addingTimeInterval(12)) }
+        XCTAssertEqual(narrowed, Array(samples[11...]))
+        XCTAssertEqual(store.lastReadMetrics.decodedSnapshots, 0)
+        XCTAssertEqual(store.lastReadMetrics.reusedSnapshots, 13)
+        XCTAssertEqual(firstRead.first?.processes.first?.executable, longPath)
+        XCTAssertEqual(firstRead.last?.warnings, samples.last?.warnings)
+    }
 }

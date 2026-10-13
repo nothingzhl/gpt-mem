@@ -46,6 +46,13 @@ struct CodexRolloutParser {
     }
 
     mutating func consume(_ data: Data, line: Int, isFinalLine: Bool) {
+        // Foundation JSON bridging creates autoreleased temporary objects. Drain
+        // them per record instead of retaining a whole catalog read's temporaries.
+        // Strings stored in entries/summary fields remain owned by Swift values.
+        autoreleasepool { consumeRecord(data, line: line, isFinalLine: isFinalLine) }
+    }
+
+    private mutating func consumeRecord(_ data: Data, line: Int, isFinalLine: Bool) {
         guard !data.isEmpty else { return }
         if data.allSatisfy({ $0 == 32 || $0 == 9 || $0 == 13 }) { return }
         guard let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {

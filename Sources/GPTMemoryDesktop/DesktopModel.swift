@@ -165,8 +165,10 @@ final class DesktopModel: ObservableObject {
 
 /// All native collector, SQLite and lock operations are serialized off the UI thread.
 private final class DesktopSamplingService {
-    private let queue = DispatchQueue(label: "local.gpt-manager.sampling", qos: .utility)
-    private let operationQueue = DispatchQueue(label: "local.gpt-manager.files", qos: .utility)
+    private let queue = DispatchQueue(label: "local.gpt-manager.sampling", qos: .utility,
+                                     autoreleaseFrequency: .workItem)
+    private let operationQueue = DispatchQueue(label: "local.gpt-manager.files", qos: .utility,
+                                              autoreleaseFrequency: .workItem)
     private let historyCacheLimit = 32 * 1_024 * 1_024
     private let databaseURL: URL
     private let handler: (DesktopUpdate) -> Void
@@ -258,6 +260,11 @@ private final class DesktopSamplingService {
         self.timer = timer; timer.resume()
     }
     private func tick() {
+        // Timer callbacks need their own boundary as well as queued work items.
+        // Published snapshots retain their values; native/JSON scratch objects do not.
+        autoreleasepool { collectAndPublish() }
+    }
+    private func collectAndPublish() {
         do {
             var notice: String?
             // When an external CLI writer exits, the desktop can take over the same

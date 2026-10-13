@@ -227,6 +227,8 @@ final class SessionDesktopModel: ObservableObject {
                                         reuseMatches: Bool = false) {
         filterTask?.cancel()
         filterOperation?.cancel()
+        filterTask = nil
+        filterOperation = nil
         let generation = UUID()
         filterGeneration = generation
         pendingSelectionReload = pendingSelectionReload || reloadSelection
@@ -250,7 +252,12 @@ final class SessionDesktopModel: ObservableObject {
             }
             self.filterOperation = operation
             let result = await operation.value
-            guard let result, self.filterGeneration == generation, !Task.isCancelled else { return }
+            guard self.filterGeneration == generation, !Task.isCancelled else { return }
+            // A completed Task keeps its value alive as long as its handle does.
+            // Publish the result without keeping another catalog-sized snapshot.
+            self.filterOperation = nil
+            self.filterTask = nil
+            guard let result else { self.isFiltering = false; return }
             self.filteredSessions = result.summaries
             self.tokenTotals = result.totals
             self.analytics = result.analytics
@@ -292,11 +299,15 @@ final class SessionDesktopModel: ObservableObject {
     func refresh() {
         catalogTask?.cancel()
         catalogOperation?.cancel()
+        catalogTask = nil
+        catalogOperation = nil
         // A pending detail read shares the repository lock with the catalog.
         // Stop it before scanning, so refresh does not queue behind obsolete I/O.
         if isLoadingTranscript {
             transcriptTask?.cancel()
             transcriptOperation?.cancel()
+            transcriptTask = nil
+            transcriptOperation = nil
             transcriptGeneration = UUID()
         }
         let generation = UUID()
@@ -309,6 +320,8 @@ final class SessionDesktopModel: ObservableObject {
         catalogTask = Task { [weak self] in
             let result = await operation.value
             guard let self, self.catalogGeneration == generation, !Task.isCancelled else { return }
+            self.catalogOperation = nil
+            self.catalogTask = nil
             self.isLoading = false
             self.hasLoaded = true
             switch result {
@@ -317,6 +330,8 @@ final class SessionDesktopModel: ObservableObject {
                 // summary back while the new catalog's filters finish in background.
                 self.transcriptTask?.cancel()
                 self.transcriptOperation?.cancel()
+                self.transcriptTask = nil
+                self.transcriptOperation = nil
                 self.transcriptGeneration = UUID()
                 self.isLoadingTranscript = false
                 self.sessions = catalog.sessions
@@ -350,6 +365,8 @@ final class SessionDesktopModel: ObservableObject {
            (transcript != nil || isLoadingTranscript) { return }
         transcriptTask?.cancel()
         transcriptOperation?.cancel()
+        transcriptTask = nil
+        transcriptOperation = nil
         let generation = UUID()
         transcriptGeneration = generation
         selectedSessionID = id
@@ -372,6 +389,8 @@ final class SessionDesktopModel: ObservableObject {
             guard let self, self.transcriptGeneration == generation,
                   self.selectedSessionID == id, self.selectedSession != nil,
                   !Task.isCancelled else { return }
+            self.transcriptOperation = nil
+            self.transcriptTask = nil
             self.isLoadingTranscript = false
             switch result {
             case .success(let loaded):
@@ -404,6 +423,8 @@ final class SessionDesktopModel: ObservableObject {
     func clearSelection() {
         transcriptTask?.cancel()
         transcriptOperation?.cancel()
+        transcriptTask = nil
+        transcriptOperation = nil
         transcriptGeneration = UUID()
         selectedSessionID = nil
         transcript = nil

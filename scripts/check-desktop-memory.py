@@ -21,17 +21,27 @@ private final class Fixture {
     private var diagnosticDone = false
     private var exportDone = false
     private var errors: [String] = []
-    var state: (count: Int, paused: Bool, diagnosticStarted: Bool, diagnosticDone: Bool, exportDone: Bool, errors: [String]) {
+    private var latestPublished: MemorySnapshot?
+    var state: (count: Int, paused: Bool, diagnosticStarted: Bool, diagnosticDone: Bool, exportDone: Bool, errors: [String], latestPublished: MemorySnapshot?) {
         lock.lock(); defer { lock.unlock() }
-        return (count, paused, diagnosticStarted, diagnosticDone, exportDone, errors)
+        return (count, paused, diagnosticStarted, diagnosticDone, exportDone, errors, latestPublished)
     }
     func sample() -> MemorySnapshot {
         lock.lock(); count += 1; let index = count; lock.unlock()
-        return MemorySnapshot(id: String(index), capturedAt: Date(), processes: [])
+        let path = "/Applications/" + String(repeating: "临时采样元数据/", count: 20) + "Fixture.app/Contents/MacOS/Fixture"
+        let processes = (0..<40).map { offset in
+            ProcessSample(bootID: "fixture", pid: 1000 + offset, parentPID: 1, startTimeTicks: 1,
+                startedAt: Date(timeIntervalSince1970: 1_800_000_000), executable: path,
+                role: .renderer, roleHint: "合成页面渲染", rootKey: "fixture:root",
+                footprintBytes: UInt64(index * 1024 + offset))
+        }
+        return MemorySnapshot(id: String(index), capturedAt: Date(), processes: processes,
+                              warnings: ["合成样本；验证采样临时对象释放后的数据寿命。"])
     }
     func update(_ update: DesktopUpdate) {
         lock.lock(); defer { lock.unlock() }
         paused = update.mode == "已暂停"
+        if let snapshot = update.snapshot { latestPublished = snapshot }
         if let error = update.historyError { errors.append(error) }
     }
     func capture(_ process: ProcessSample, _ output: URL) throws -> DiagnosticResult {
@@ -98,7 +108,15 @@ do {
     let persisted = try reader.load(since: Date().addingTimeInterval(-60))
     try expect(persisted.count >= 5, "continued samples persisted")
     print("PASS slow export does not block sampling or pause")
-    print("DESKTOP MEMORY CHECKS PASSED: 2 workflows, \(assertions) assertions; synthetic samples only")
+    try expect(persisted.last == fixture.state.latestPublished, "published sample survives sampling autorelease pool")
+    try expect(persisted.last?.processes.count == 40, "complete process samples persist")
+    try expect(persisted.last?.processes.first?.executable.contains("临时采样元数据") == true,
+               "long Unicode executable metadata survives decoder pools")
+    try expect(persisted.last?.processes.last?.rootKey == "fixture:root", "process identity metadata remains valid")
+    try expect(persisted.last?.warnings == ["合成样本；验证采样临时对象释放后的数据寿命。"],
+               "snapshot warnings remain valid")
+    print("PASS complete published and persisted samples survive temporary object pools")
+    print("DESKTOP MEMORY CHECKS PASSED: 3 workflows, \(assertions) assertions; synthetic samples only")
 } catch {
     fputs("DESKTOP MEMORY CHECK FAILED: \(error)\n", stderr); exit(1)
 }

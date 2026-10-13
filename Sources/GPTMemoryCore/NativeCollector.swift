@@ -22,6 +22,13 @@ public enum ProcessClassifier {
 }
 
 public final class NativeCollector {
+    // Paths live in ProcessSample. Retaining the C struct would also keep its
+    // 4 KiB path buffer for every unrelated process on the system.
+    private struct NativeMetrics {
+        let parentPID: Int
+        let isValid: Bool
+        let cpuTimeNS: UInt64
+    }
     private let bootID: String
     private var priorCPU: [String: (UInt64, Double)] = [:]
     private var cachedRoleHints: [String: String] = [:]
@@ -43,6 +50,10 @@ public final class NativeCollector {
     }
 
     public func sample() throws -> MemorySnapshot {
+        try autoreleasepool { try collectSample() }
+    }
+
+    private func collectSample() throws -> MemorySnapshot {
         let capturedAt = Date()
         let now = gpt_monotonic_seconds()
         var pointer: UnsafeMutablePointer<Int32>?
@@ -51,27 +62,28 @@ public final class NativeCollector {
             throw MemoryError.message("无法读取 macOS 进程列表：\(String(cString: strerror(errno)))。请在普通本机终端运行；受限执行环境可能禁止进程查询。")
         }
         defer { free(pointer) }
-        var native: [Int: gpt_process_info] = [:]
+        var native: [Int: NativeMetrics] = [:]
+        var values: [Int: ProcessSample] = [:]
         var failedPIDs: Set<Int> = []
         for i in 0..<Int(count) {
             let pid = pointer[i]
             if pid <= 0 { continue }
             var info = gpt_process_info()
-            if gpt_read_process(pid, &info) == 0 { native[Int(pid)] = info }
-            else { failedPIDs.insert(Int(pid)) }
-        }
-        guard !native.isEmpty else {
-            throw MemoryError.message("进程枚举成功但无法读取任何进程信息；当前环境限制了 libproc 权限。")
-        }
-        var values: [Int: ProcessSample] = [:]
-        for (pid, var info) in native {
+            guard gpt_read_process(pid, &info) == 0 else {
+                failedPIDs.insert(Int(pid)); continue
+            }
+            native[Int(pid)] = NativeMetrics(parentPID: Int(info.parent_pid),
+                isValid: info.metrics_valid != 0, cpuTimeNS: info.cpu_time_ns)
             let executable = string(&info.executable)
-            values[pid] = ProcessSample(bootID: bootID, pid: pid, parentPID: Int(info.parent_pid),
+            values[Int(pid)] = ProcessSample(bootID: bootID, pid: Int(pid), parentPID: Int(info.parent_pid),
                 startTimeTicks: info.start_ticks, startedAt: Date(timeIntervalSince1970: info.started_at),
                 executable: executable, role: ProcessClassifier.classify(executable: executable, safeHint: ""),
                 footprintBytes: info.footprint_bytes, rssBytes: info.rss_bytes,
                 peakFootprintBytes: info.peak_footprint_bytes,
                 absoluteStartTimeMicroseconds: info.start_ticks)
+        }
+        guard !native.isEmpty else {
+            throw MemoryError.message("进程枚举成功但无法读取任何进程信息；当前环境限制了 libproc 权限。")
         }
         let roots = values.values.filter { $0.role == .appMain }
         var owners: [String: String] = Dictionary(uniqueKeysWithValues: roots.map { ($0.key, $0.key) })
@@ -118,16 +130,16 @@ public final class NativeCollector {
         for (pid, var value) in values {
             let isSelf = pid == Int(getpid())
             guard let owner = owners[value.key], !observerPIDs.contains(pid) else {
-                if isSelf, let info = native[pid], info.metrics_valid != 0 {
-                    value.cpuPercent = cpuPercent(key: value.key, cpu: info.cpu_time_ns, now: now)
-                    nextCPU[value.key] = (info.cpu_time_ns, now)
+                if isSelf, let info = native[pid], info.isValid {
+                    value.cpuPercent = cpuPercent(key: value.key, cpu: info.cpuTimeNS, now: now)
+                    nextCPU[value.key] = (info.cpuTimeNS, now)
                     values[pid] = value
                 }
                 continue
             }
             nextOwners[value.key] = owner
             nextOwnedPIDs[pid] = (value.key, owner)
-            guard let info = native[pid], info.metrics_valid != 0 else { unavailable.append(pid); continue }
+            guard let info = native[pid], info.isValid else { unavailable.append(pid); continue }
             let hint: String
             if let previous = cachedRoleHints[value.key] {
                 hint = previous
@@ -142,9 +154,9 @@ public final class NativeCollector {
             value.roleHint = hint
             value.role = ProcessClassifier.classify(executable: value.executable, safeHint: hint)
             value.rootKey = owner
-            value.ownership = remembered.contains(value.key) && native[pid]?.parent_pid == 1 ? "remembered_ancestry" : "process_tree"
-            value.cpuPercent = cpuPercent(key: value.key, cpu: info.cpu_time_ns, now: now)
-            nextCPU[value.key] = (info.cpu_time_ns, now)
+            value.ownership = remembered.contains(value.key) && info.parentPID == 1 ? "remembered_ancestry" : "process_tree"
+            value.cpuPercent = cpuPercent(key: value.key, cpu: info.cpuTimeNS, now: now)
+            nextCPU[value.key] = (info.cpuTimeNS, now)
             monitored.append(value)
         }
         // Cache only currently live instances, bounding observer memory over long runs.
@@ -159,7 +171,7 @@ public final class NativeCollector {
         let unknownCount = monitored.filter { $0.role == .unknownNode }.count
         if unknownCount > 0 { warnings.append("\(unknownCount) 个 Node 的服务角色未确认，已单列，未计作 MCP。") }
         var observer = values[Int(getpid())]
-        if native[Int(getpid())]?.metrics_valid == 0 { observer = nil }
+        if native[Int(getpid())]?.isValid == false { observer = nil }
         observer?.ownership = "observer"
         observer?.rootKey = "observer"
         return MemorySnapshot(capturedAt: capturedAt,
