@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import GPTSessionKit
 
 enum SessionWorkspaceSection: String, CaseIterable {
@@ -27,6 +28,11 @@ struct SessionsContent: View {
     @State private var messageRangeStart: Int
     @State private var showTokenDetails = false
     @State private var editingSession: CodexSessionSummary?
+    @State private var showsFullTextSearch = false
+    @State private var handoffDraft: HandoffDraft?
+    @State private var pendingSearchHit: SessionSearchHit?
+    @State private var pendingMessageID: String?
+    @State private var jumpNotice: String?
     @State private var editingProject: SessionProjectSummary?
     private let initiallyExpandedWarnings: Bool
 
@@ -48,12 +54,15 @@ struct SessionsContent: View {
                     }
                 }.pickerStyle(.segmented).frame(width: 360)
                 Spacer()
+                Button("全文搜索", systemImage: "magnifyingglass") { showsFullTextSearch = true }
+                    .disabled(model.isLoading || !model.hasLoaded)
                 if model.isFiltering {
                     ProgressView().controlSize(.small)
                     Text("更新筛选…").font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
                 }
             }
             controls
+            if let jumpNotice { Text(jumpNotice).font(.caption).foregroundStyle(.orange) }
             SessionManagementStatus(model: model.management, showsWriteError: editingSession == nil && editingProject == nil)
             if let error = model.errorMessage {
                 SessionWarningsDisclosure(title: "读取失败", warnings: [error], initiallyExpanded: true)
@@ -90,6 +99,34 @@ struct SessionsContent: View {
                 // A cached same-ID reload can complete within one render frame;
                 // count changes must still move the page into the new valid range.
                 messageRangeStart = SessionMessagePage.latestStart(messageCount: model.transcript?.messages.count ?? 0)
+            }
+            .onChange(of: model.isFiltering) { _, filtering in
+                if !filtering, let hit = pendingSearchHit {
+                    pendingSearchHit = nil
+                    pendingMessageID = hit.messageID
+                    model.select(hit.summary.id)
+                }
+            }
+            .sheet(isPresented: $showsFullTextSearch) {
+                SessionFullTextSearchSheet(model: model) { hit in
+                    showsFullTextSearch = false
+                    section = .sessions
+                    jumpNotice = nil
+                    pendingSearchHit = hit
+                    model.query = ""
+                    model.selectedProject = nil
+                    model.selectedProjectTag = nil
+                    model.onlyFavoriteSessions = false
+                    model.includeArchived = true
+                    if !model.isFiltering {
+                        pendingSearchHit = nil
+                        pendingMessageID = hit.messageID
+                        model.select(hit.summary.id)
+                    }
+                }
+            }
+            .sheet(item: $handoffDraft) { draft in
+                SessionHandoffEditor(initialText: draft.text)
             }
             .sheet(item: $editingSession) { summary in
                 SessionMetadataEditor(model: model, summary: summary)
@@ -322,6 +359,10 @@ struct SessionsContent: View {
                     guard canManage else { return }
                     model.toggleSessionFavorite(summary)
                 }
+                Button("继续工作", systemImage: "arrow.right.doc.on.clipboard") {
+                    guard let transcript = model.transcript, transcript.summary.id == summary.id else { return }
+                    handoffDraft = HandoffDraft(text: SessionHandoff.draft(transcript: transcript, note: model.note(for: summary)))
+                }.disabled(model.isLoadingTranscript || model.transcript?.summary.id != summary.id)
                 Button { beginEditing(summary) } label: { Label("编辑", systemImage: "pencil") }
                     .font(.system(size: 11)).disabled(!canManage)
                     .help("编辑本地名称与备注").accessibilityLabel("编辑本地名称与备注")
@@ -423,6 +464,15 @@ struct SessionsContent: View {
                     }.padding(.bottom, 12)
                 }
             }
+        .task(id: pendingMessageID) {
+            guard let id = pendingMessageID else { return }
+            if model.transcriptIndex?.index(of: id) != nil {
+                jump(to: id, in: transcript, using: proxy)
+            } else {
+                jumpNotice = "原日志已变化，当前读取范围中找不到命中消息。请重新全文搜索。"
+            }
+            pendingMessageID = nil
+        }
         }.id(transcript.summary.id)
     }
 
@@ -561,5 +611,120 @@ private struct SessionMessageCard: View {
                     .font(.system(size: 10)).buttonStyle(.link)
             }
         }
+    }
+}
+
+private struct HandoffDraft: Identifiable {
+    let id = UUID()
+    let text: String
+}
+
+struct SessionHandoffEditor: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var text: String
+    @State private var status = ""
+    init(initialText: String) { _text = State(initialValue: initialText) }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("继续工作 · 交接说明").font(.headline)
+            Text("本地摘录，可编辑后复制到新会话。请补充目标、已验证结果与待办；不会自动发送。")
+                .font(.callout).foregroundStyle(.secondary)
+            TextEditor(text: $text).font(.system(size: 12, design: .monospaced))
+                .border(Color.gray.opacity(0.3))
+            HStack {
+                Text(status).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("关闭") { dismiss() }
+                Button("导出 Markdown") {
+                    let panel = NSSavePanel()
+                    panel.nameFieldStringValue = "继续工作交接.md"
+                    guard panel.runModal() == .OK, let url = panel.url else { return }
+                    do {
+                        try text.write(to: url, atomically: true, encoding: .utf8)
+                        status = "已导出"
+                    } catch { status = "导出失败：\(error.localizedDescription)" }
+                }
+                Button("复制交接说明") {
+                    NSPasteboard.general.clearContents()
+                    status = NSPasteboard.general.setString(text, forType: .string) ? "已复制，可粘贴到新会话" : "复制失败"
+                }.buttonStyle(.borderedProminent)
+            }.controlSize(.large)
+        }.padding(20).frame(minWidth: 680, minHeight: 520)
+    }
+}
+
+struct SessionFullTextSearchSheet: View {
+    @ObservedObject var model: SessionDesktopModel
+    let onOpen: (SessionSearchHit) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+    @State private var scope = SessionSearchScope.all
+    @State private var project: String?
+    @State private var archived = false
+    @State private var submittedQuery = ""
+    @State private var submittedScope = ""
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("跨会话全文搜索").font(.headline)
+            HStack {
+                TextField("输入关键词，空格分隔多个词（同一消息需全部命中）", text: $query)
+                    .textFieldStyle(.roundedBorder).onSubmit { search() }
+                if model.isSearchingFullText {
+                    ProgressView().controlSize(.small)
+                    Button("停止") { model.cancelFullTextSearch() }
+                } else {
+                    Button("搜索") { search() }.disabled(query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            HStack {
+                Picker("内容", selection: $scope) {
+                    ForEach(SessionSearchScope.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+                Picker("项目", selection: $project) {
+                    Text("所有项目").tag(String?.none)
+                    ForEach(model.projectPaths, id: \.self) { Text($0).tag(Optional($0)) }
+                }
+                Toggle("含归档", isOn: $archived)
+            }
+            Text("按需读取本地日志；最多 200 条结果、128 MiB 扫描预算。报错与代码筛选采用文本特征，可能有遗漏。")
+                .font(.caption).foregroundStyle(.secondary)
+            if let result = model.fullTextResult {
+                Text("关键词：\(submittedQuery) · \(submittedScope) · \(result.hits.count) 条匹配 · 已读取 \(result.scannedSessions)/\(result.totalSessions) 个会话")
+                    .font(.callout)
+                if result.stoppedAtLimit || result.skippedSessions > 0 || result.incompleteSessions > 0 {
+                    Text("\(result.stoppedAtLimit ? "达到扫描或结果上限；请缩小范围。 " : "")\(result.skippedSessions) 个会话未能读取，\(result.incompleteSessions) 个有读取提示；结果可能不完整。")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+                if result.hits.isEmpty { Text("本次读取范围内没有匹配消息。请调整关键词或范围。") }
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 10) {
+                        ForEach(result.hits) { hit in
+                            Button { onOpen(hit) } label: {
+                                VStack(alignment: .leading, spacing: 5) {
+                                    Text(model.displayTitle(for: hit.summary)).font(.headline)
+                                    Text("\(hit.summary.projectPath ?? "项目未记录") · \(hit.kind.rawValue)")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                    Text(hit.excerpt).font(.system(size: 12)).lineLimit(5)
+                                }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Color.gray.opacity(0.08)).clipShape(RoundedRectangle(cornerRadius: 8))
+                            }.buttonStyle(.plain).help("打开会话并定位到这条消息")
+                        }
+                    }
+                }
+            } else {
+                Spacer()
+                Text(model.isSearchingFullText ? "正在读取并匹配消息…（\(model.fullTextScanned)/\(model.fullTextTotal) 个会话）" : "选择范围后点击搜索。结果可直接跳到原始消息。")
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            if let error = model.fullTextError { Text(error).foregroundStyle(.red) }
+            HStack { Spacer(); Button("关闭") { dismiss() } }.controlSize(.large)
+        }.padding(20).frame(width: 760, height: 580)
+            .onDisappear { model.cancelFullTextSearch() }
+    }
+    private func search() {
+        submittedQuery = query
+        submittedScope = scope.title + " · " + (project ?? "所有项目") + (archived ? " · 含归档" : "")
+        model.searchFullText(query: query, scope: scope, project: project, archived: archived)
     }
 }

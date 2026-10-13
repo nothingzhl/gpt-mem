@@ -437,6 +437,64 @@ final class SessionDesktopModel: ObservableObject {
         selectedProject = path
     }
 
+    @Published private(set) var fullTextResult: SessionSearchResult?
+    @Published private(set) var isSearchingFullText = false
+    @Published private(set) var fullTextScanned = 0
+    @Published private(set) var fullTextTotal = 0
+    @Published private(set) var fullTextError: String?
+    private var fullTextTask: Task<Void, Never>?
+    private var fullTextOperation: Task<SessionSearchResult, Error>?
+    private var fullTextGeneration = UUID()
+
+    func searchFullText(query: String, scope: SessionSearchScope, project: String?, archived: Bool) {
+        cancelFullTextSearch()
+        fullTextResult = nil
+        fullTextError = nil
+        guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let generation = UUID()
+        fullTextGeneration = generation
+        let candidates = sessions.filter { (archived || !$0.isArchived) &&
+            (project == nil || SessionManagementIndex.projectPath(for: $0) == project) }
+        let loader = transcriptLoader
+        fullTextScanned = 0
+        fullTextTotal = candidates.count
+        isSearchingFullText = true
+        let operation = Task.detached(priority: .utility) {
+            try SessionFullTextSearch.search(sessions: candidates, query: query, scope: scope, progress: { [weak self] count, _ in
+                Task { @MainActor in
+                    guard let self, self.fullTextGeneration == generation, self.isSearchingFullText else { return }
+                    self.fullTextScanned = count
+                }
+            }, loader: loader)
+        }
+        fullTextOperation = operation
+        fullTextTask = Task { [weak self] in
+            do {
+                let result = try await operation.value
+                guard let self, self.fullTextGeneration == generation, !Task.isCancelled else { return }
+                self.fullTextResult = result
+                self.isSearchingFullText = false
+                self.fullTextOperation = nil
+                self.fullTextTask = nil
+            } catch {
+                guard let self, self.fullTextGeneration == generation, !Task.isCancelled else { return }
+                self.isSearchingFullText = false
+                self.fullTextOperation = nil
+                self.fullTextTask = nil
+                if !(error is CancellationError) { self.fullTextError = "全文搜索失败：\(error.localizedDescription)" }
+            }
+        }
+    }
+
+    func cancelFullTextSearch() {
+        fullTextTask?.cancel()
+        fullTextOperation?.cancel()
+        fullTextTask = nil
+        fullTextOperation = nil
+        fullTextGeneration = UUID()
+        isSearchingFullText = false
+    }
+
     func loadIfNeeded() {
         management.loadIfNeeded()
         guard !hasLoaded, !isLoading else { return }

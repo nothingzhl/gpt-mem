@@ -1327,6 +1327,29 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
                        warnings: SessionDesktopModel, errors: SessionDesktopModel, to path: String) async throws {
     _ = NSApplication.shared
     NSApplication.shared.setActivationPolicy(.prohibited)
+    if let transcript = state.transcript {
+        let draft = SessionHandoff.draft(transcript: transcript)
+        let handoff = AnyView(SessionHandoffEditor(initialText: draft))
+        let search = AnyView(SessionFullTextSearchSheet(model: state, onOpen: { _ in }))
+        for (name, content, width, height) in [("desktop-handoff-preview.png", handoff, CGFloat(680), CGFloat(520)),
+                                              ("desktop-fulltext-preview.png", search, CGFloat(760), CGFloat(580))] {
+            let host = NSHostingView(rootView: content.background(MemoryStyle.surface))
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+                                  styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.contentView = host
+            host.frame = NSRect(x: 0, y: 0, width: width, height: height)
+            host.layoutSubtreeIfNeeded()
+            try await Task.sleep(nanoseconds: 70_000_000)
+            host.layoutSubtreeIfNeeded()
+            guard let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { throw CheckFailure(message: "reuse render bitmap") }
+            host.cacheDisplay(in: host.bounds, to: bitmap)
+            guard let png = bitmap.representation(using: .png, properties: [:]) else { throw CheckFailure(message: "reuse render PNG") }
+            try png.write(to: URL(fileURLWithPath: path).deletingLastPathComponent().appendingPathComponent(name))
+            window.close()
+            print("RENDER \(name)")
+        }
+    }
     let expanded = Set(state.transcript?.messages.filter { $0.callID != nil }.map(\.id) ?? [])
     let output = URL(fileURLWithPath: path)
     let expandedOutput = output.deletingPathExtension().appendingPathExtension("expanded.png")
@@ -1430,6 +1453,29 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
 }
 #endif
 
+@MainActor func checkFullTextSearchLifecycle() async throws {
+    let a = summary("reuse-a"), b = summary("reuse-b", archived: true)
+    let source = FixtureSource(catalogs: [.init(delay: 0, result: .success(.init(sessions: [a,b])))],
+        transcripts: [a.id: [.init(delay: 0.03, result: .success(.init(summary: a,
+            messages: [.init(id: "answer", kind: .assistant, text: "timeout failed")])))]])
+    let state = try model(source, name: "fulltext")
+    state.loadIfNeeded()
+    try await waitFor({ state.hasLoaded && !state.isFiltering }, "catalog ready")
+    state.searchFullText(query: "timeout", scope: .assistant, project: nil, archived: false)
+    try expect(state.isSearchingFullText, "search publishes progress")
+    try await waitFor({ !state.isSearchingFullText }, "fulltext completes")
+    try expect(state.fullTextResult?.hits.first?.messageID == "answer", "assistant text found")
+    try expect(state.fullTextResult?.totalSessions == 1, "archive filter applied")
+    state.searchFullText(query: "timeout", scope: .all, project: nil, archived: true)
+    state.cancelFullTextSearch()
+    try await Task.sleep(nanoseconds: 60_000_000)
+    try expect(!state.isSearchingFullText && state.fullTextResult == nil, "cancelled search cannot publish")
+    state.searchFullText(query: "absent", scope: .all, project: nil, archived: true)
+    try await waitFor({ !state.isSearchingFullText }, "new query completes")
+    try expect(state.fullTextResult?.hits.isEmpty == true, "new query replaces stale matches")
+    try expect(state.fullTextResult?.totalSessions == 2, "archived search included")
+}
+
 @MainActor func runChecks() async throws {
     try await checkLazyLoadAndFiltering()
     try await checkTaskResultOwnership()
@@ -1447,6 +1493,7 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
     let state = try await checkRepositoryIntegration()
     try await checkPersistentRepositoryReopen()
     try checkChunkPoolBoundaries()
+    try await checkFullTextSearchLifecycle()
     let managed = try await checkManagementPersistenceAndFiltering()
     try await checkManagementFailureAndRetry()
     try await checkManagementIdentityAndPendingQuit()
@@ -1454,7 +1501,7 @@ func summary(_ id: String, project: String = "/workspace/mock", archived: Bool =
     try await checkManagementDiscardFailedDraft()
     let tagged = try await checkProjectTagFilteringAndPersistence()
     try await checkProjectTagConflictFailureAndCancel()
-    print("DESKTOP SESSION CHECKS PASSED: 23 workflows, \(assertionCount) assertions; isolated fixtures only")
+    print("DESKTOP SESSION CHECKS PASSED: 24 workflows, \(assertionCount) assertions; isolated fixtures only")
     #if RENDER_SESSIONS
     if let output = ProcessInfo.processInfo.environment["GPT_DESKTOP_SESSION_RENDER_PATH"] {
         try await render(state, projects: projects, indexed: indexed, managed: managed, tagged: tagged,
