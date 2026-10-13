@@ -1,0 +1,206 @@
+# GPT Manager
+
+macOS 上独立运行的 ChatGPT / Codex 内存观察器与 Codex 会话查看器。提供原生 SwiftUI 桌面应用 GPT Manager 和保留的 `gpt-mem` CLI，记录进程内存，并根据历史给出变化结论、主要来源、重点进程和下一步检查建议。桌面还可在本机查看、搜索 Codex 会话和统计日志记录的 Token 用量。常规内存采样不读取聊天正文；会话模块只在打开该页面后读取本机会话日志，不发送正文或读取其他应用的凭据。AI 内存分析仅在你确认发送摘要后调用所选服务。
+
+需要 macOS 14 或更新版本；从源码构建需要 Swift 6 工具链（Command Line Tools 即可，无需安装完整 Xcode）。采样使用 macOS 原生进程接口，数据保存在本机 SQLite，应用运行不依赖 Python、Node 或第三方包。桌面监控和 CLI `watch` 使用同一套历史及单实例锁。
+
+## 桌面应用
+
+界面采用 CC Switch 式的左侧栏和主内容区：
+
+- **内存概览**：先看分析结论和检查建议，再查看 GPT 进程合计、观察器自身、系统内存信息和内存变化。
+- **进程**：查看进程角色、PID、启动身份及内存指标，区分 MCP、REPL 和二级工具执行器。
+- **历史报告**：查看完整的分析结论、判断依据、重点发现和检查建议，以及增长归因和持续增长候选。
+- **Codex 工作区**：先看项目卡片和统计图，点击项目进入会话；也可直接浏览、搜索历史对话和工具调用。
+- **设置**：调整采样与存储选项，管理多个 AI 来源、模型和钥匙串密钥。
+
+从项目目录构建并打包：
+
+```sh
+./scripts/package-app.sh
+./scripts/launch-desktop.sh
+```
+
+产物为本项目的 `dist/GPT Manager.app`，也可在 Finder 中双击打开。打包脚本只生成并校验该项目产物，采用本机 ad-hoc 签名；不会自动启动应用、安装到 Applications、启用 launchd 或修改 Codex 配置。重新执行可更新同一产物；运行后的应用使用 macOS 普通应用方式退出。
+
+已有 release 二进制时，可跳过构建，或指定单独构建目录中的产物：
+
+```sh
+./scripts/package-app.sh --skip-build
+./scripts/package-app.sh --bin /path/to/gpt-manager
+```
+
+`--skip-build` 从 SwiftPM 的 release 产物目录读取 `gpt-manager` 和 `gpt-mem`；`--bin` 和 `GPT_MANAGER_BIN` 可指定桌面产物，默认读取同目录的 `gpt-mem`，也可通过 `--cli-bin` 或 `GPT_MANAGER_CLI_BIN` 单独指定。应用内置报告导出程序，无需另行安装 CLI；缺少 CLI 产物时打包会明确报错。不会覆盖本项目之外的路径或目标位置的其他应用。CLI 可继续单独使用和安装。
+
+需要隔离历史数据时，可指定桌面数据目录：
+
+```sh
+./scripts/launch-desktop.sh --data-dir "$PWD/desktop-history"
+```
+
+也可直接运行应用包中的 `gpt-manager` 并设置 `GPT_MEM_HOME`。未指定时使用下文的默认历史目录；桌面与 CLI 共享同一数据库时遵守同一监控锁。
+
+桌面内存历史使用最多 32 MiB 原始载荷对应的解析缓存，新增样本只解析新记录；其他连接改写数据库时清除缓存，读取窗口与基线仍保持完整。历史未变化时复用本地分析。趋势图同时保留各分段高点和低点；报告与分析使用全部样本。诊断与导出在独立队列运行，采样和暂停不需要等待它们结束。
+
+## Codex 工作区
+
+左侧“Codex 工作区”默认打开“项目概览”：项目按完整路径分组，同名文件夹不会合并，未记录项目单列。项目卡片显示会话数、工具调用、已知 Token 和最近活动，点击即可查看该项目的会话。“统计图表”提供项目用量排行、会话末次记录模型的分布，以及按北京时间开始日期统计的新会话数量。活跃图最多显示截至最新记录日期的 30 天，不将文件修改时间解释为当天 Token 消费；模型分布统计会话数量，不把整个会话用量归为某个模型的精确消耗。
+
+“会话浏览”提供项目筛选、搜索、归档会话开关和手动刷新。选中会话后查看用户与助手消息、折叠的工具调用与结果、已记录的推理摘要，以及模型、会话 ID 和时间。长对话以 100 条为一页，默认显示最近消息；目录、搜索命中和工具关联跳转会定位到对应页。长消息默认预览前 2000 个字符，可手动展开全文。搜索针对标题、用户提问、项目和会话 ID；助手回答与工具输出不参与跨会话搜索。
+
+默认只读 `~/.codex/sessions` 和 `~/.codex/archived_sessions` 下的 JSONL，并读取 `session_index.jsonl` 中的会话标题；设置 `CODEX_HOME` 可指定 Codex 根目录。索引采用摘要解析，读取、搜索和统计都在后台执行；搜索有 250 毫秒防抖，旧请求不会覆盖新筛选。用户目录、工具配对和全文命中在后台建立，翻页与展开消息复用索引。切换会话会取消旧读取，停止其后续扫描与解析。列表摘要校验大小、修改时间、inode 和 ctime；详情使用最近 3 份、最多 8 MiB 的缓存，相同大小与修改时间的文件替换也会更新。目录读取预算不足时，下一次刷新从有界断点继续；文件变更后重新解析。内存采样不会重绘整份会话。索引中的改名优先于会话内标题，单独改名后刷新即可更新。大文件、过长单行、截断日志和缺失字段会显示限制说明。不会解析或解密隐藏的推理密文。
+
+会话页默认将统计收为一行，可展开查看详细 Token。目录、统计、工具消息及 AI 设置中的折叠入口都支持点击整行，包含标题和右侧空白，点击高度至少 32 点。翻页控制固定在正文区域外，前后页连续且不重叠；同一会话刷新后会校正到有效页面。`Command-R` 刷新当前工作区，会话页刷新 Codex 目录，内存页刷新采样和历史。
+
+Token 来自日志中的用量字段，优先采用最新累计值。缓存 Token 是输入的子集，推理 Token 是输出的子集，均单独显示，不再次加进总量。没有记录的数值显示“未记录”；筛选统计只说明所选会话的已知用量，不等同于账单，也不根据文件修改时间将跨天历史当作今天的消费。会话日志不能证明某一聊天对应哪个内存进程，两个模块各自保留有依据的数据。
+
+这一模块移植了 [Sessions Viewer](https://github.com/jerrywu001/cc-sessions-viewer) 的 Codex 来源解析思路和会话浏览设计，采用本项目的 Swift / SwiftUI 实现。来源协议、统一消息与用量模型位于独立的 `GPTSessionKit` 库中，后续增加其他会话来源可复用桌面浏览层；共用 AI 服务仍由 `GPTAnalysisKit` 管理。当前会话查看、搜索和统计全部在本机执行。授权与来源说明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)，也随应用包分发。
+
+## CLI 构建和使用
+
+```sh
+swift build -c release
+.build/release/gpt-mem status
+.build/release/gpt-mem watch --interval 5 --duration 60
+.build/release/gpt-mem explain --since 30m
+.build/release/gpt-mem report --since 2h --output report.html
+```
+
+直接打开生成的 HTML 即可查看报告，所有样式均内嵌，不需要网络或外部 CDN。报告优先展示分析结论、依据、重点发现与下一步检查，并包含起止时刻、采样次数、增长归因、角色汇总、进程变化、创建与退出事件、结束时进程明细，以及数据缺失提示。程序路径仅显示文件名，PID 和运行时间仍保留，分享前请检查。
+
+可手动安装到当前用户目录：
+
+```sh
+./scripts/install.sh
+~/.local/bin/gpt-mem --help
+```
+
+脚本默认写入 `~/.local/bin`，不使用 `sudo`。也可指定目标 bin 目录，或通过 `GPT_MEM_BIN_DIR` 指定。不会修改 shell 配置或安装 MCP。
+
+## 命令
+
+| 命令 | 行为 |
+| --- | --- |
+| `status`（默认） | 即时采样，显示角色数量和占用、前十个高占用进程、观察器自身、系统压力和交换空间；存在历史时与上一份样本比较 |
+| `watch` | 持续采样写入 SQLite，同一数据库目录只允许一个监控实例；Ctrl-C 或 SIGTERM 干净退出并释放锁 |
+| `explain --since 30m` | 给出最近窗口的分析结论、主要来源、重点进程和检查建议，保留新增、退出、存量与缺失指标对账；缺少两份样本时明确报错 |
+| `report --since 2h --output report.html` | 基于历史生成离线 HTML；不指定 output 时显示分析摘要 |
+| `diagnose --pid PID --output vmmap-summary.txt` | 对当前可识别的 GPT 目标手动采集有界 `vmmap -summary`；检查进程启动身份，避免 PID 复用 |
+
+统一支持 `--json`、`--db path` 和 `--help`。`watch --json` 每份样本输出一行 JSON（NDJSON）；其他命令输出一个 JSON 对象。错误写入 stderr，退出码非零，stdout 不混入日志。时间文本使用北京时间，JSON 时间为 ISO 8601。
+
+```sh
+gpt-mem status --json
+gpt-mem watch --json --interval 5 --duration 120 > samples.ndjson
+gpt-mem explain --since 2h --json
+gpt-mem report --since 2h --output report.html --json > report.json
+```
+
+`watch` 不指定 duration 时持续运行。interval 最小 1 秒，duration 为正秒数。睡眠唤醒或一次采样耗时较长时跳过错过的采样点，避免突发补采。`since` 支持秒以及 `s`、`m`、`h`、`d`，例如 `120`、`30m`、`2h`、`7d`。
+
+## 内存口径与分类
+
+主要指标为 `proc_pid_rusage` 返回的 `ri_phys_footprint`（physical footprint），峰值为 `ri_lifetime_max_phys_footprint`。RSS 是辅助指标，不能直接替代 footprint：压缩等内存承担关系可能令两者明显不同。显示单位为 MiB（1024² 字节）和 GiB（1024³ 字节）。合计为本次成功测量的已识别进程 footprint 之和；缺少指标时明确提示，不把缺失值当成零或进程退出，也不应将该合计等同于整机已用内存。
+
+进程使用启动标识与 PID 共同识别，避免 PID 复用。分类同时参考可执行程序、受限的工具标识及父子关系，覆盖 ChatGPT / Codex 主程序、页面 Renderer、GPU、应用服务、Codex 后台、MCP 应用工具、代码审查、MySQL、电脑操作、REPL 和工具执行器。REPL 与 MCP 分开统计；普通 Node 进程不会仅因使用 Node 就被归入 MCP。观察器自身单列，不计入 GPT 合计。
+
+持续增长候选要求同一进程至少持续 10 分钟、至少 11 份完整样本、净增长至少 100 MiB、至少 70% 相邻样本为正增长，且相邻采样间隔不超过 120 秒；只表示需要进一步定位。进程常驻时间长、单次上涨、角色名称相同或父进程仍存在，均不能证明泄漏。当前没有桌面聊天与 MCP 实例的可靠关联接口，会话归属始终显示为“未知”。本版不自动调用 `vmmap`；`diagnose` 仅在明确执行该命令时采集摘要，不转储对象或聊天内容，默认最多等待 10 秒、输出上限 512 KiB，拒绝覆盖已有文件。超时或部分输出时返回退出码 2，不结束 GPT 目标进程。
+
+## 分析解读
+
+桌面概览、历史页、CLI 与 HTML 报告使用同一份本地分析解读；JSON 在分析对象的 `explanation` 中保留结论类型、文字结论、依据、发现和下一步建议。解读根据实际采样生成，不需要模型服务或网络。
+
+分析说明本窗口占用是增长、下降还是起止变化较小，区分新增进程和已有进程的贡献，并指出增长最多的已有进程；新增进程主导时，点名末次占用最大的新增 PID 和程序。起止净变化绝对值小于 10 MiB 时只说明起止变化较小，仍会提示窗口内的进程活动。完整观测中，峰值较起始上涨至少 100 MiB、随后较峰值回落至少 100 MiB 时，会单独指出上涨后回落。持续增长候选和系统压力也会给出具体依据与检查建议。
+
+缺少两份样本或有效时间跨度时明确无法判断；存在缺测时结论标为部分数据，不以总量下降推断正常。对当前持续增长的进程，建议核对 PID 与启动身份后手动采集内存摘要；已退出实例保留其历史发现，避免按复用的 PID 诊断其他进程。结论解释进程指标和变化，无法据此确定具体对象分配原因或确认泄漏。
+
+## AI 深入分析
+
+在桌面“设置 → AI 分析来源”点击“添加来源”，先选 OpenAI、DeepSeek、Ollama 或自定义预设。名称、协议和基础地址自动填好：DeepSeek 还预填默认模型；OpenAI 可填 Key 后点击“拉取模型”选择账号可用模型，Ollama 可拉取本机已安装模型。自定义入口用于兼容服务或网关。常用信息直接填写，协议、JSON 模式、超时和输出 Token 收在“高级设置”中。支持多条配置：
+
+| 接口协议 | 基础地址示例 | 用途 |
+| --- | --- | --- |
+| OpenAI Responses | `https://api.openai.com/v1` | OpenAI Responses，默认请求 JSON Schema 结构化结果 |
+| OpenAI 兼容接口 | `https://api.deepseek.com` | 使用 Chat Completions 协议的服务或网关；兼容性以服务支持的参数为准 |
+| Ollama | `http://localhost:11434` | 本机模型，也支持自行配置的 HTTPS 服务 |
+
+基础地址不包含 `/responses`、`/chat/completions` 或 `/api/chat`，程序按协议补充路径。模型可以搜索并从列表选择，也可直接填写 ID；预设和列表不保证模型支持所有分析参数。远程服务使用 HTTPS；HTTP 仅支持本机回环地址。OpenAI 和远程兼容接口需要密钥，本机兼容服务和 Ollama 可不填写。兼容服务不支持 JSON 格式参数时，可在高级设置中关闭 JSON 模式，返回内容仍会通过同一套结构与引用校验。
+
+“拉取模型”仅向表单上显示的服务地址发送模型列表请求，不发送内存摘要，不保存草稿。新输入的 Key 仅随这次请求使用；编辑已有来源时可复用同地址、同协议的已保存 Key，改成其他服务后需重新填写该服务的 Key。切换预设、服务地址或协议会清除尚未保存的 Key。自定义地址旁直接显示接口格式，可选择 Chat Completions、Responses 或 Ollama。取消、关闭表单或改地址后，旧列表请求不能覆盖新表单；服务不支持列出模型时可手动填写。此流程参考 [CC Switch 的预设与模型选择](https://github.com/farion1231/cc-switch/blob/main/docs/user-manual/en/2-providers/2.1-add.md)，模型列表协议参考 [OpenAI Models](https://developers.openai.com/api/reference/resources/models/methods/list)、[Ollama Tags](https://docs.ollama.com/api/tags)，DeepSeek 预设参考[官方快速开始](https://api-docs.deepseek.com/)。
+
+来源配置保存在历史目录中的 `ai-services.json`，文件权限为 `0600`，不包含 API Key。密钥只保存在 macOS 钥匙串。同地址、同协议编辑时留空表示保留已有密钥；换服务时需填入新 Key，或在高级设置中明确清除原 Key，避免把旧密钥沿用到新服务。“清除已保存的密钥”是独立选项；取消编辑不会保存。配置读取失败时禁止覆盖保存，修复文件后可重新读取。编辑、移除前重新核对已保存来源，冲突时保留草稿与密钥并提示重新打开编辑；保存时保留其他新来源。模型列表拉取期间也可保存手填模型，保存成功会取消列表请求。
+
+高级设置的超时限制从发送到完整响应的总时间；服务持续慢速返回字节也会在期限内取消传输。模型列表与 AI 分析均使用这个限制，取消或超时不会自动重试。
+
+概览与历史页提供“AI 深入分析”：先查看来源、模型、实际观察窗口和匿名摘要，再点击“发送摘要并分析”。预览冻结本次输入，采样仍可继续。来源在确认前被修改时需要重新预览，确认时绑定该请求的密钥；不会自动切换来源或重试。请求可取消，但已经发到服务的请求可能已被处理。
+
+发送内容包括窗口、已测总量、原始四项对账、完整性、系统指标、最多 12 个重点进程实例和最多 120 个保留极值的趋势点。输入限制为 128 KiB。进程使用 `p1/p2` 匿名编号，真实 PID、启动身份、完整路径、原始命令行和原始警告文字留在本机；可选活动说明会随摘要发送。不会自动读取或外发 `vmmap` 文件、聊天或其他日志。
+
+AI 返回摘要、证据观察、原因假设、缺少的证据、检查建议和限制。结果必须引用存在的证据编号，针对对象的检查建议只能引用当前可检查对象；这些校验不能保证模型假设正确。界面标明来源、模型和实际窗口，窗口、活动说明或来源变化后保留旧结果并明确标记。分析失败保留本地解读和上次 AI 结果。
+
+新来源默认输出上限为 8192 Token；已有配置不会被自动提高。预览显示实际上限，旧的低上限配置可在发送前点击“提高到 8192 并重新预览”，保留同一份冻结摘要。若服务明确返回长度限制，界面显示本次上限和有效的生成/推理 Token 用量，并提供提高上限后重新预览的入口（最多 16384）；仍需手动确认发送。长度限制也可能与上下文容量有关，提高预算不能保证解决所有情况，可缩短观察窗口。内容限制、服务失败、缺少完成状态分别给出提示，不自动重试，不把截断正文当作完整报告。请求中的报告要求也限制了结论和条目篇幅。
+
+部分模型的输出预算包含推理 Token，尚未生成报告正文就可能用完预算；参见 [OpenAI 推理预算说明](https://developers.openai.com/api/docs/guides/reasoning) 和 [DeepSeek 长度终止说明](https://api-docs.deepseek.com/api/create-chat-completion/)。诊断只展示固定原因与有效数字，不显示服务原始错误文字、推理正文或密钥。
+
+成功结果在本次应用运行期间缓存，最多 16 条，按模块、完整输入、服务配置、密钥摘要和实际时间戳区分；退出应用后释放。现有 CLI 和 HTML 导出继续提供本地分析解读，AI 结果当前在桌面中展示。
+
+### 新模块复用
+
+`GPTAnalysisKit` 是独立 Swift 库，不依赖 `GPTMemoryCore`。模块实现 `AIAnalysisModule.makeInput()`，提供领域规则、事实编号、匿名对象和观察窗口，然后调用同一个 `AIAnalysisCoordinator`；来源、HTTP 请求、钥匙串、限额、输出校验和缓存都由通用层处理。
+
+| 部件 | 职责 |
+| --- | --- |
+| `AIAnalysisModule` / `AIAnalysisInput` | 模块提供脱敏、有限的事实与领域规则；本地标签与外发匿名编号分开 |
+| `AIProviderClient` / `HTTPAIProviderClient` | 接入来源协议，不读取内存快照；新协议可实现同一个客户端接口 |
+| `AIProviderPreset` / `AIModelCatalogClient` | 服务商预设与模型发现，供各模块的来源设置共用 |
+| `AIAnalysisCoordinator` | 校验输入、调用客户端、检查引用、取消处理与缓存 |
+| `MemoryAIAnalysisModule` | 内存模块适配器，复用已计算的对账与候选 |
+| `DesktopAIModel` / `AIAnalysisCard` | 通用设置、冻结预览、任务状态与结果展示；每个模块可拥有独立展示状态并共享协调器 |
+
+例如后续磁盘模块可以提供 `disk.change` 等事实编号，并复用相同的来源与结果结构；不需要给 HTTP 客户端增加磁盘判断。协议参考：[OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs?api-mode=responses)、[DeepSeek JSON Output](https://api-docs.deepseek.com/guides/json_mode/)、[Ollama Chat](https://docs.ollama.com/api/chat)。
+
+## 历史与清理
+
+默认数据库位于 `~/Library/Application Support/gpt-mem/history.sqlite3`。`GPT_MEM_HOME` 可覆盖所在目录，`--db` 可指定文件：
+
+```sh
+GPT_MEM_HOME="$PWD/local-history" gpt-mem watch --duration 60
+gpt-mem watch --db "$PWD/local-history/history.sqlite3" --duration 60
+gpt-mem explain --db "$PWD/local-history/history.sqlite3" --since 30m
+```
+
+监控每分钟执行历史维护：24 小时内保留每条原始快照，24 小时至 7 天每分钟保留最新一条，超过 7 天删除。查询时会附带窗口之前最近一条基线；报告显示实际起止时刻，不假定刚好落在窗口边界。停止该数据库的所有监控实例后，删除数据库及同名 `-wal` / `-shm` 文件即可清空历史。锁文件可能留在目录中；是否占用取决于操作系统锁状态，文件存在不代表监控仍在运行。不要在监控运行时删除锁文件或数据库，否则可能破坏单实例判断及记录一致性。
+
+原始历史保留本机进程识别信息和内存指标，不包含聊天正文和令牌。输出中的程序路径脱敏为文件名，SQLite 本身仍应按本机诊断数据保管。
+
+单次历史查询最多读取 10000 份快照（含窗口前基线），覆盖桌面每秒采样、2 小时窗口的完整历史，桌面导出与 CLI 使用同一上限。超出时会在读取快照内容前报错，要求缩短观察窗口或 `--since`，避免长窗口报告占用过多内存，不会静默截断或降采样。桌面历史读取失败时保留上次成功读取的曲线与分析，并提示数据可能来自之前的窗口；读取恢复后自动清除历史错误提示。
+
+## 权限与限制
+
+通常无需管理员权限。其他用户的进程、受系统保护的进程或采样途中退出的进程可能不可读，工具会输出警告和不可用 PID；不会为补齐数据请求提权或绕过系统保护。系统压力、压缩或交换指标不可用时显示“未知”。
+
+分类依赖当前桌面应用的进程结构，未来应用升级可能改变工具名称或布局；未识别子进程会保留为其他或未知 Node。总量变化按观察窗口的起止样本计算，中间创建又退出的进程保留为事件，其生命周期占用不会错误加到结束时总量。无历史、样本太少或指标缺失时不声称分析完整。
+
+## 检查
+
+```sh
+./scripts/test.sh
+./scripts/smoke-cli.sh .build/debug/gpt-mem
+swift build --configuration release
+python3 scripts/check-desktop-ai.py --render reports/desktop-ai-preview.png
+python3 scripts/check-provider-editor.py
+python3 scripts/check-desktop-sessions.py --render reports/desktop-sessions-preview.png
+python3 scripts/check-desktop-memory.py
+```
+
+`scripts/test.sh` 使用现有 Swift 工具链执行同一套核心与通用 AI 测试；没有完整 Xcode / XCTest 的环境也可执行，不要求安装完整 Xcode。有 XCTest 时也支持 `swift test`。AI 协议测试使用 URLProtocol mock，不调用真实模型，不需要密钥；配置与凭据测试使用临时文件和测试凭据存储。
+
+`scripts/check-desktop-ai.py` 使用现有 Release 产物验证桌面 AI 配置、冻结预览、密钥绑定、取消、失败保留、旧结果提示及输出预算恢复。恢复检查验证原摘要保留、旧配置保护、最大预算与手动重新确认，修改预算不会发起请求。模型与凭据均为模拟数据，不访问真实服务或系统钥匙串；可选的 `--render` 生成离屏界面预览，不启动应用。真实服务需在设置中填写自己的地址、模型和密钥后手动验证。
+
+`scripts/check-provider-editor.py` 使用模拟目录与凭据验证预设、表单隔离、模型选择、取消与重拉、修改来源后旧请求失效及错误恢复，同样不访问真实服务或系统钥匙串。
+
+`scripts/check-desktop-sessions.py` 使用临时 JSONL 和注入的来源验证会话筛选、用量缺失、后台读取、旧请求失效、错误恢复和只读解析到桌面显示的完整流程；`--render` 渲染生产会话界面的模拟预览。核心测试还覆盖旧版和新版事件、消息去重、工具配对、累计 Token 与读取边界。检查不读取用户的真实对话目录。
+
+`scripts/check-desktop-memory.py` 使用生产采样服务、注入的合成样本和慢速本地导出组件，验证诊断与导出期间采样继续，暂停无需等待文件操作。只使用临时数据库，不运行真实进程诊断或原生采样。
+
+CLI 检查使用临时目录验证无历史失败、参数校验、短时真实采样、NDJSON 格式、单实例锁、退出后的锁释放以及 HTML 报告，不改动默认历史数据库。
