@@ -335,3 +335,5 @@ Codex 的生成器不使用本工具的文件锁，最终检查与替换之间�
 验证：`./scripts/test.sh --filter DesktopSpeedTests`，`python3 scripts/check-desktop-speed.py --render reports/desktop-speed-preview.png`。`--live` 可只读查看真实日志的模型名和区间汇总，均不发测速请求。
 
 0.19.1 性能优化：日志按换行边界批量追加，统计无关事件不解析时间戳；速度明细采用懒加载，同一次页面绘制只筛选一次数据，未变化的统计快照不重复发布。临时日志基准可用 `python3 scripts/check-desktop-speed.py --benchmark` 复现：本机约 12 MiB 大消息日志三轮追赶中位数由 316 ms 降至 21 ms，空闲刷新约 0.2 ms。数据是日志读取基准，不代表整体应用性能或模型生成速度；不会写入真实会话。分块跨行和超长行后的有效用量由针对性测试覆盖。
+
+0.19.2 完成逐模块性能审计：会话冷解析和全文搜索减少约67–69%，200工具推荐扫描减少约91%，历史分析减少约22%（对应合成负载）。八个主页面已进行原生窗口布局与资源占用测量。复现方法、具体规模与限制见 [性能审计](docs/performance-audit.md)，不会把夹具进程的Footprint当成实际应用内存。
