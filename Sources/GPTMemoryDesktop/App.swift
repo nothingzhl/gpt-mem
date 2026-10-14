@@ -18,14 +18,14 @@ final class ManagerAppDelegate: NSObject, NSApplicationDelegate {
         let prompts = memory?.aiModel.promptLibrary
         guard library?.isSaving == true || library?.isRemoving == true || library?.isExporting == true
                 || management?.isSaving == true || memory?.processActions.hasPendingWork == true
-                || memory?.isFileOperationInProgress == true || prompts?.isSaving == true else { return .terminateNow }
+                || memory?.isFileOperationInProgress == true || prompts?.isSaving == true || memory?.knowledgeModel.isSaving == true else { return .terminateNow }
         // A completed AI response can still be queued for local persistence.
         // Let that bounded file operation finish before quitting the process.
         if terminationTask == nil {
             terminationTask = Task { @MainActor [weak self] in
                 while library?.isSaving == true || library?.isRemoving == true || library?.isExporting == true
                         || management?.isSaving == true || memory?.processActions.hasPendingWork == true
-                        || memory?.isFileOperationInProgress == true || prompts?.isSaving == true {
+                        || memory?.isFileOperationInProgress == true || prompts?.isSaving == true || memory?.knowledgeModel.isSaving == true {
                     try? await Task.sleep(nanoseconds: 50_000_000)
                 }
                 self?.terminationTask = nil
@@ -58,9 +58,9 @@ struct GPTManagerApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
             CommandGroup(after: .toolbar) {
-                Button(model.isReportLibraryActive ? "刷新 AI 报告" : (model.isSessionWorkspaceActive ? "刷新 Codex 会话" : "刷新内存数据")) { model.refreshCurrentPage() }
+                Button(model.isKnowledgeWorkspaceActive ? "刷新记忆库" : (model.isReportLibraryActive ? "刷新 AI 报告" : (model.isSessionWorkspaceActive ? "刷新 Codex 会话" : "刷新内存数据"))) { model.refreshCurrentPage() }
                     .keyboardShortcut("r", modifiers: [.command])
-                    .disabled(!model.isSessionWorkspaceActive && !model.isReportLibraryActive && model.isBusy)
+                    .disabled(!model.isKnowledgeWorkspaceActive && !model.isSessionWorkspaceActive && !model.isReportLibraryActive && model.isBusy)
                 Button(model.isMonitoring ? "暂停采集" : "开始采集") {
                     model.isMonitoring ? model.stopMonitoring() : model.startMonitoring()
                 }.keyboardShortcut("p", modifiers: [.command, .shift])

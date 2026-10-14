@@ -33,12 +33,15 @@ final class DesktopModel: ObservableObject {
     @Published var modeLabel = "准备就绪"
     @Published var isSessionWorkspaceActive = false
     @Published var isReportLibraryActive = false
+    @Published var isKnowledgeWorkspaceActive = false
     @Published var lastExportURL: URL?
     @Published var lastDiagnosticURL: URL?
     let databaseURL: URL
     let aiModel: DesktopAIModel
     let sessionAIModel: DesktopAIModel
     let sessionModel: SessionDesktopModel
+    let knowledgeModel: KnowledgeDesktopModel
+    let knowledgeAIModel: DesktopAIModel
     let processActions: MemoryProcessActionsModel
     private var isPerformingFileOperation = false
     var isFileOperationInProgress: Bool { isPerformingFileOperation }
@@ -79,6 +82,10 @@ final class DesktopModel: ObservableObject {
             reportLibrary: aiModel.reportLibrary, promptLibrary: aiModel.promptLibrary)
         sessionModel = SessionDesktopModel(indexDirectoryURL: directory.appendingPathComponent("session-index", isDirectory: true),
             managementDirectoryURL: directory.appendingPathComponent("session-management", isDirectory: true))
+        knowledgeModel = KnowledgeDesktopModel(directoryURL: directory.appendingPathComponent("knowledge-library", isDirectory: true),
+            sourceRoot: CodexSessionRepository.defaultRootURL.appendingPathComponent("memories", isDirectory: true))
+        knowledgeAIModel = DesktopAIModel(configurationStore: AIConfigurationStore(url: directory.appendingPathComponent("ai-services.json")),
+            reportLibrary: aiModel.reportLibrary, promptLibrary: aiModel.promptLibrary)
         let projectIndex = SessionIndexStore(directoryURL: directory.appendingPathComponent("session-index", isDirectory: true), rootURL: sessionModel.rootURL)
         processActions = MemoryProcessActionsModel(directoryURL: directory.appendingPathComponent("process-actions", isDirectory: true),
             projectPathsLoader: { Array(Set(try projectIndex.load().entries.compactMap { $0.summary.projectPath })) })
@@ -94,7 +101,9 @@ final class DesktopModel: ObservableObject {
     func stopMonitoring() { service.stop() }
     func refresh() { isBusy = true; service.refresh(window: windowSeconds) }
     func refreshCurrentPage() {
-        if isReportLibraryActive {
+        if isKnowledgeWorkspaceActive {
+            Task { await knowledgeModel.reload() }
+        } else if isReportLibraryActive {
             guard !aiModel.reportLibrary.isLoading else { return }
             aiModel.reportLibrary.refresh()
         } else if isSessionWorkspaceActive {

@@ -152,8 +152,9 @@ public struct AIAnalysisResult: Codable, Equatable {
     /// Citation validation does not establish the truth of the model's hypotheses.
     public func validate(against input: AIAnalysisInput) throws {
         func validText(_ text: String) -> Bool { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && text.utf8.count <= 12_000 }
-        guard validText(summary), !observations.isEmpty, observations.count <= 12,
-              hypotheses.count <= 8, !nextSteps.isEmpty, nextSteps.count <= 10,
+        let allowsEmptyCandidates = input.moduleID == "knowledge.extract"
+        guard validText(summary), (allowsEmptyCandidates || !observations.isEmpty), observations.count <= 12,
+              hypotheses.count <= 8, (allowsEmptyCandidates || !nextSteps.isEmpty), nextSteps.count <= 10,
               !limitations.isEmpty, limitations.count <= 10, limitations.allSatisfy(validText) else {
             throw AIAnalysisError.invalidResponse("分析内容为空或超过允许长度。")
         }

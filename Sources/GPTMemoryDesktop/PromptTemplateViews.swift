@@ -6,6 +6,7 @@ private func promptModuleTitle(_ moduleID: String?) -> String {
     case nil: return "通用"
     case "memory": return "内存分析"
     case "session.handoff": return "会话交接"
+    case "knowledge.extract": return "记忆提取"
     default: return moduleID ?? "通用"
     }
 }
@@ -96,7 +97,7 @@ struct PromptTemplateSettingsCard: View {
                     Spacer()
                     Button("管理模板") { showsManager = true }
                 }
-                ForEach(["memory", "session.handoff"], id: \.self) { module in
+                ForEach(["memory", "session.handoff", "knowledge.extract"], id: \.self) { module in
                     Picker(promptModuleTitle(module) + "默认", selection: Binding(get: { library.catalog.defaults[module] }, set: { id in
                         Task { _ = await library.setDefault(id, module: module) }
                     })) {
@@ -177,7 +178,8 @@ struct PromptTemplateManager: View {
                         Text("通用（所有模块）").tag(Optional<String>.none)
                         Text("内存分析").tag(Optional("memory"))
                         Text("会话交接").tag(Optional("session.handoff"))
-                        if let module = draft.moduleID, !["memory", "session.handoff"].contains(module) {
+                        Text("记忆提取").tag(Optional("knowledge.extract"))
+                        if let module = draft.moduleID, !["memory", "session.handoff", "knowledge.extract"].contains(module) {
                             Text(module).tag(Optional(module))
                         }
                     }

@@ -872,7 +872,7 @@ def main() -> int:
         desktop = project / "Sources" / "GPTMemoryDesktop"
         sources = [desktop / "DesktopAIModel.swift", desktop / "PromptTemplateLibraryModel.swift", desktop / "AIReportLibraryModel.swift"]
         if output:
-            sources += [desktop / name for name in ["DesktopModel.swift", "Views.swift", "MemoryProcessActionsModel.swift", "MemoryProcessActionViews.swift", "AIViews.swift", "AIReportViews.swift", "AIProviderEditorModel.swift", "Style.swift", "SessionDesktopModel.swift", "SessionManagementModel.swift", "SessionManagementViews.swift", "SessionViews.swift", "SessionProjectViews.swift", "SessionHandoffAIViews.swift", "PromptTemplateViews.swift"]]
+            sources += [desktop / name for name in ["DesktopModel.swift", "Views.swift", "KnowledgeDesktopModel.swift", "KnowledgeViews.swift", "KnowledgeExtractionViews.swift", "MemoryProcessActionsModel.swift", "MemoryProcessActionViews.swift", "AIViews.swift", "AIReportViews.swift", "AIProviderEditorModel.swift", "Style.swift", "SessionDesktopModel.swift", "SessionManagementModel.swift", "SessionManagementViews.swift", "SessionViews.swift", "SessionProjectViews.swift", "SessionHandoffAIViews.swift", "PromptTemplateViews.swift"]]
         architecture = platform.machine()
         if architecture not in {"arm64", "x86_64"}:
             raise RuntimeError(f"不支持的 macOS 架构：{architecture}")

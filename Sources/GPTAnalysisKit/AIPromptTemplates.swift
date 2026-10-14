@@ -20,6 +20,7 @@ public struct AIPromptTemplate: Codable, Equatable, Identifiable {
         .init(id: "builtin.handoff.continue", title: "继续开发", text: "重点提取当前目标、用户最新决定、已完成和未完成的工作、真实验证记录及关键限制。下一步按执行顺序排列，便于另一位开发者直接接手；对助手声称完成但缺少验证的内容标记待核验。", moduleID: "session.handoff"),
         .init(id: "builtin.handoff.review", title: "阶段复盘", text: "重点整理这一阶段的成果、需求变更、已确认的决策与理由、仍存在的问题和验收缺口。下一步优先补齐影响交付的缺口，不要把历史状态当成当前状态。", moduleID: "session.handoff"),
         .init(id: "builtin.handoff.debug", title: "问题排查交接", text: "重点整理问题现象、复现条件、已尝试的方法、已有证据、已排除与尚未确认的原因。下一步给出最少且有区分度的检查，避免重复无效尝试。", moduleID: "session.handoff"),
+        .init(id: "builtin.knowledge.extract", title: "长期记忆提取", text: "只提取明确、稳定、可复用的用户偏好和已确认的项目决策。每条注明依据，遇到冲突列为待确认；没有可靠内容则不生成候选。候选须经人工审核，不声称已经生效。", moduleID: "knowledge.extract"),
         .init(id: "builtin.memory.inspect", title: "优先排查大头", text: "优先解释已测内存变化的主要来源、进程身份与生命周期，以及缺测对判断的影响。按收益排序给出少量检查步骤，不把常驻或单次上涨当作泄漏。", moduleID: "memory")
     ]
 }
