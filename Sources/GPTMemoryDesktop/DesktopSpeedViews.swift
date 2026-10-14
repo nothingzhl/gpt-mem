@@ -17,7 +17,8 @@ struct DesktopSpeedView: View {
     }
     private func number(_ value: Double?, suffix: String) -> String { value.map { String(format: "%.1f", $0) + suffix } ?? "未记录" }
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let rows = self.rows
+        return VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Picker("日志模型", selection: $selectedModel) {
                     Text("全部模型").tag("")
@@ -48,7 +49,7 @@ struct DesktopSpeedView: View {
                 DisclosureGroup("数据范围与读取提示") { Text(model.snapshot.warnings.joined(separator: "\n")).font(.caption).textSelection(.enabled) }
             }
             ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
+                LazyVStack(alignment: .leading, spacing: 16) {
                     if rows.isEmpty {
                         Text(model.isRefreshing ? "正在读取本地用量记录…" : "还没有可计算的桌面用量区间").font(.title3)
                         Text("在桌面 Codex 会话中正常使用即可；如日志尚未追上，保持本页打开会继续增量读取。不会额外发测速请求。用量和时间缺失时不伪造速度。").foregroundStyle(.secondary)

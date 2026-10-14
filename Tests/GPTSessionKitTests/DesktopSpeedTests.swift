@@ -60,6 +60,32 @@ final class DesktopSpeedTests: XCTestCase {
         XCTAssertFalse(p.rows[0].firstInTurn)
         XCTAssertFalse(p.warnings.isEmpty)
     }
+    func testChunkBoundariesAndOversizedLinesKeepFollowingUsage() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("speed-chunks-" + UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let folder = root.appendingPathComponent("sessions/2026/10/14")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let file = folder.appendingPathComponent("fixture.jsonl")
+        var data = Data()
+        for line in [try event(0, "session_meta", ["originator": "Codex Desktop"]), try event(0, "turn_context", ["model": "A"]), try event(0, "event_msg", ["type": "task_started"])] { data.append(line); data.append(10) }
+        // A valid large line spans a read boundary; the following oversized line is skipped.
+        let large = try event(5, "event_msg", ["type": "agent_message", "message": String(repeating: "x", count: 1_048_000)])
+        for _ in 0..<2 { data.append(large); data.append(10) }
+        data.append(try event(5, "event_msg", ["type": "agent_message", "message": String(repeating: "x", count: 2_100_000)])); data.append(10)
+        data.append(try usage(10, total: 100, last: 100)); data.append(10)
+        try data.write(to: file)
+        let reader = DesktopSpeedReader(rootURL: root), now = Date(timeIntervalSince1970: 1791936010)
+        var snapshot = try reader.read(now: now)
+        XCTAssertEqual(snapshot.pendingFiles, 1)
+        var warnings = snapshot.warnings
+        for _ in 0..<4 where snapshot.pendingFiles > 0 { snapshot = try reader.read(now: now); warnings += snapshot.warnings }
+        XCTAssertEqual(snapshot.pendingFiles, 0)
+        XCTAssertEqual(snapshot.samples.count, 1)
+        XCTAssertEqual(snapshot.samples.first?.intervalRate, 10)
+        XCTAssertTrue(warnings.contains { $0.contains("1 MiB") })
+        XCTAssertEqual(try reader.read(now: now).samples, snapshot.samples)
+        XCTAssertEqual(try Data(contentsOf: file), data)
+    }
     func testIncrementalReaderWaitsForNewlineAndTracksTruncationWithoutSourceWrites() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("speed-tests-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

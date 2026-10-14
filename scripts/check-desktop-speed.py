@@ -51,6 +51,29 @@ var assertions = 0
         try png.write(to: url); model.stop(); window.close()
     }
     print("PASS desktop speed: \(assertions) checks; temporary logs, zero model requests")
+    if ProcessInfo.processInfo.environment["SPEED_BENCHMARK"] == "1" {
+        let noise = try record(5, "event_msg", ["type": "agent_message", "message": String(repeating: "x", count: 65536)])
+        var large = try record(0, "session_meta", ["id": "benchmark", "originator": "Codex Desktop"])
+        large += try record(0, "turn_context", ["model": "fixture-model"])
+        large += try record(0, "event_msg", ["type": "task_started"])
+        for _ in 0..<192 { large += noise }
+        large += try record(10, "event_msg", ["type": "token_count", "info": ["total_token_usage": ["output_tokens": 100], "last_token_usage": ["output_tokens": 100]]])
+        try large.write(to: file)
+        var durations: [Double] = []
+        for _ in 0..<3 {
+            let reader = DesktopSpeedReader(rootURL: root)
+            let begin = ProcessInfo.processInfo.systemUptime
+            var snapshot = try reader.read()
+            while snapshot.pendingFiles > 0 { snapshot = try reader.read() }
+            try expect(snapshot.samples.count == 1, "benchmark preserves usage after large message lines")
+            durations.append(ProcessInfo.processInfo.systemUptime - begin)
+        }
+        let reader = DesktopSpeedReader(rootURL: root)
+        while try reader.read().pendingFiles > 0 {}
+        let begin = ProcessInfo.processInfo.systemUptime
+        for _ in 0..<20 { _ = try reader.read() }
+        print("BENCHMARK bytes=\(large.count) median-catchup-ms=\(durations.sorted()[1] * 1000) idle-refresh-ms=\((ProcessInfo.processInfo.systemUptime - begin) * 50)")
+    }
     if ProcessInfo.processInfo.environment["SPEED_LIVE"] == "1" {
         let live = DesktopSpeedReader()
         var snapshot = DesktopSpeedSnapshot()
@@ -66,7 +89,7 @@ Task { @MainActor in do { try await run(); exit(0) } catch { print("FAIL \(error
 RunLoop.main.run()
 '''
 def main():
-    parser = argparse.ArgumentParser(); parser.add_argument('--render'); parser.add_argument('--live', action='store_true'); args = parser.parse_args()
+    parser = argparse.ArgumentParser(); parser.add_argument('--render'); parser.add_argument('--live', action='store_true'); parser.add_argument('--benchmark', action='store_true'); args = parser.parse_args()
     project = Path(__file__).resolve().parents[1]
     spec = importlib.util.spec_from_file_location('helper', project/'scripts/check-desktop-ai.py'); helper = importlib.util.module_from_spec(spec); spec.loader.exec_module(helper)
     release, objects = helper.release_inputs(project)
@@ -78,5 +101,6 @@ def main():
         env=os.environ.copy(); env['SPEED_FIXTURE']=str(folder/'fixtures')
         if args.render: env['SPEED_RENDER']=str(Path(args.render).resolve())
         if args.live: env['SPEED_LIVE']='1'
+        if args.benchmark: env['SPEED_BENCHMARK']='1'
         subprocess.run([str(binary)],env=env,check=True,timeout=60)
 if __name__=='__main__': main()

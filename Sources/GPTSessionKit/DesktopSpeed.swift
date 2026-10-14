@@ -15,7 +15,7 @@ public struct DesktopSpeedSample: Identifiable, Equatable, Sendable {
     /// Wall-clock efficiency between usage records, not streaming generation speed.
     public var intervalRate: Double { Double(output) / seconds }
 }
-public struct DesktopSpeedSnapshot: Sendable {
+public struct DesktopSpeedSnapshot: Equatable, Sendable {
     public let samples: [DesktopSpeedSample]
     public let files: Int
     public let pendingFiles: Int
@@ -54,6 +54,7 @@ struct DesktopSpeedParser {
                 model = next; return
             }
             guard type == "event_msg", let subtype = payload["type"] as? String,
+                  ["task_started", "task_complete", "task_completed", "turn_aborted", "token_count"].contains(subtype),
                   let stamp = root["timestamp"] as? String, let date = dates.date(from: stamp) ?? fallback.date(from: stamp) else { return }
             if subtype == "task_started" {
                 let id = payload["turn_id"] as? String
@@ -167,14 +168,30 @@ public final class DesktopSpeedReader: @unchecked Sendable {
             try handle.seek(toOffset: current.offset)
             let amount = min(budget, 2 * 1024 * 1024)
             let data = try handle.read(upToCount: amount) ?? Data(); budget -= data.count
-            for byte in data {
-                current.offset += 1
-                if byte == 10 {
-                    if !current.skipping { current.parser.consume(current.buffer, identity: url.lastPathComponent + ":" + String(current.offset)) }
-                    current.buffer.removeAll(keepingCapacity: true); current.skipping = false
-                } else if !current.skipping {
-                    if current.buffer.count >= 1_048_576 { current.buffer.removeAll(keepingCapacity: true); current.skipping = true; warnings.append("跳过超过 1 MiB 的日志行，相关统计可能缺失。") }
-                    else { current.buffer.append(byte) }
+            // Scan newline boundaries in bulk; append each segment once instead of each byte.
+            // Partial and oversized lines retain the same bounded behavior across reads.
+            data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+                guard let base = bytes.baseAddress else { return }
+                var position = 0
+                while position < bytes.count {
+                    let newline = memchr(base.advanced(by: position), 10, bytes.count - position)
+                    let end = newline.map { base.distance(to: UnsafeRawPointer($0)) } ?? bytes.count
+                    let count = end - position
+                    current.offset += UInt64(count)
+                    if !current.skipping {
+                        if count > 1_048_576 - current.buffer.count {
+                            current.buffer.removeAll(keepingCapacity: true); current.skipping = true
+                            warnings.append("跳过超过 1 MiB 的日志行，相关统计可能缺失。")
+                        } else if count > 0 {
+                            current.buffer.append(base.advanced(by: position).assumingMemoryBound(to: UInt8.self), count: count)
+                        }
+                    }
+                    if newline != nil {
+                        current.offset += 1
+                        if !current.skipping { current.parser.consume(current.buffer, identity: url.lastPathComponent + ":" + String(current.offset)) }
+                        current.buffer.removeAll(keepingCapacity: true); current.skipping = false
+                        position = end + 1
+                    } else { break }
                 }
             }
             current.modified = info.st_mtimespec; current.changed = info.st_ctimespec

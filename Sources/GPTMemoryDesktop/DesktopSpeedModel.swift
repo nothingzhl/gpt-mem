@@ -37,7 +37,9 @@ private actor DesktopSpeedService {
         do {
             let value = try await service.refresh()
             guard generation == id, !Task.isCancelled else { return }
-            snapshot = value; error = nil; updatedAt = Date()
+            if snapshot != value { snapshot = value }
+            if error != nil { error = nil }
+            updatedAt = Date()
         } catch { if generation == id { self.error = error.localizedDescription } }
     }
 }
