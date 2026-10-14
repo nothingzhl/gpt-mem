@@ -45,6 +45,32 @@ try FileManager.default.createDirectory(at: memories, withIntermediateDirectorie
 for i in 0..<100 { try String(repeating: "- 原始记忆测试\n", count: 100).write(to: memories.appendingPathComponent("fixture\(i).md"), atomically: true, encoding: .utf8) }
 try measure("codex-memory.read.100") { let loaded = try CodexMemoryReader(rootURL: memories).read(); precondition(!loaded.documents.isEmpty) }
 
+
+let sessionRoot = root.appendingPathComponent("session-fixture")
+let logs = sessionRoot.appendingPathComponent("sessions/2026/10/14")
+try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+func logRecord(_ type: String, _ payload: [String: Any]) throws -> Data {
+    var data = try JSONSerialization.data(withJSONObject: ["timestamp": "2026-10-14T00:00:00.000Z", "type": type, "payload": payload]); data.append(10); return data
+}
+for i in 0..<100 {
+    var bytes = try logRecord("session_meta", ["id": "fixture-\(i)", "cwd": "/fixture/project", "originator": "Codex Desktop"])
+    bytes += try logRecord("turn_context", ["model": "fixture-model"])
+    for j in 0..<100 { bytes += try logRecord("event_msg", ["type": j % 2 == 0 ? "user_message" : "agent_message", "message": "消息\(j) " + String(repeating: "x", count: 640)]) }
+    try bytes.write(to: logs.appendingPathComponent("fixture-\(i).jsonl"))
+}
+try measure("sessions.catalog.cold.100x100", repeats: 3) { let catalog = try CodexSessionRepository(rootURL: sessionRoot).loadCatalog(); precondition(catalog.sessions.count == 100) }
+let repository = CodexSessionRepository(rootURL: sessionRoot)
+let sessionCatalog = try repository.loadCatalog()
+try measure("sessions.catalog.warm.100x100") { let catalog = try repository.loadCatalog(); precondition(catalog.sessions.count == 100) }
+let firstSession = sessionCatalog.sessions[0]
+try measure("sessions.transcript.cold.100-messages", repeats: 3) { let transcript = try CodexSessionRepository(rootURL: sessionRoot).loadTranscript(for: firstSession); precondition(transcript.messages.count == 100) }
+_ = try repository.loadTranscript(for: firstSession)
+try measure("sessions.transcript.warm.100-messages") { let transcript = try repository.loadTranscript(for: firstSession); precondition(transcript.messages.count == 100) }
+try measure("sessions.fulltext.no-hit.100x100", repeats: 3) {
+    let reader = CodexSessionRepository(rootURL: sessionRoot)
+    let result = try SessionFullTextSearch.search(sessions: sessionCatalog.sessions, query: "missing-fixture", scope: .all, loader: reader.loadTranscript)
+    precondition(result.scannedSessions == 100 && result.hits.isEmpty)
+}
 var appRoot = ProcessSample(bootID: "fixture", pid: 500, parentPID: 1, startTimeTicks: 1, startedAt: origin, executable: "/fixture/Codex.app/Contents/MacOS/Codex", role: .appMain, footprintBytes: 100000000)
 appRoot.rootKey = appRoot.key
 let workers = (0..<200).map { i in ProcessSample(bootID: "fixture", pid: 501 + i, parentPID: 500, startTimeTicks: 2, startedAt: origin, executable: "fixture-node", role: .mcpApp, rootKey: appRoot.key, footprintBytes: 64000000, cpuPercent: 0) }
@@ -69,6 +95,16 @@ for i in 0..<100 {
 }
 try measure("reports.load.100") { let catalog = try reports.loadCatalog(); precondition(catalog.reports.count == 100) }
 try measure("reports.export.markdown-json") { let markdown = try AIReportExport.markdown(saved!); let json = try AIReportExport.json(saved!); precondition(!markdown.isEmpty && !json.isEmpty) }
+
+let resultBytes = try AIAnalysisCodec.encoder().encode(result)
+try measure("ai.result.decode-validate") { let parsed = try AIAnalysisCodec.decoder().decode(AIAnalysisResult.self, from: resultBytes); try parsed.validate(against: input) }
+let original = "# 规则\n" + (0..<1000).map { "- 规则\($0) 中文测试内容\n\n" }.joined()
+try measure("codex-memory.preview.1000-items") {
+    let items = CodexMemoryItem.parse(original)
+    precondition(items.count == 1000)
+    let preview = try items[500].replacing(in: original, with: "- 修改规则\n\n")
+    precondition(preview.contains("修改规则") && !preview.contains("规则500 "))
+}
 if CommandLine.arguments.contains("--native") {
     let collector = NativeCollector()
     try measure("native.readonly-collection", repeats: 3) { let sample = try collector.sample(); precondition(sample.capturedAt.timeIntervalSince1970 > 0) }

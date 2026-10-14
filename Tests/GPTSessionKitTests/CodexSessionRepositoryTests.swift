@@ -222,6 +222,21 @@ final class CodexSessionRepositoryTests: XCTestCase {
         XCTAssertEqual(try repository.loadTranscript(for:summary).messages.count,2)
     }
 
+    func testMessageLimitsCountGraphemesRatherThanUTF8Bytes() throws {
+        let fixture = try Fixture(); defer { fixture.remove() }
+        let short = String(repeating: "👩‍💻", count: 17000)
+        let long = String(repeating: "e\u{301}", count: 65537)
+        _ = try fixture.write([metadata(), record("event_msg", ["type": "agent_message", "message": short]), record("event_msg", ["type": "agent_message", "message": long], time: 1)])
+        let repository = CodexSessionRepository(rootURL: fixture.root)
+        let summary = try XCTUnwrap(repository.loadCatalog().sessions.first)
+        let transcript = try repository.loadTranscript(for: summary)
+        XCTAssertEqual(transcript.messages.count, 2)
+        XCTAssertEqual(transcript.messages[0].text, short)
+        XCTAssertEqual(transcript.messages[1].text.count, 65536)
+        XCTAssertEqual(transcript.messages[1].text, String(long.prefix(65536)))
+        XCTAssertTrue(transcript.warnings.contains { $0.contains("截断展示") })
+    }
+
     func testLongPromptSearchUsesFullGlobalBudgetAndWarnsOnTruncation() throws {
         let fixture = try Fixture(); defer { fixture.remove() }
         _ = try fixture.write([metadata(),record("event_msg",["type":"user_message","message":String(repeating:"a",count:4_200)+"needle"])])

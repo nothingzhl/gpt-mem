@@ -179,8 +179,15 @@ struct CodexRolloutParser {
     private mutating func add(kind: SessionMessageKind, text raw: String, source: Source, timestamp: Date?, line: Int,
                               toolName: String? = nil, callID: String? = nil, itemID: String? = nil) {
         guard !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || kind == .toolCall || kind == .toolResult else { return }
-        let text = String(raw.prefix(64 * 1_024))
-        if text.count < raw.count { warn("部分消息超过 64 KiB 字符展示上限，已截断展示。") }
+        let text: String
+        // A UTF-8 byte count below the character limit proves no truncation is needed.
+        // Avoid repeatedly walking grapheme clusters for ordinary short messages.
+        if raw.utf8.count <= 64 * 1_024 { text = raw }
+        else {
+            let slice = raw.prefix(64 * 1_024)
+            text = String(slice)
+            if slice.endIndex != raw.endIndex { warn("部分消息超过 64 KiB 字符展示上限，已截断展示。") }
+        }
         let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveKind = kind == .user && isInjectedContext(normalized) ? .system : kind
         let safeItemID = itemID.map { String($0.prefix(512)) }
@@ -235,11 +242,12 @@ struct CodexRolloutParser {
         if firstUserTitle == nil { firstUserTitle = cleanTitle(message.text) }
         let remaining = limits.maximumSearchCharacters - searchCharacters
         guard remaining > 0 else { searchTruncated = true; return }
-        let retained = String(message.text.prefix(remaining))
+        let slice = message.text.prefix(remaining)
+        let retained = String(slice)
         let retainedCount = retained.count
         searchText += retained
         searchCharacters += retainedCount
-        if retainedCount < message.text.count { searchTruncated = true }
+        if slice.endIndex != message.text.endIndex { searchTruncated = true }
         if retainedCount < remaining { searchText += "\n"; searchCharacters += 1 }
     }
 
