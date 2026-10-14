@@ -28,7 +28,7 @@ struct KnowledgeWorkspace: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Picker("记忆来源", selection: $sourceTab) { Text("我的记忆库").tag(false); Text("Codex 本地记忆（只读）").tag(true) }.pickerStyle(.segmented).frame(width: 370)
+                Picker("记忆来源", selection: $sourceTab) { Text("我的记忆库").tag(false); Text("Codex 原始记忆").tag(true) }.pickerStyle(.segmented).frame(width: 370)
                 Spacer()
                 Button("刷新") { Task { if sourceTab { await model.readSources() } else { await model.reload() } } }.disabled(model.isLoading || model.isReadingSources)
                 Button("新建记忆") { model.editor = .init(draft: .init(), expected: nil) }.disabled(!model.hasLoaded || model.loadError != nil)
@@ -102,7 +102,7 @@ struct KnowledgeWorkspace: View {
                 }.disabled(model.isReadingSources)
                 if model.isReadingSources { ProgressView().controlSize(.small) }
             }
-            Text("文件保持只读；导入会创建 GPT Manager 的独立草稿。文件中的历史指令是资料，导入不会执行它们。").font(.caption).foregroundStyle(.secondary)
+            Text("MEMORY.md 支持单条编辑和删除，确认后直接修改原文件并备份；其余文件只读。Codex 可能重新生成记忆，请避免与生成任务同时写入。").font(.caption).foregroundStyle(.secondary)
             if !model.sourceCatalog.warnings.isEmpty {
                 DisclosureGroup("读取提示（\(model.sourceCatalog.warnings.count)）") { Text(model.sourceCatalog.warnings.joined(separator: "\n")).font(.caption).textSelection(.enabled) }
             }
@@ -115,6 +115,7 @@ struct KnowledgeWorkspace: View {
                 if let source = model.sourceCatalog.documents.first(where: { $0.id == selected }) {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack { Text(source.title).font(.title3); Spacer(); Button("导入副本并审核") { model.editor = .init(draft: source.importedDraft(), expected: nil) }.disabled(model.loadError != nil) }
+                        if source.relativePath == "MEMORY.md" { CodexOriginalControls(model: model, source: source) }
                         ScrollView { Text(source.text).font(.system(size: 12, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
                     }.padding(12)
                 } else { Text(model.isReadingSources ? "正在读取本地 Markdown 记忆…" : "选择文件查看；搜索覆盖已读取的正文").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity) }
@@ -248,5 +249,124 @@ private struct KnowledgeBundleView: View {
                 Button("复制参考记忆") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string) }.disabled(text.isEmpty || oversized)
             }
         }.padding(24).frame(width: 720, height: 580)
+    }
+}
+
+private struct CodexOriginalRequest: Identifiable {
+    let id = UUID()
+    let source: KnowledgeSourceDocument
+    let item: CodexMemoryItem
+    let deleting: Bool
+}
+private struct CodexOriginalControls: View {
+    @ObservedObject var model: KnowledgeDesktopModel
+    let source: KnowledgeSourceDocument
+    @State private var selectedItem: Int?
+    @State private var request: CodexOriginalRequest?
+    @State private var restore: CodexMemoryBackup?
+    @State private var showBackups = false
+    @State private var removingBackup: CodexMemoryBackup?
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            let items = CodexMemoryItem.parse(source.text)
+            Picker("原始记忆条目", selection: $selectedItem) {
+                Text("选择顶层列表项（\(items.count) 条）").tag(Optional<Int>.none)
+                ForEach(items) { item in Text(String((item.context + " · " + item.text).prefix(100))).tag(Optional(item.id)) }
+            }
+            HStack {
+                if let item = items.first(where: { $0.id == selectedItem }) {
+                    Button("编辑原始条目…") { request = .init(source: source, item: item, deleting: false) }
+                    Button("删除原始条目…") { request = .init(source: source, item: item, deleting: true) }
+                }
+                Button("操作备份与恢复…") { Task { await model.loadOriginalBackups(); showBackups = true } }
+            }.disabled(model.isSaving)
+        }
+        .onChange(of: source.text) { _, _ in selectedItem = nil }
+        .sheet(item: $request) { request in CodexOriginalEditView(model: model, request: request) }
+        .sheet(isPresented: $showBackups) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("MEMORY.md 操作备份").font(.title2)
+                Text("仅当当前原文件与这次操作的结果完全一致时才允许回滚；恢复也会创建新备份。备份可能包含未成功写入的操作，请核对。最多保留 20 份，达到上限后停止修改；可导出后明确删除不再需要的备份。").font(.caption).foregroundStyle(.secondary)
+                if let error = model.sourceError { Text(error).foregroundStyle(.orange) }
+                List(model.originalBackups) { backup in
+                    HStack {
+                        Text(backup.createdAt.formatted() + " · " + backup.action + "\n" + backup.rootPath).font(.caption).textSelection(.enabled)
+                        Spacer()
+                        Button("导出备份") { exportBackup(backup) }
+                        Button("预览恢复…") { restore = backup }.disabled(model.isSaving || backup.rootPath != model.sourceRoot.standardizedFileURL.path)
+                        Button("删除备份…") { removingBackup = backup }
+                    }
+                }
+                HStack { Spacer(); Button("关闭") { showBackups = false } }
+            }.padding(24).frame(width: 760, height: 520)
+                        .alert("永久删除此操作备份？", isPresented: Binding(get: { removingBackup != nil }, set: { if !$0 { removingBackup = nil } })) {
+                Button("取消", role: .cancel) { removingBackup = nil }
+                Button("删除备份", role: .destructive) { if let backup = removingBackup { Task { await model.removeOriginalBackup(backup) } }; removingBackup = nil }
+            } message: { Text("只删除选中的操作备份，原始记忆不变；此备份无法再恢复。建议先导出。") }
+            .sheet(item: $restore) { backup in CodexOriginalRestoreView(model: model, backup: backup) }
+        }
+    }
+    private func exportBackup(_ backup: CodexMemoryBackup) {
+        let panel = NSSavePanel(); panel.allowedContentTypes = [.json]; panel.nameFieldStringValue = "MEMORY-backup-" + backup.id + ".json"
+        if panel.runModal() == .OK, let url = panel.url {
+            do { let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]; try encoder.encode(backup).write(to: url, options: .atomic) }
+            catch { NSAlert(error: error).runModal() }
+        }
+    }
+}
+private struct CodexOriginalEditView: View {
+    @ObservedObject var model: KnowledgeDesktopModel
+    let request: CodexOriginalRequest
+    @State private var draft: String
+    @State private var preview: String?
+    @State private var error: String?
+    @State private var discard = false
+    @Environment(\.dismiss) private var dismiss
+    init(model: KnowledgeDesktopModel, request: CodexOriginalRequest) { self.model = model; self.request = request; _draft = State(initialValue: request.item.text) }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(request.deleting ? "删除 Codex 原始记忆条目" : "编辑 Codex 原始记忆条目").font(.title2)
+            Text(request.source.fileURL.path).font(.caption).textSelection(.enabled)
+            Text("只影响选中的列表项；确认后修改原始 MEMORY.md，备份整个文件。Codex 可能重新生成记忆，建议先结束相关生成任务。未同步修改摘要和历史来源，不能保证 Codex 后续不会再次学到相同内容。").font(.caption).foregroundStyle(.orange)
+            Text(request.item.context).font(.headline)
+            if !request.deleting { TextEditor(text: $draft).font(.system(size: 12, design: .monospaced)).frame(height: 140) }
+            if let preview {
+                Text("修改范围：\(request.item.text.utf8.count) 字节 → \(request.deleting ? 0 : draft.utf8.count) 字节；文件 \(request.source.text.utf8.count) → \(preview.utf8.count) 字节").font(.caption)
+                HStack(alignment: .top) {
+                    ScrollView { Text("原条目\n\n" + request.item.text).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+                    ScrollView { Text("修改后\n\n" + (request.deleting ? "（移除此条目）" : draft)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+                }
+            } else { Text("先预览这条记忆的前后差异，再确认写入。续行请缩进，不能加入其他顶层条目或标题。").foregroundStyle(.secondary) }
+            if let error { Text(error).foregroundStyle(.orange).textSelection(.enabled) }
+            HStack {
+                Button("取消") { if draft != request.item.text { discard = true } else { dismiss() } }
+                Spacer()
+                if preview == nil {
+                    Button("预览差异") { do { preview = try request.item.replacing(in: request.source.text, with: request.deleting ? nil : draft); error = nil } catch { self.error = error.localizedDescription } }
+                } else {
+                    Button(request.deleting ? "确认删除并备份" : "确认保存并备份") {
+                        guard let preview else { return }
+                        Task { if await model.editOriginal(source: request.source, replacement: preview, action: request.deleting ? "删除单条记忆" : "编辑单条记忆") { dismiss() } else { error = model.sourceError } }
+                    }.buttonStyle(.borderedProminent)
+                }
+            }
+        }.padding(24).frame(width: 820, height: 650).disabled(model.isSaving).interactiveDismissDisabled()
+        .onChange(of: draft) { _, _ in preview = nil }
+        .confirmationDialog("放弃未保存的修改？", isPresented: $discard) { Button("放弃修改", role: .destructive) { dismiss() }; Button("继续编辑", role: .cancel) {} }
+    }
+}
+private struct CodexOriginalRestoreView: View {
+    @ObservedObject var model: KnowledgeDesktopModel
+    let backup: CodexMemoryBackup
+    @State private var error: String?
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("确认恢复原始 MEMORY.md").font(.title2)
+            Text("恢复整个文件；当前内容必须与操作后的快照完全一致，否则拒绝覆盖。恢复前同样备份当前文件。").font(.caption).foregroundStyle(.orange)
+            HStack { ScrollView { Text("操作后（预期当前文件）\n\n" + backup.after).textSelection(.enabled) }; ScrollView { Text("恢复为操作前\n\n" + backup.before).textSelection(.enabled) } }
+            if let error { Text(error).foregroundStyle(.orange) }
+            HStack { Button("取消") { dismiss() }; Spacer(); Button("确认恢复并备份") { Task { if await model.restoreOriginal(backup) { dismiss() } else { error = model.sourceError } } }.buttonStyle(.borderedProminent) }
+        }.padding(24).frame(width: 850, height: 650).disabled(model.isSaving).interactiveDismissDisabled()
     }
 }

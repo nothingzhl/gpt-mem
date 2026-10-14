@@ -5,8 +5,9 @@ import GPTAnalysisKit
 private struct KnowledgeSnapshot { let sequence: Int; let catalog: KnowledgeCatalog }
 private actor KnowledgeIO {
     let store: KnowledgeStore
+    let originalEditor: CodexMemoryEditor
     var sequence = 0
-    init(store: KnowledgeStore) { self.store = store }
+    init(store: KnowledgeStore) { self.store = store; originalEditor = CodexMemoryEditor(backupDirectory: store.directoryURL.deletingLastPathComponent().appendingPathComponent("codex-memory-backups")) }
     private func wrap(_ catalog: KnowledgeCatalog) -> KnowledgeSnapshot { sequence += 1; return .init(sequence: sequence, catalog: catalog) }
     func load() throws -> KnowledgeSnapshot { wrap(try store.load()) }
     func save(_ draft: KnowledgeDraft, expected: KnowledgeEntry?, reason: String) throws -> KnowledgeSnapshot {
@@ -17,6 +18,10 @@ private actor KnowledgeIO {
     }
     func trash(_ entry: KnowledgeEntry, trashed: Bool) throws -> KnowledgeSnapshot { wrap(try store.setTrashed(trashed, expected: entry)) }
     func delete(_ entry: KnowledgeEntry) throws -> KnowledgeSnapshot { wrap(try store.permanentlyDelete(expected: entry)) }
+    func editOriginal(root: URL, original: String, replacement: String, action: String) throws -> CodexMemoryBackup { try originalEditor.apply(root: root, original: original, replacement: replacement, action: action) }
+    func removeBackup(_ backup: CodexMemoryBackup) throws { try originalEditor.removeBackup(backup) }
+    func backups() throws -> [CodexMemoryBackup] { try originalEditor.backups() }
+    func restoreOriginal(_ backup: CodexMemoryBackup, root: URL) throws { _ = try originalEditor.restore(backup, root: root) }
     func sources(root: URL) throws -> KnowledgeSourceCatalog { try CodexMemoryReader(rootURL: root).read() }
 }
 struct KnowledgeEditRequest: Identifiable {
@@ -42,6 +47,7 @@ final class KnowledgeDesktopModel: ObservableObject {
     @Published private(set) var operationError: String?
     @Published private(set) var sourceError: String?
     @Published private(set) var status: String?
+    @Published private(set) var originalBackups: [CodexMemoryBackup] = []
     @Published var editor: KnowledgeEditRequest?
     @Published var query = "" { didSet { filter() } }
     @Published var projectFilter = "" { didSet { filter() } }
@@ -76,6 +82,38 @@ final class KnowledgeDesktopModel: ObservableObject {
         do { sourceCatalog = try await io.sources(root: sourceRoot); sourceError = nil }
         catch { sourceCatalog = .init(); sourceError = error.localizedDescription }
         isReadingSources = false; filter()
+    }
+    func loadOriginalBackups() async {
+        do { originalBackups = try await io.backups() } catch { sourceError = error.localizedDescription }
+    }
+    func editOriginal(source: KnowledgeSourceDocument, replacement: String, action: String) async -> Bool {
+        guard !isSaving, source.relativePath == "MEMORY.md", source.fileURL.standardizedFileURL == sourceRoot.appendingPathComponent("MEMORY.md").standardizedFileURL else { return false }
+        let root = sourceRoot
+        isSaving = true; sourceError = nil
+        defer { isSaving = false }
+        do {
+            _ = try await io.editOriginal(root: root, original: source.text, replacement: replacement, action: action)
+            status = "已修改 Codex 的 MEMORY.md，操作前后原文已备份。"
+            await readSources(); await loadOriginalBackups(); return true
+        } catch { sourceError = error.localizedDescription; return false }
+    }
+    func removeOriginalBackup(_ backup: CodexMemoryBackup) async {
+        guard !isSaving else { return }
+        isSaving = true; sourceError = nil
+        defer { isSaving = false }
+        do { try await io.removeBackup(backup); await loadOriginalBackups() }
+        catch { sourceError = error.localizedDescription }
+    }
+    func restoreOriginal(_ backup: CodexMemoryBackup) async -> Bool {
+        guard !isSaving else { return false }
+        let root = sourceRoot
+        isSaving = true; sourceError = nil
+        defer { isSaving = false }
+        do {
+            try await io.restoreOriginal(backup, root: root)
+            status = "已恢复 MEMORY.md，同时备份了恢复前的文件。"
+            await readSources(); await loadOriginalBackups(); return true
+        } catch { sourceError = error.localizedDescription; return false }
     }
     func save(_ request: KnowledgeEditRequest) async -> Bool {
         guard !isSaving else { return false }

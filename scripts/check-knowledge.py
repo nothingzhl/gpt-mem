@@ -48,7 +48,28 @@ var assertions = 0
     try expect(!FileManager.default.fileExists(atPath: model.directoryURL.path), "initial read must not create store")
     await model.readSources(); try await settle(model)
     try expect(model.filteredSources.count == 1, "source indexing")
-    var draft = model.filteredSources[0].importedDraft()
+    let originalSource = model.filteredSources[0]
+    try expect(model.originalBackups.isEmpty, "read source does not create operation backups")
+    let originalWithItem = "# Fixture\n- Original rule\n\n- Keep rule\n"
+    try Data(originalWithItem.utf8).write(to: sources.appendingPathComponent("MEMORY.md"))
+    await model.readSources(); try await settle(model)
+    let editableSource = model.filteredSources[0]
+    let item = CodexMemoryItem.parse(editableSource.text)[0]
+    let changed = try item.replacing(in: editableSource.text, with: "- Reviewed rule\n\n")
+    let applied = await model.editOriginal(source: editableSource, replacement: changed, action: "编辑单条记忆")
+    try expect(applied && model.originalBackups.count == 1, "reviewed original edit saves backup")
+    let backup = model.originalBackups[0]
+    let stale = await model.editOriginal(source: editableSource, replacement: "- Stale overwrite\n", action: "编辑单条记忆")
+    try expect(!stale && model.sourceError != nil, "stale original draft rejected")
+    let restoredOriginal = await model.restoreOriginal(backup)
+    try expect(restoredOriginal, "original rollback")
+    let restoredText = try String(contentsOf: sources.appendingPathComponent("MEMORY.md"), encoding: .utf8)
+    try expect(restoredText == originalWithItem, "original contents restored exactly")
+    await model.removeOriginalBackup(backup)
+    try expect(model.originalBackups.count == 1, "explicit backup removal preserves remaining backup")
+    try sourceData.write(to: sources.appendingPathComponent("MEMORY.md"))
+    await model.readSources(); try await settle(model)
+    var draft = originalSource.importedDraft()
     model.editor = .init(draft: draft, expected: nil)
     try expect(model.catalog.entries.isEmpty, "opening editor must not save")
     let save = await model.save(model.editor!)
