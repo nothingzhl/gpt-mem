@@ -184,6 +184,13 @@ final class OptimizationFixture: @unchecked Sendable {
     try await waitFor({ reopened.records.count == 1 }, "stored action did not reopen")
     try expect(reopened.records.first?.observation?.state == .exited, "effect records persist across model reopening")
     try expect(reopened.records.first?.trend?.count == 3, "frozen target trend persists with the action")
+    state.loadCommandPreview(for: fixture.target)
+    try await waitFor({ !state.isLoadingCommands }, "command read did not finish")
+    try expect(state.commandPreviews[fixture.target.key]?.contains("未知") == true, "unreadable process command is explicit, not a fabricated task")
+    try expect(state.records.count == 1, "reading command does not write action records")
+    state.loadCommandPreview(for: fixture.target); state.clearCommandPreviews()
+    try await Task.sleep(nanoseconds: 50_000_000)
+    try expect(state.commandPreviews.isEmpty && !state.isLoadingCommands, "closing preview rejects late command results")
     print("PASS confirmation/cancel, duplicate submission, verified effects and private persistence/reopening")
 
     let refusing = Fixture(); refusing.refuse = true

@@ -59,6 +59,45 @@ final class MemoryProcessActionsModel: ObservableObject {
     private var optimizationCompleted = 0
     var hasPendingWork: Bool { isBusy || isObserving || isSavingRecords || isOptimizing }
 
+    @Published private(set) var commandPreviews: [String: String] = [:]
+    @Published private(set) var isLoadingCommands = false
+    private var commandReadID = UUID()
+
+    func clearCommandPreviews() {
+        commandReadID = UUID(); commandPreviews = [:]; isLoadingCommands = false
+    }
+
+    func loadCommandPreviews(candidates: [MemoryOptimizationCandidate], snapshot: MemorySnapshot?) {
+        guard let snapshot else { clearCommandPreviews(); return }
+        var targets = candidates.map(\.process)
+        for candidate in candidates {
+            targets += snapshot.processes.filter {
+                $0.ownership == "process_tree" && MemoryOptimizationPlanner.isDescendant($0, of: candidate.process, in: snapshot)
+            }.prefix(8)
+        }
+        loadCommands(targets)
+    }
+
+    func loadCommandPreview(for process: ProcessSample) { loadCommands([process]) }
+
+    private func loadCommands(_ processes: [ProcessSample]) {
+        let readID = UUID(); commandReadID = readID; commandPreviews = [:]
+        var seen: Set<String> = []
+        let targets = Array(processes.filter { seen.insert($0.key).inserted }.prefix(128))
+        isLoadingCommands = true
+        queue.async { [weak self, targets] in
+            var values: [String: String] = [:]
+            for process in targets {
+                do { values[process.key] = try ProcessCommandReader.read(process) }
+                catch { values[process.key] = Self.describe(error) }
+            }
+            DispatchQueue.main.async {
+                guard let self, self.commandReadID == readID else { return }
+                self.commandPreviews = values; self.isLoadingCommands = false
+            }
+        }
+    }
+
     func optimizationCandidates(snapshot: MemorySnapshot?, history: [MemorySnapshot] = [], minimumBytes: UInt64 = 32 * 1024 * 1024) -> [MemoryOptimizationCandidate] {
         guard let snapshot, Date().timeIntervalSince(snapshot.capturedAt) <= 30 else { return [] }
         return MemoryOptimizationPlanner.candidates(snapshot: snapshot, protectedPIDs: protectedPIDs, minimumBytes: minimumBytes, history: history)

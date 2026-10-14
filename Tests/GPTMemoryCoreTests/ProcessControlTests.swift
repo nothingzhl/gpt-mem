@@ -26,6 +26,30 @@ final class ProcessControlTests: XCTestCase {
         }
     }
 
+    func testCommandReaderShowsArgumentsExcludesEnvironmentAndRejectsReuse() throws {
+        let child = Process(); child.executableURL = URL(fileURLWithPath: "/bin/sleep"); child.arguments = ["60"]
+        child.environment = ["GPT_COMMAND_TEST_SECRET": "environment-only-sentinel"]
+        try child.run()
+        defer { if child.isRunning { child.terminate() }; child.waitUntilExit() }
+        var info = gpt_process_info()
+        XCTAssertEqual(gpt_read_process(child.processIdentifier, &info), 0)
+        let path = withUnsafePointer(to: &info.executable) { $0.withMemoryRebound(to: CChar.self, capacity: 4096) { String(cString: $0) } }
+        var target = ProcessSample(bootID: "test", pid: Int(child.processIdentifier), parentPID: Int(getpid()),
+            startTimeTicks: info.start_ticks, startedAt: Date(), executable: path, role: .toolWorker,
+            rootKey: "test-root", footprintBytes: 0)
+        let command = try ProcessCommandReader.read(target)
+        XCTAssertTrue(command.contains("sleep"))
+        XCTAssertTrue(command.contains("60"))
+        XCTAssertFalse(command.contains("environment-only-sentinel"))
+        var short = [CChar](repeating: 1, count: 4)
+        XCTAssertEqual(gpt_read_command(child.processIdentifier, target.startTimeTicks, path, &short, short.count), -1)
+        XCTAssertTrue(short.allSatisfy { $0 == 0 })
+        target.startTimeTicks += 1
+        XCTAssertThrowsError(try ProcessCommandReader.read(target))
+        target.startTimeTicks -= 1; target.ownership = "remembered_ancestry"
+        XCTAssertThrowsError(try ProcessCommandReader.read(target))
+    }
+
     func testToolPlannerProtectsAncestorsAndKeepsUnrelatedTools() {
         let fixture = Fixture()
         var tool = fixture.process; tool.footprintBytes = 100 * 1024 * 1024

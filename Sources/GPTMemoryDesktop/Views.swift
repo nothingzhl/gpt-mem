@@ -626,6 +626,7 @@ struct ProcessesContent: View {
                                     Text("\(MemoryFormat.executable(process.executable)) · 父进程 \(String(process.parentPID)) · \(MemoryFormat.date(process.startedAt)) 启动")
                                         .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary).textSelection(.enabled)
                                     Text("程序：\(process.executable)").font(.system(size: 10)).textSelection(.enabled)
+                                    MemoryProcessCommandDetail(model: actions, process: process)
                                     let root = snapshot?.processes.first(where: { $0.key == process.rootKey })
                                     Text("所属应用：\(root.map { MemoryFormat.executable($0.executable) + " · PID " + String($0.pid) } ?? "当前无法确认主进程")")
                                         .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)

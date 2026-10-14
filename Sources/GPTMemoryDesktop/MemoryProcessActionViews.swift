@@ -168,20 +168,10 @@ struct MemoryOptimizationPlan: View {
                             .font(.system(size: 12)).foregroundStyle(MemoryStyle.secondary)
                     }
                     ForEach(visibleCandidates) { candidate in
-                        Toggle(isOn: Binding(get: { selected.contains(candidate.id) }, set: {
-                            if $0 { selected.insert(candidate.id) } else { selected.remove(candidate.id) }
-                        })) {
-                            VStack(alignment: .leading, spacing: 5) {
-                                Text("\(MemoryFormat.executable(candidate.process.executable)) · PID \(candidate.process.pid) · \(MemoryFormat.bytes(candidate.process.footprintBytes))")
-                                    .font(.system(size: 13, weight: .medium))
-                                Text("\(candidate.process.role.label) · \(candidate.relatedProcessCount) 个下级进程 · \(MemoryFormat.date(candidate.process.startedAt)) 启动")
-                                    .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
-                                Text("所属：\(MemoryFormat.executable(candidate.rootProcess.executable)) · PID \(candidate.rootProcess.pid)").font(.system(size: 11))
-                                Text(candidate.activity).font(.system(size: 11)).foregroundStyle(MemoryStyle.orange)
-                                Text(candidate.process.executable).font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary).textSelection(.enabled)
-                            }
-                        }.toggleStyle(.checkbox).padding(12).frame(maxWidth: .infinity, alignment: .leading)
-                            .background(MemoryStyle.surface).clipShape(RoundedRectangle(cornerRadius: 8))
+                        MemoryToolCommandRow(model: model, candidate: candidate, snapshot: snapshot,
+                            selected: Binding(get: { selected.contains(candidate.id) }, set: {
+                                if $0 { selected.insert(candidate.id) } else { selected.remove(candidate.id) }
+                            }))
                     }
                 }
             }.frame(minHeight: 130, maxHeight: 280)
@@ -193,7 +183,12 @@ struct MemoryOptimizationPlan: View {
                 Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("请求退出所选进程…") { confirms = true }.disabled(selected.isEmpty || model.hasPendingWork)
             }.controlSize(.large)
+            Text("命令在打开时读取，仅在本机临时展示。常驻服务的启动参数无法说明当前处理的请求；任务内容可能仍未知。")
+                .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
+            Button("刷新启动命令") { model.loadCommandPreviews(candidates: candidates, snapshot: snapshot) }.disabled(model.isLoadingCommands)
         }.padding(24).frame(width: 620)
+            .onAppear { model.loadCommandPreviews(candidates: candidates, snapshot: snapshot) }
+            .onDisappear { model.clearCommandPreviews() }
             .alert("确认正常退出 \(selected.count) 个工具进程？", isPresented: $confirms) {
                 Button("取消", role: .cancel) {}
                 Button("确认退出", role: .destructive) {
@@ -201,5 +196,55 @@ struct MemoryOptimizationPlan: View {
                     if model.isOptimizing { dismiss() }
                 }
             } message: { Text("请先保存任务。所选工具任务及其下级进程可能受影响；退出请求无法撤回。") }
+    }
+}
+
+
+private struct MemoryToolCommandRow: View {
+    @ObservedObject var model: MemoryProcessActionsModel
+    let candidate: MemoryOptimizationCandidate
+    let snapshot: MemorySnapshot?
+    @Binding var selected: Bool
+    var body: some View {
+        Toggle(isOn: $selected) {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("\(MemoryFormat.executable(candidate.process.executable)) · PID \(candidate.process.pid) · \(MemoryFormat.bytes(candidate.process.footprintBytes))")
+                .font(.system(size: 13, weight: .medium))
+            Text("\(candidate.process.role.label) · \(candidate.relatedProcessCount) 个下级进程 · \(MemoryFormat.date(candidate.process.startedAt)) 启动")
+                .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
+            Text("所属：\(MemoryFormat.executable(candidate.rootProcess.executable)) · PID \(candidate.rootProcess.pid)").font(.system(size: 11))
+            Text(candidate.activity).font(.system(size: 11)).foregroundStyle(MemoryStyle.orange)
+            Text("启动命令：" + (model.commandPreviews[candidate.id] ?? (model.isLoadingCommands ? "读取中…" : "未读取")))
+                .font(.system(size: 11, design: .monospaced)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            let children = snapshot.map { sample in sample.processes.filter { MemoryOptimizationPlanner.isDescendant($0, of: candidate.process, in: sample) } } ?? []
+            if !children.isEmpty {
+                DisclosureGroup("下级进程命令（\(children.count) 个，最多展示 8 个）") {
+                    ForEach(Array(children.prefix(8))) { child in
+                        Text("PID \(child.pid)：" + (model.commandPreviews[child.key] ?? (model.isLoadingCommands ? "读取中…" : "未读取")))
+                            .font(.system(size: 10, design: .monospaced)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+        }.toggleStyle(.checkbox).padding(12).frame(maxWidth: .infinity, alignment: .leading)
+            .background(MemoryStyle.surface).clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+
+struct MemoryProcessCommandDetail: View {
+    @ObservedObject var model: MemoryProcessActionsModel
+    let process: ProcessSample
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Button("读取启动命令") { model.loadCommandPreview(for: process) }.disabled(model.isLoadingCommands)
+            if let command = model.commandPreviews[process.key] {
+                Text(command).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("本次读取的启动参数，不能据此判断当前请求或是否空闲。")
+                    .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
+            }
+        }.onChange(of: process.key) { _, _ in model.clearCommandPreviews() }
+            .onDisappear { model.clearCommandPreviews() }
     }
 }

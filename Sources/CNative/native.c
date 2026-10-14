@@ -138,6 +138,43 @@ int gpt_signal_process(int pid, uint64_t birth, const char *executable, int sign
     return kill(pid, signal_number);
 }
 
+/* Explicit UI request only. Return argc NUL-separated arguments, never env. */
+int gpt_read_command(int pid, uint64_t birth, const char *executable, char *out, size_t capacity) {
+    if (!out || capacity == 0 || capacity > 16 * 1024) { errno = EINVAL; return -1; }
+    memset(out, 0, capacity);
+    if (gpt_validate_process(pid, birth, executable) != 0) return -1;
+    int mib[3] = {CTL_KERN, KERN_PROCARGS2, pid};
+    size_t length = 0;
+    if (sysctl(mib, 3, NULL, &length, NULL, 0) != 0) return -1;
+    if (length < sizeof(int) || length > 4 * 1024 * 1024) { errno = EOVERFLOW; return -1; }
+    size_t allocated = length;
+    char *data = calloc(1, allocated);
+    if (!data) return -1;
+    int result = -1;
+    if (sysctl(mib, 3, data, &length, NULL, 0) != 0) goto done;
+    if (length < sizeof(int) || length > allocated) { errno = EINVAL; goto done; }
+    int argc = 0; memcpy(&argc, data, sizeof(argc));
+    if (argc <= 0 || argc > 65536) { errno = EINVAL; goto done; }
+    char *cursor = data + sizeof(argc), *end = data + length;
+    size_t size = strnlen(cursor, (size_t)(end - cursor));
+    if (cursor + size >= end) { errno = EINVAL; goto done; }
+    cursor += size + 1;
+    while (cursor < end && *cursor == '\0') cursor++;
+    size_t used = 0;
+    for (int index = 0; index < argc; index++) {
+        size = strnlen(cursor, (size_t)(end - cursor));
+        if (cursor + size >= end) { errno = EINVAL; goto done; }
+        if (size + 1 > capacity - used) { errno = EOVERFLOW; goto done; }
+        memcpy(out + used, cursor, size + 1); used += size + 1; cursor += size + 1;
+    }
+    if (gpt_validate_process(pid, birth, executable) != 0) goto done;
+    result = (int)used;
+done:
+    memset(data, 0, allocated); free(data);
+    if (result < 0) memset(out, 0, capacity);
+    return result;
+}
+
 /* Caller asks for hints only for app-owned processes, minimizing argv reads. */
 void gpt_read_role_hint(int pid, char *out, size_t capacity) {
     if (capacity) out[0] = '\0';
