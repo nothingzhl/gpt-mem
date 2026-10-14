@@ -74,15 +74,24 @@ final class Fixture: @unchecked Sendable {
 }
 final class OptimizationFixture: @unchecked Sendable {
     let lock = NSLock()
+    let main = ProcessSample(bootID: "opt", pid: 223450, parentPID: 1, startTimeTicks: 1,
+        startedAt: Date(timeIntervalSince1970: 1), executable: "/Applications/Codex.app/Contents/MacOS/Codex",
+        role: .appMain, rootKey: "opt:223450:1", footprintBytes: 100 * 1024 * 1024)
     var roots: [ProcessSample] = (0..<2).map { offset in
         let pid = 223455 + offset
-        return ProcessSample(bootID: "opt", pid: pid, parentPID: 1, startTimeTicks: UInt64(offset + 1),
-            startedAt: Date(timeIntervalSince1970: Double(offset + 1)), executable: "/Applications/Codex.app/Contents/MacOS/Codex",
-            role: .appMain, rootKey: "opt:\(pid):\(offset + 1)", footprintBytes: 200 * 1024 * 1024)
+        return ProcessSample(bootID: "opt", pid: pid, parentPID: 223450, startTimeTicks: UInt64(offset + 2),
+            startedAt: Date(timeIntervalSince1970: Double(offset + 2)), executable: offset == 0 ? "/runtime/node" : "/runtime/python",
+            role: offset == 0 ? .mcpApp : .repl, rootKey: "opt:223450:1", footprintBytes: 200 * 1024 * 1024)
     }
-    var exited: Set<Int> = [], sends: [Int] = [], hold = false, failIdentity = false, failObservation = false
+    var exited: Set<Int> = [], sends: [Int] = [], hold = false, failIdentity = false, failObservation = false, restart = false
     func snapshot() -> MemorySnapshot {
-        lock.lock(); defer { lock.unlock() }; return .init(processes: roots.filter { !exited.contains($0.pid) })
+        lock.lock(); defer { lock.unlock() }; var processes = [main] + roots.filter { !exited.contains($0.pid) }
+        if restart, let first = roots.first, exited.contains(first.pid) {
+            var replacement = first; replacement.pid += 20; replacement.startTimeTicks += 100
+            replacement.startedAt = Date()
+            processes.append(replacement)
+        }
+        return .init(processes: processes)
     }
     func control() -> ProcessControl {
         ProcessControl(sample: {
@@ -101,14 +110,15 @@ final class OptimizationFixture: @unchecked Sendable {
     }
 }
 @MainActor func optimizationChecks(_ base: URL) async throws {
-    for scenario in ["success", "single", "held", "identity", "cancel", "observation"] {
+    for scenario in ["success", "single", "held", "identity", "cancel", "observation", "restart"] {
         let fixture = OptimizationFixture()
         fixture.hold = scenario == "held" || scenario == "cancel"
         fixture.failIdentity = scenario == "identity"
         fixture.failObservation = scenario == "observation"
+        fixture.restart = scenario == "restart"
         let state = MemoryProcessActionsModel(directoryURL: base.appendingPathComponent(scenario), control: fixture.control(), observationDelays: [0.01, 0.02, 0.03])
         let snapshot = fixture.snapshot(), candidates = state.optimizationCandidates(snapshot: fixture.snapshot())
-        try expect(candidates.count == 2, "two reviewable roots")
+        try expect(candidates.count == 2, "two reviewable tool processes")
         state.startOptimization(candidates: candidates, selected: [], snapshot: snapshot, history: [])
         try expect(fixture.sends.isEmpty, "empty selection never exits")
         let selection = scenario == "single" ? Set([candidates[0].id]) : Set(candidates.map(\.id))
@@ -120,6 +130,11 @@ final class OptimizationFixture: @unchecked Sendable {
         try await idle(state)
         try expect(fixture.sends.count == (scenario == "success" ? 2 : scenario == "identity" ? 0 : 1), "batch only continues after verified exit; no duplicate submission")
         try expect(state.records.count == fixture.sends.count, "one persisted receipt per accepted exit")
+        try expect(!fixture.sends.contains(fixture.main.pid), "application root never receives a signal")
+        if scenario == "restart" {
+            try expect(state.records.first?.observation?.replacementPIDs.isEmpty == false, "respawn shown separately from the exited original")
+            try expect(state.optimizationMessage?.contains("新实例") == true, "respawn stops remaining tools and informs user")
+        }
         if scenario == "success" {
             try expect(state.records.allSatisfy { $0.observation?.state == .exited && $0.effectComplete == true }, "all exits observed")
             try expect(state.optimizationMessage?.contains("-400.0 MiB") == true, "whole-batch measured comparison")
@@ -130,6 +145,13 @@ final class OptimizationFixture: @unchecked Sendable {
     let candidates = state.optimizationCandidates(snapshot: fixture.snapshot())
     state.startOptimization(candidates: candidates, selected: Set(candidates.map(\.id)), snapshot: .init(capturedAt: Date().addingTimeInterval(-40), processes: fixture.roots), history: [])
     try expect(fixture.sends.isEmpty && !state.isOptimizing, "stale scan cannot execute")
+    let nested = OptimizationFixture()
+    nested.roots[1].parentPID = nested.roots[0].pid
+    let nestedState = MemoryProcessActionsModel(directoryURL: base.appendingPathComponent("nested"), control: nested.control())
+    let nestedSnapshot = nested.snapshot(), nestedCandidates = nestedState.optimizationCandidates(snapshot: nestedSnapshot)
+    nestedState.startOptimization(candidates: nestedCandidates, selected: Set(nestedCandidates.map(\.id)), snapshot: nestedSnapshot, history: [])
+    try expect(nested.sends.isEmpty && !nestedState.isOptimizing, "parent and descendant cannot be selected together")
+    try expect(nestedState.optimizationMessage?.contains("父子关系") == true, "overlap refusal is explained")
     print("PASS optimization selection, serial verified exits, stop, refusal, stale scan and measured effects")
 }
 @MainActor func runChecks() async throws {
@@ -215,6 +237,13 @@ final class OptimizationFixture: @unchecked Sendable {
                "a failed final check cannot enable force or repeat the original request")
     print("PASS final observation failures invalidate earlier live status and keep force disabled")
 
+    if let path = ProcessInfo.processInfo.environment["GPT_ACTION_LIVE_HISTORY"] {
+        let store = try MemoryStore(url: URL(fileURLWithPath: path), readOnly: true)
+        if let snapshot = try store.latest() {
+            let tools = MemoryOptimizationPlanner.candidates(snapshot: snapshot, protectedPIDs: [], minimumBytes: 0)
+            print("READ-ONLY LIVE HISTORY: \(tools.count) eligible tools, \(tools.filter { $0.process.footprintBytes >= 32 * 1024 * 1024 }.count) at least 32 MiB; no real signals")
+        }
+    }
     print("PROCESS ACTION CHECKS PASSED: 6 workflows, \(assertions) assertions; all signals mocked")
     #if RENDER_ACTIONS
     if let output = ProcessInfo.processInfo.environment["GPT_ACTION_RENDER_DIR"] {

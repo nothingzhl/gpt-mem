@@ -26,29 +26,42 @@ final class ProcessControlTests: XCTestCase {
         }
     }
 
-    func testOptimizationProtectsWholeFamilyAndOnlyRecommendsRoots() {
+    func testToolPlannerProtectsAncestorsAndKeepsUnrelatedTools() {
         let fixture = Fixture()
-        var root = fixture.root; root.footprintBytes = 200 * 1024 * 1024
-        var child = fixture.process; child.footprintBytes = 300 * 1024 * 1024
-        let snapshot = MemorySnapshot(processes: [root, child])
-        let candidates = MemoryOptimizationPlanner.candidates(snapshot: snapshot, protectedPIDs: [])
+        var tool = fixture.process; tool.footprintBytes = 100 * 1024 * 1024
+        let snapshot = MemorySnapshot(processes: [fixture.root, tool])
+        let candidates = MemoryOptimizationPlanner.candidates(snapshot: snapshot, protectedPIDs: [fixture.root.pid])
         XCTAssertEqual(candidates.count, 1)
-        XCTAssertEqual(candidates.first?.process.key, root.key)
-        XCTAssertEqual(candidates.first?.familyBytes, 500 * 1024 * 1024)
-        XCTAssertEqual(candidates.first?.relatedProcessCount, 1)
-        XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: snapshot, protectedPIDs: [child.pid]).isEmpty)
-        root.ownership = "remembered_ancestry"
-        XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: .init(processes: [root, child]), protectedPIDs: []).isEmpty)
-        root.ownership = "process_tree"; root.rootKey = "unknown"
-        XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: .init(processes: [root, child]), protectedPIDs: []).isEmpty)
+        XCTAssertEqual(candidates.first?.process.key, tool.key)
+        XCTAssertEqual(candidates.first?.rootProcess.key, fixture.root.key)
+        XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: snapshot, protectedPIDs: [tool.pid]).isEmpty)
+        tool.ownership = "remembered_ancestry"
+        XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: .init(processes: [fixture.root, tool]), protectedPIDs: []).isEmpty)
+        tool.ownership = "process_tree"; tool.parentPID = 1
+        XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: .init(processes: [fixture.root, tool]), protectedPIDs: []).isEmpty)
     }
 
-    func testOptimizationRejectsSmallFamiliesAndOverflow() {
+    func testToolPlannerRoleThresholdAndActivity() {
         let fixture = Fixture()
+        var tool = fixture.process
         XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: fixture.snapshot, protectedPIDs: []).isEmpty)
-        var root = fixture.root; root.footprintBytes = UInt64.max
-        var child = fixture.process; child.footprintBytes = 1
-        XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: .init(processes: [root, child]), protectedPIDs: []).isEmpty)
+        XCTAssertEqual(MemoryOptimizationPlanner.candidates(snapshot: fixture.snapshot, protectedPIDs: [], minimumBytes: 0).count, 1)
+        tool.footprintBytes = 100 * 1024 * 1024
+        for role in [ProcessRole.renderer, .gpu, .appMain, .codexBackend, .unknownNode, .other] {
+            tool.role = role
+            XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: .init(processes: [fixture.root, tool]), protectedPIDs: []).isEmpty)
+        }
+        tool.role = .repl; tool.cpuPercent = 0
+        let now = Date()
+        let snapshot = MemorySnapshot(capturedAt: now, processes: [fixture.root, tool])
+        XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: snapshot, protectedPIDs: []).first!.activity.contains("数据不足"))
+        let past = MemorySnapshot(capturedAt: now.addingTimeInterval(-30), processes: [fixture.root, tool])
+        XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: snapshot, protectedPIDs: [], history: [past]).first!.activity.contains("不能判定空闲"))
+        tool.cpuPercent = 4
+        let active = MemorySnapshot(capturedAt: now.addingTimeInterval(-15), processes: [fixture.root, tool])
+        XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: snapshot, protectedPIDs: [], history: [past, active]).first!.activity.contains("观测到 CPU 活动"))
+        var observerAncestor = tool; observerAncestor.pid += 1; observerAncestor.parentPID = tool.pid; observerAncestor.startTimeTicks += 1
+        XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: .init(processes: [fixture.root, tool, observerAncestor]), protectedPIDs: [observerAncestor.pid]).isEmpty)
     }
 
     func testSignalAcceptanceIsNotAnExitAndEffectsAreMeasured() throws {

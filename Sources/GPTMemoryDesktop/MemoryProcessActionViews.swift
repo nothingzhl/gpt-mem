@@ -104,31 +104,40 @@ struct MemoryProcessActionHistory: View {
 }
 
 
+private struct MemoryOptimizationReview: Identifiable {
+    let id = UUID()
+    let candidates: [MemoryOptimizationCandidate]
+    let snapshot: MemorySnapshot?
+    let history: [MemorySnapshot]
+}
+
 struct MemoryOptimizationControl: View {
     @ObservedObject var model: MemoryProcessActionsModel
     let snapshot: MemorySnapshot?
     let history: [MemorySnapshot]
     var isBusy = false
-    @State private var showsPlan = false
-    @State private var candidates: [MemoryOptimizationCandidate] = []
+    @State private var review: MemoryOptimizationReview?
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Button { candidates = model.optimizationCandidates(snapshot: snapshot); showsPlan = true } label: {
-                    Label("一键优化内存…", systemImage: "wand.and.stars")
+                Button {
+                    review = MemoryOptimizationReview(candidates: model.optimizationCandidates(snapshot: snapshot, history: history, minimumBytes: 0),
+                                                      snapshot: snapshot, history: history)
+                } label: {
+                    Label("内存处理…", systemImage: "wand.and.stars")
                 }.disabled(isBusy || model.hasPendingWork || model.pending != nil || snapshot == nil)
                 if model.isOptimizing {
                     ProgressView().controlSize(.small)
                     Button("停止后续处理") { model.stopOptimization() }
                 }
-                Text("扫描高占用应用，选择后正常退出").font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
+                Text("查看 GPT 后台工具，确认后单独处理").font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
                 Spacer()
             }
             if let message = model.optimizationMessage {
                 Text(message).font(.system(size: 11)).textSelection(.enabled)
             }
-        }.sheet(isPresented: $showsPlan) {
-            MemoryOptimizationPlan(model: model, candidates: candidates, snapshot: snapshot, history: history)
+        }.sheet(item: $review) { review in
+            MemoryOptimizationPlan(model: model, candidates: review.candidates, snapshot: review.snapshot, history: review.history)
         }
     }
 }
@@ -140,29 +149,35 @@ struct MemoryOptimizationPlan: View {
     let history: [MemorySnapshot]
     @State private var selected: Set<String> = []
     @State private var confirms = false
+    @State private var showAll = false
+    private var visibleCandidates: [MemoryOptimizationCandidate] { candidates.filter { showAll || $0.process.footprintBytes >= 32 * 1024 * 1024 } }
     @Environment(\.dismiss) private var dismiss
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("内存优化方案").font(.system(size: 20, weight: .semibold))
-            Text("按应用及子进程的已知 Footprint 排序，列出占用至少 128 MiB 的应用。高占用不代表空闲；只选择你已经不用的应用。")
+            Text("后台工具内存处理").font(.system(size: 20, weight: .semibold))
+            Text("按单个工具进程占用排序，优先显示至少 32 MiB 的 MCP、REPL 和工具执行器。近期 CPU 仅供参考；请确认该工具已经不用。")
                 .font(.system(size: 12)).fixedSize(horizontal: false, vertical: true)
-            Text("退出会关闭应用窗口，并可能中断其中的会话、工具及未保存任务。不会自动强杀；当前观察器所在应用不会推荐。")
+            Text("只向所选工具进程发送正常退出信号，可能中断工具任务并影响其子进程。主应用、页面渲染和 GPU 不在此列表；不自动强杀。")
                 .font(.system(size: 12)).foregroundStyle(MemoryStyle.orange).fixedSize(horizontal: false, vertical: true)
+            Toggle("显示全部可处理工具（包含低于 32 MiB）", isOn: $showAll)
+                .onChange(of: showAll) { _, _ in selected = [] }
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    if candidates.isEmpty {
-                        Text("当前没有可推荐的对象。可能占用较低、目标属于受保护的应用，或采样已过期；刷新后可重新扫描。")
+                    if visibleCandidates.isEmpty {
+                        Text("当前没有匹配工具。可以显示全部工具，或取消后刷新再扫描；归属不明及观察器的祖先进程不会列出。")
                             .font(.system(size: 12)).foregroundStyle(MemoryStyle.secondary)
                     }
-                    ForEach(candidates) { candidate in
+                    ForEach(visibleCandidates) { candidate in
                         Toggle(isOn: Binding(get: { selected.contains(candidate.id) }, set: {
                             if $0 { selected.insert(candidate.id) } else { selected.remove(candidate.id) }
                         })) {
                             VStack(alignment: .leading, spacing: 5) {
-                                Text("\(MemoryFormat.executable(candidate.process.executable)) · PID \(candidate.process.pid) · \(MemoryFormat.bytes(candidate.familyBytes))")
+                                Text("\(MemoryFormat.executable(candidate.process.executable)) · PID \(candidate.process.pid) · \(MemoryFormat.bytes(candidate.process.footprintBytes))")
                                     .font(.system(size: 13, weight: .medium))
-                                Text("包含 \(candidate.relatedProcessCount) 个关联子进程 · \(MemoryFormat.date(candidate.process.startedAt)) 启动")
+                                Text("\(candidate.process.role.label) · \(candidate.relatedProcessCount) 个下级进程 · \(MemoryFormat.date(candidate.process.startedAt)) 启动")
                                     .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
+                                Text("所属：\(MemoryFormat.executable(candidate.rootProcess.executable)) · PID \(candidate.rootProcess.pid)").font(.system(size: 11))
+                                Text(candidate.activity).font(.system(size: 11)).foregroundStyle(MemoryStyle.orange)
                                 Text(candidate.process.executable).font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary).textSelection(.enabled)
                             }
                         }.toggleStyle(.checkbox).padding(12).frame(maxWidth: .infinity, alignment: .leading)
@@ -170,20 +185,21 @@ struct MemoryOptimizationPlan: View {
                     }
                 }
             }.frame(minHeight: 130, maxHeight: 280)
-            Text("已选 \(selected.count) 个应用。占用是扫描时的测量值，不能保证全部释放。执行前重新校验身份，每个目标观察 10 秒；拒绝退出或状态不明时停止后续处理。")
+            Text("已选 \(selected.count) 个工具进程。占用是扫描时的测量值，不能保证全部释放。执行前重新校验身份，每个目标观察 10 秒；拒绝退出、出现新实例或状态不明时停止后续处理。")
                 .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary).fixedSize(horizontal: false, vertical: true)
+            if let message = model.optimizationMessage { Text(message).font(.system(size: 11)).foregroundStyle(MemoryStyle.orange) }
             HStack {
                 Spacer()
                 Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("正常退出所选应用…") { confirms = true }.disabled(selected.isEmpty || model.hasPendingWork)
+                Button("请求退出所选进程…") { confirms = true }.disabled(selected.isEmpty || model.hasPendingWork)
             }.controlSize(.large)
         }.padding(24).frame(width: 620)
-            .alert("确认正常退出 \(selected.count) 个应用？", isPresented: $confirms) {
+            .alert("确认正常退出 \(selected.count) 个工具进程？", isPresented: $confirms) {
                 Button("取消", role: .cancel) {}
                 Button("确认退出", role: .destructive) {
                     model.startOptimization(candidates: candidates, selected: selected, snapshot: snapshot, history: history)
-                    dismiss()
+                    if model.isOptimizing { dismiss() }
                 }
-            } message: { Text("请先保存任务。所选应用及其关联工具可能停止；退出请求无法撤回。") }
+            } message: { Text("请先保存任务。所选工具任务及其下级进程可能受影响；退出请求无法撤回。") }
     }
 }

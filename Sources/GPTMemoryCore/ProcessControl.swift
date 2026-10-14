@@ -198,32 +198,61 @@ public final class ProcessControl: @unchecked Sendable {
 }
 
 
-/// Review whole applications rather than guessing which renderer or tool is idle.
+/// CPU is a measured activity hint, never proof that a task is idle.
 public struct MemoryOptimizationCandidate: Identifiable, Sendable {
     public let process: ProcessSample
-    public let familyBytes: UInt64
+    public let rootProcess: ProcessSample
     public let relatedProcessCount: Int
+    public let activity: String
     public var id: String { process.key }
 }
 
 public enum MemoryOptimizationPlanner {
-    public static func candidates(snapshot: MemorySnapshot, protectedPIDs: Set<Int>, minimumBytes: UInt64 = 128 * 1024 * 1024) -> [MemoryOptimizationCandidate] {
-        // Protect the entire family containing the observer's ancestors, not only their PID.
-        let protectedRoots = Set(snapshot.processes.filter { protectedPIDs.contains($0.pid) }.map(\.rootKey))
-        return snapshot.processes.compactMap { root in
-            guard root.role == .appMain, root.key == root.rootKey,
-                  root.ownership == "process_tree", root.pid > 1, root.pid <= Int(Int32.max),
-                  ProcessControl.birth(root) > 0, !protectedPIDs.contains(root.pid),
-                  !protectedRoots.contains(root.key) else { return nil }
-            let family = snapshot.processes.filter { $0.rootKey == root.key }
-            var total: UInt64 = 0
-            for process in family {
-                let sum = total.addingReportingOverflow(process.footprintBytes)
-                guard !sum.overflow else { return nil }
-                total = sum.partialValue
+    public static let supportedRoles: Set<ProcessRole> = [.mcpApp, .mcpCodeReview, .mcpMySQL, .mcpCUA, .repl, .toolWorker]
+
+    public static func isDescendant(_ child: ProcessSample, of target: ProcessSample, in snapshot: MemorySnapshot) -> Bool {
+        var current = child
+        var visited: Set<Int> = []
+        for _ in 0..<64 {
+            guard visited.insert(current.pid).inserted,
+                  let parent = snapshot.processes.first(where: { $0.pid == current.parentPID }),
+                  parent.rootKey == child.rootKey,
+                  ProcessControl.birth(parent) <= ProcessControl.birth(current) else { return false }
+            if parent.key == target.key { return true }
+            current = parent
+        }
+        return false
+    }
+
+    public static func candidates(snapshot: MemorySnapshot, protectedPIDs: Set<Int>, minimumBytes: UInt64 = 32 * 1024 * 1024, history: [MemorySnapshot] = []) -> [MemoryOptimizationCandidate] {
+        snapshot.processes.compactMap { process in
+            guard supportedRoles.contains(process.role), process.ownership == "process_tree",
+                  process.pid > 1, process.pid <= Int(Int32.max), ProcessControl.birth(process) > 0,
+                  !protectedPIDs.contains(process.pid), process.footprintBytes >= minimumBytes,
+                  let root = snapshot.processes.first(where: { $0.key == process.rootKey }),
+                  root.role == .appMain, root.key == root.rootKey, root.ownership == "process_tree",
+                  ProcessClassifier.isAppRoot(executable: root.executable),
+                  isDescendant(process, of: root, in: snapshot) else { return nil }
+            let descendants = snapshot.processes.filter { isDescendant($0, of: process, in: snapshot) }
+            guard !descendants.contains(where: { protectedPIDs.contains($0.pid) }) else { return nil }
+            var samples = history.filter {
+                $0.capturedAt >= snapshot.capturedAt.addingTimeInterval(-120) && $0.capturedAt <= snapshot.capturedAt
             }
-            guard total >= minimumBytes else { return nil }
-            return MemoryOptimizationCandidate(process: root, familyBytes: total, relatedProcessCount: max(0, family.count - 1))
-        }.sorted { $0.familyBytes == $1.familyBytes ? $0.process.pid < $1.process.pid : $0.familyBytes > $1.familyBytes }
+            if !samples.contains(where: { $0.id == snapshot.id }) { samples.append(snapshot) }
+            samples.sort { $0.capturedAt < $1.capturedAt }
+            let values = samples.compactMap { sample -> Double? in
+                guard let value = sample.processes.first(where: { $0.key == process.key && $0.executable == process.executable })?.cpuPercent,
+                      value.isFinite, value >= 0 else { return nil }
+                return value
+            }
+            let activity: String
+            if values.contains(where: { $0 >= 1 }) { activity = "近 2 分钟观测到 CPU 活动；可能正在执行任务" }
+            else if samples.count >= 2, values.count == samples.count,
+                    let first = samples.first, let last = samples.last, last.capturedAt.timeIntervalSince(first.capturedAt) >= 15 {
+                activity = "近期 CPU 较低；等待中的任务仍可能存活，不能判定空闲"
+            } else { activity = "近期活动数据不足；任务状态未知" }
+            return MemoryOptimizationCandidate(process: process, rootProcess: root,
+                relatedProcessCount: descendants.count, activity: activity)
+        }.sorted { $0.process.footprintBytes == $1.process.footprintBytes ? $0.process.pid < $1.process.pid : $0.process.footprintBytes > $1.process.footprintBytes }
     }
 }
