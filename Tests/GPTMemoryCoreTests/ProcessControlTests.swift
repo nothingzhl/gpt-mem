@@ -26,6 +26,31 @@ final class ProcessControlTests: XCTestCase {
         }
     }
 
+    func testOptimizationProtectsWholeFamilyAndOnlyRecommendsRoots() {
+        let fixture = Fixture()
+        var root = fixture.root; root.footprintBytes = 200 * 1024 * 1024
+        var child = fixture.process; child.footprintBytes = 300 * 1024 * 1024
+        let snapshot = MemorySnapshot(processes: [root, child])
+        let candidates = MemoryOptimizationPlanner.candidates(snapshot: snapshot, protectedPIDs: [])
+        XCTAssertEqual(candidates.count, 1)
+        XCTAssertEqual(candidates.first?.process.key, root.key)
+        XCTAssertEqual(candidates.first?.familyBytes, 500 * 1024 * 1024)
+        XCTAssertEqual(candidates.first?.relatedProcessCount, 1)
+        XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: snapshot, protectedPIDs: [child.pid]).isEmpty)
+        root.ownership = "remembered_ancestry"
+        XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: .init(processes: [root, child]), protectedPIDs: []).isEmpty)
+        root.ownership = "process_tree"; root.rootKey = "unknown"
+        XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: .init(processes: [root, child]), protectedPIDs: []).isEmpty)
+    }
+
+    func testOptimizationRejectsSmallFamiliesAndOverflow() {
+        let fixture = Fixture()
+        XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: fixture.snapshot, protectedPIDs: []).isEmpty)
+        var root = fixture.root; root.footprintBytes = UInt64.max
+        var child = fixture.process; child.footprintBytes = 1
+        XCTAssertTrue(MemoryOptimizationPlanner.candidates(snapshot: .init(processes: [root, child]), protectedPIDs: []).isEmpty)
+    }
+
     func testSignalAcceptanceIsNotAnExitAndEffectsAreMeasured() throws {
         let fixture = Fixture(), control = fixture.control()
         let receipt = try control.execute(process: fixture.process, kind: .request)

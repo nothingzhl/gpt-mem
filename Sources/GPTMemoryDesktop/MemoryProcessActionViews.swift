@@ -102,3 +102,88 @@ struct MemoryProcessActionHistory: View {
         }
     }
 }
+
+
+struct MemoryOptimizationControl: View {
+    @ObservedObject var model: MemoryProcessActionsModel
+    let snapshot: MemorySnapshot?
+    let history: [MemorySnapshot]
+    var isBusy = false
+    @State private var showsPlan = false
+    @State private var candidates: [MemoryOptimizationCandidate] = []
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Button { candidates = model.optimizationCandidates(snapshot: snapshot); showsPlan = true } label: {
+                    Label("一键优化内存…", systemImage: "wand.and.stars")
+                }.disabled(isBusy || model.hasPendingWork || model.pending != nil || snapshot == nil)
+                if model.isOptimizing {
+                    ProgressView().controlSize(.small)
+                    Button("停止后续处理") { model.stopOptimization() }
+                }
+                Text("扫描高占用应用，选择后正常退出").font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
+                Spacer()
+            }
+            if let message = model.optimizationMessage {
+                Text(message).font(.system(size: 11)).textSelection(.enabled)
+            }
+        }.sheet(isPresented: $showsPlan) {
+            MemoryOptimizationPlan(model: model, candidates: candidates, snapshot: snapshot, history: history)
+        }
+    }
+}
+
+struct MemoryOptimizationPlan: View {
+    @ObservedObject var model: MemoryProcessActionsModel
+    let candidates: [MemoryOptimizationCandidate]
+    let snapshot: MemorySnapshot?
+    let history: [MemorySnapshot]
+    @State private var selected: Set<String> = []
+    @State private var confirms = false
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("内存优化方案").font(.system(size: 20, weight: .semibold))
+            Text("按应用及子进程的已知 Footprint 排序，列出占用至少 128 MiB 的应用。高占用不代表空闲；只选择你已经不用的应用。")
+                .font(.system(size: 12)).fixedSize(horizontal: false, vertical: true)
+            Text("退出会关闭应用窗口，并可能中断其中的会话、工具及未保存任务。不会自动强杀；当前观察器所在应用不会推荐。")
+                .font(.system(size: 12)).foregroundStyle(MemoryStyle.orange).fixedSize(horizontal: false, vertical: true)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    if candidates.isEmpty {
+                        Text("当前没有可推荐的对象。可能占用较低、目标属于受保护的应用，或采样已过期；刷新后可重新扫描。")
+                            .font(.system(size: 12)).foregroundStyle(MemoryStyle.secondary)
+                    }
+                    ForEach(candidates) { candidate in
+                        Toggle(isOn: Binding(get: { selected.contains(candidate.id) }, set: {
+                            if $0 { selected.insert(candidate.id) } else { selected.remove(candidate.id) }
+                        })) {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text("\(MemoryFormat.executable(candidate.process.executable)) · PID \(candidate.process.pid) · \(MemoryFormat.bytes(candidate.familyBytes))")
+                                    .font(.system(size: 13, weight: .medium))
+                                Text("包含 \(candidate.relatedProcessCount) 个关联子进程 · \(MemoryFormat.date(candidate.process.startedAt)) 启动")
+                                    .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
+                                Text(candidate.process.executable).font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary).textSelection(.enabled)
+                            }
+                        }.toggleStyle(.checkbox).padding(12).frame(maxWidth: .infinity, alignment: .leading)
+                            .background(MemoryStyle.surface).clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                }
+            }.frame(minHeight: 130, maxHeight: 280)
+            Text("已选 \(selected.count) 个应用。占用是扫描时的测量值，不能保证全部释放。执行前重新校验身份，每个目标观察 10 秒；拒绝退出或状态不明时停止后续处理。")
+                .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("正常退出所选应用…") { confirms = true }.disabled(selected.isEmpty || model.hasPendingWork)
+            }.controlSize(.large)
+        }.padding(24).frame(width: 620)
+            .alert("确认正常退出 \(selected.count) 个应用？", isPresented: $confirms) {
+                Button("取消", role: .cancel) {}
+                Button("确认退出", role: .destructive) {
+                    model.startOptimization(candidates: candidates, selected: selected, snapshot: snapshot, history: history)
+                    dismiss()
+                }
+            } message: { Text("请先保存任务。所选应用及其关联工具可能停止；退出请求无法撤回。") }
+    }
+}

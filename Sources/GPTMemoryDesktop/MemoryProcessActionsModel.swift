@@ -52,7 +52,48 @@ final class MemoryProcessActionsModel: ObservableObject {
     private var pendingWrites = 0
     private let observationDelays: [Double]
     private let protectedPIDs = ProcessControl.observerAncestors()
-    var hasPendingWork: Bool { isBusy || isObserving || isSavingRecords }
+    @Published private(set) var isOptimizing = false
+    @Published private(set) var optimizationMessage: String?
+    private var optimizationQueue: [MemoryProcessActionRequest] = []
+    private var optimizationFirstReceipt: ProcessExitReceipt?
+    private var optimizationCompleted = 0
+    var hasPendingWork: Bool { isBusy || isObserving || isSavingRecords || isOptimizing }
+
+    func optimizationCandidates(snapshot: MemorySnapshot?) -> [MemoryOptimizationCandidate] {
+        guard let snapshot, Date().timeIntervalSince(snapshot.capturedAt) <= 30 else { return [] }
+        return MemoryOptimizationPlanner.candidates(snapshot: snapshot, protectedPIDs: protectedPIDs)
+            .filter { canRequest($0.process) }
+    }
+
+    func startOptimization(candidates: [MemoryOptimizationCandidate], selected: Set<String>, snapshot: MemorySnapshot?, history: [MemorySnapshot]) {
+        guard !isBusy, !isObserving, !isOptimizing, pending == nil, let snapshot,
+              Date().timeIntervalSince(snapshot.capturedAt) <= 30 else {
+            optimizationMessage = "采样已过期或有其他操作，请刷新后重新扫描。"; return
+        }
+        let allowed = Set(optimizationCandidates(snapshot: snapshot).map(\.id))
+        let targets = candidates.filter { selected.contains($0.id) }
+        guard !targets.isEmpty, targets.allSatisfy({ allowed.contains($0.id) }) else {
+            optimizationMessage = "目标已变化，请重新扫描。"; return
+        }
+        optimizationQueue = targets.map { .init(process: $0.process, kind: .request,
+            relatedProcessCount: $0.relatedProcessCount, trend: Self.trend(for: $0.process, in: history)) }
+        optimizationFirstReceipt = nil; optimizationCompleted = 0; isOptimizing = true
+        optimizationMessage = "依次正常退出所选应用，每个对象观察完成后继续。"
+        advanceOptimization()
+    }
+
+    func stopOptimization() {
+        optimizationQueue = []
+        optimizationMessage = "已停止后续退出；已经发送的请求仍会完成状态检查。"
+        if !isBusy && !isObserving { isOptimizing = false }
+    }
+
+    private func advanceOptimization() {
+        guard !optimizationQueue.isEmpty else { isOptimizing = false; return }
+        pending = optimizationQueue.removeFirst()
+        executePending()
+    }
+
 
     init(directoryURL: URL, control: ProcessControl = ProcessControl(send: MemoryProcessActionsModel.sendDesktop), observationDelays: [Double] = [1, 5, 10]) {
         self.directoryURL = directoryURL; self.control = control
@@ -79,7 +120,7 @@ final class MemoryProcessActionsModel: ObservableObject {
     }
 
     func prepare(_ process: ProcessSample, kind: ProcessExitKind, snapshot: MemorySnapshot?, history: [MemorySnapshot] = []) {
-        guard !isBusy, !isObserving, pending == nil else { return }
+        guard !isBusy, !isObserving, !isOptimizing, pending == nil else { return }
         guard let snapshot, snapshot.processes.contains(where: { $0.key == process.key }), canRequest(process) else {
             message = "目标当前不可操作，请刷新并重新选择。"; return
         }
@@ -96,7 +137,7 @@ final class MemoryProcessActionsModel: ObservableObject {
     }
 
     func canForce(_ process: ProcessSample) -> Bool {
-        guard !isBusy, !isObserving, let record = latestExit(for: process),
+        guard !isBusy, !isObserving, !isOptimizing, let record = latestExit(for: process),
               let receipt = record.receipt, receipt.kind == .request,
               receipt.process.key == process.key, record.effectComplete == true,
               record.observationFailed != true, record.observation?.state == .running else { return false }
@@ -107,6 +148,11 @@ final class MemoryProcessActionsModel: ObservableObject {
     }
 
     func confirm() {
+        guard !isOptimizing else { return }
+        executePending()
+    }
+
+    private func executePending() {
         guard !isBusy, !isObserving, let request = pending else { return }
         pending = nil; isBusy = true; message = nil
         let previous = latestExit(for: request.process)?.receipt
@@ -119,6 +165,7 @@ final class MemoryProcessActionsModel: ObservableObject {
                     let record = MemoryProcessActionRecord(id: receipt.id, process: receipt.process,
                         createdAt: receipt.requestedAt, receipt: receipt, trend: request.trend)
                     self.publish(record)
+                    if self.isOptimizing && self.optimizationFirstReceipt == nil { self.optimizationFirstReceipt = receipt }
                     self.message = "\(request.kind.label)请求已发送；正在核实目标和处理后占用。"
                     self.persist(record)
                     self.didRequestExit?()
@@ -127,7 +174,13 @@ final class MemoryProcessActionsModel: ObservableObject {
                     }
                 }
             } catch {
-                DispatchQueue.main.async { self?.isBusy = false; self?.message = Self.describe(error) }
+                DispatchQueue.main.async {
+                    self?.isBusy = false; self?.message = Self.describe(error)
+                    if self?.isOptimizing == true {
+                        self?.optimizationQueue = []; self?.isOptimizing = false
+                        self?.optimizationMessage = "优化已停止：" + Self.describe(error)
+                    }
+                }
             }
         }
     }
@@ -144,12 +197,29 @@ final class MemoryProcessActionsModel: ObservableObject {
                     record.observation = observation; record.observationFailed = false; record.effectComplete = final
                     self.publish(record); self.persist(record)
                     self.message = observation.state.label + (final ? "。效果记录已更新。" : "；继续观察到 10 秒。")
+                    if final && self.isOptimizing {
+                        if observation.state == .exited {
+                            self.optimizationCompleted += 1
+                            let delta = self.optimizationFirstReceipt.map {
+                                ProcessExitObservation(receipt: $0, state: observation.state, after: observation.after).knownTotalChange
+                            } ?? nil
+                            self.optimizationMessage = "已确认退出 \(self.optimizationCompleted) 个应用。已知应用总占用变化：\(delta.map { String(format: "%+.1f MiB", Double($0) / 1048576) } ?? "指标不完整")。变化包含期间其他活动，并非保证释放量。"
+                            self.advanceOptimization()
+                        } else {
+                            self.optimizationQueue = []; self.isOptimizing = false
+                            self.optimizationMessage = "优化已停止：目标\(observation.state.label)，未继续退出其他应用。可在操作记录中查看结果。"
+                        }
+                    }
                 case .failure(let error):
                     if var record = self.records.first(where: { $0.id == receipt.id }) {
                         record.observationFailed = true; record.effectComplete = final
                         self.publish(record); self.persist(record)
                     }
                     self.message = "退出请求已经发送；效果检查失败：\(Self.describe(error))"
+                    if final && self.isOptimizing {
+                        self.optimizationQueue = []; self.isOptimizing = false
+                        self.optimizationMessage = "优化已停止：无法确认退出效果，未继续处理后续应用。"
+                    }
                 }
             }
         }

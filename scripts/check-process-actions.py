@@ -72,8 +72,69 @@ final class Fixture: @unchecked Sendable {
 @MainActor func idle(_ model: MemoryProcessActionsModel) async throws {
     try await waitFor({ !model.hasPendingWork }, "action/observation/persistence did not complete")
 }
+final class OptimizationFixture: @unchecked Sendable {
+    let lock = NSLock()
+    var roots: [ProcessSample] = (0..<2).map { offset in
+        let pid = 223455 + offset
+        return ProcessSample(bootID: "opt", pid: pid, parentPID: 1, startTimeTicks: UInt64(offset + 1),
+            startedAt: Date(timeIntervalSince1970: Double(offset + 1)), executable: "/Applications/Codex.app/Contents/MacOS/Codex",
+            role: .appMain, rootKey: "opt:\(pid):\(offset + 1)", footprintBytes: 200 * 1024 * 1024)
+    }
+    var exited: Set<Int> = [], sends: [Int] = [], hold = false, failIdentity = false, failObservation = false
+    func snapshot() -> MemorySnapshot {
+        lock.lock(); defer { lock.unlock() }; return .init(processes: roots.filter { !exited.contains($0.pid) })
+    }
+    func control() -> ProcessControl {
+        ProcessControl(sample: {
+            self.lock.lock(); let fails = self.failObservation && !self.sends.isEmpty; self.lock.unlock()
+            if fails { throw MemoryError.message("observation fixture failure") }
+            return self.snapshot()
+        }, read: { pid in
+            self.lock.lock(); defer { self.lock.unlock() }
+            guard let p = self.roots.first(where: { $0.pid == pid }), !self.exited.contains(pid) else { return .missing }
+            return .found(.init(birth: self.failIdentity ? 999 : p.startTimeTicks, executable: p.executable))
+        }, send: { p, kind in
+            self.lock.lock(); defer { self.lock.unlock() }
+            self.sends.append(p.pid)
+            if !self.hold { self.exited.insert(p.pid) }
+        }, protectedPIDs: [1])
+    }
+}
+@MainActor func optimizationChecks(_ base: URL) async throws {
+    for scenario in ["success", "single", "held", "identity", "cancel", "observation"] {
+        let fixture = OptimizationFixture()
+        fixture.hold = scenario == "held" || scenario == "cancel"
+        fixture.failIdentity = scenario == "identity"
+        fixture.failObservation = scenario == "observation"
+        let state = MemoryProcessActionsModel(directoryURL: base.appendingPathComponent(scenario), control: fixture.control(), observationDelays: [0.01, 0.02, 0.03])
+        let snapshot = fixture.snapshot(), candidates = state.optimizationCandidates(snapshot: fixture.snapshot())
+        try expect(candidates.count == 2, "two reviewable roots")
+        state.startOptimization(candidates: candidates, selected: [], snapshot: snapshot, history: [])
+        try expect(fixture.sends.isEmpty, "empty selection never exits")
+        let selection = scenario == "single" ? Set([candidates[0].id]) : Set(candidates.map(\.id))
+        state.startOptimization(candidates: candidates, selected: selection, snapshot: snapshot, history: [])
+        state.startOptimization(candidates: candidates, selected: Set(candidates.map(\.id)), snapshot: snapshot, history: [])
+        state.prepare(fixture.roots[1], kind: .force, snapshot: snapshot)
+        try expect(state.pending == nil, "batch blocks interleaved process confirmation")
+        if scenario == "cancel" { state.stopOptimization() }
+        try await idle(state)
+        try expect(fixture.sends.count == (scenario == "success" ? 2 : scenario == "identity" ? 0 : 1), "batch only continues after verified exit; no duplicate submission")
+        try expect(state.records.count == fixture.sends.count, "one persisted receipt per accepted exit")
+        if scenario == "success" {
+            try expect(state.records.allSatisfy { $0.observation?.state == .exited && $0.effectComplete == true }, "all exits observed")
+            try expect(state.optimizationMessage?.contains("-400.0 MiB") == true, "whole-batch measured comparison")
+        }
+    }
+    let fixture = OptimizationFixture()
+    let state = MemoryProcessActionsModel(directoryURL: base.appendingPathComponent("stale"), control: fixture.control())
+    let candidates = state.optimizationCandidates(snapshot: fixture.snapshot())
+    state.startOptimization(candidates: candidates, selected: Set(candidates.map(\.id)), snapshot: .init(capturedAt: Date().addingTimeInterval(-40), processes: fixture.roots), history: [])
+    try expect(fixture.sends.isEmpty && !state.isOptimizing, "stale scan cannot execute")
+    print("PASS optimization selection, serial verified exits, stop, refusal, stale scan and measured effects")
+}
 @MainActor func runChecks() async throws {
     let base = URL(fileURLWithPath: ProcessInfo.processInfo.environment["GPT_ACTION_CHECK_DIR"]!)
+    try await optimizationChecks(base.appendingPathComponent("optimization"))
     let fixture = Fixture(), state = model(fixture, base.appendingPathComponent("successful"))
     var reused = fixture.target; reused.startTimeTicks += 1
     let trend = [MemorySnapshot(processes: [reused]), MemorySnapshot(processes: [], unavailablePIDs: [fixture.target.pid]), fixture.snapshot()]
@@ -154,7 +215,7 @@ final class Fixture: @unchecked Sendable {
                "a failed final check cannot enable force or repeat the original request")
     print("PASS final observation failures invalidate earlier live status and keep force disabled")
 
-    print("PROCESS ACTION CHECKS PASSED: 5 workflows, \(assertions) assertions; all signals mocked")
+    print("PROCESS ACTION CHECKS PASSED: 6 workflows, \(assertions) assertions; all signals mocked")
     #if RENDER_ACTIONS
     if let output = ProcessInfo.processInfo.environment["GPT_ACTION_RENDER_DIR"] {
         try await render(force, held, output: URL(fileURLWithPath: output))
@@ -173,6 +234,8 @@ final class Fixture: @unchecked Sendable {
             focusedKey: .constant(fixture.target.key), actions: state, initiallyExpandedActionHistory: true, onDiagnose: { _ in })), 888, 620),
         ("process-actions-narrow-preview.png", AnyView(ProcessesContent(snapshot: snapshot, selectedRole: .constant(nil), isBusy: false,
             focusedKey: .constant(fixture.target.key), actions: state, initiallyExpandedActionHistory: true, onDiagnose: { _ in })), 728, 520),
+        ("memory-optimization-preview.png", AnyView(MemoryOptimizationPlan(model: state,
+            candidates: MemoryOptimizationPlanner.candidates(snapshot: OptimizationFixture().snapshot(), protectedPIDs: []), snapshot: OptimizationFixture().snapshot(), history: [])), 668, 560),
         ("process-exit-confirmation-preview.png", AnyView(MemoryProcessActionConfirmation(model: state, request: request)), 558, 470),
         ("process-force-confirmation-preview.png", AnyView(MemoryProcessActionConfirmation(model: state, request: force)), 558, 520)]
     for (name, view, width, height) in content {

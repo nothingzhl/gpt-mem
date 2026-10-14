@@ -196,3 +196,34 @@ public final class ProcessControl: @unchecked Sendable {
         }
     }
 }
+
+
+/// Review whole applications rather than guessing which renderer or tool is idle.
+public struct MemoryOptimizationCandidate: Identifiable, Sendable {
+    public let process: ProcessSample
+    public let familyBytes: UInt64
+    public let relatedProcessCount: Int
+    public var id: String { process.key }
+}
+
+public enum MemoryOptimizationPlanner {
+    public static func candidates(snapshot: MemorySnapshot, protectedPIDs: Set<Int>, minimumBytes: UInt64 = 128 * 1024 * 1024) -> [MemoryOptimizationCandidate] {
+        // Protect the entire family containing the observer's ancestors, not only their PID.
+        let protectedRoots = Set(snapshot.processes.filter { protectedPIDs.contains($0.pid) }.map(\.rootKey))
+        return snapshot.processes.compactMap { root in
+            guard root.role == .appMain, root.key == root.rootKey,
+                  root.ownership == "process_tree", root.pid > 1, root.pid <= Int(Int32.max),
+                  ProcessControl.birth(root) > 0, !protectedPIDs.contains(root.pid),
+                  !protectedRoots.contains(root.key) else { return nil }
+            let family = snapshot.processes.filter { $0.rootKey == root.key }
+            var total: UInt64 = 0
+            for process in family {
+                let sum = total.addingReportingOverflow(process.footprintBytes)
+                guard !sum.overflow else { return nil }
+                total = sum.partialValue
+            }
+            guard total >= minimumBytes else { return nil }
+            return MemoryOptimizationCandidate(process: root, familyBytes: total, relatedProcessCount: max(0, family.count - 1))
+        }.sorted { $0.familyBytes == $1.familyBytes ? $0.process.pid < $1.process.pid : $0.familyBytes > $1.familyBytes }
+    }
+}

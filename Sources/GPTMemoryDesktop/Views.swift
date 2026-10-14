@@ -54,6 +54,9 @@ struct MemoryDesktopView: View {
                 switch selectedPage {
                 case .overview:
                     ScrollView {
+                        MemoryOptimizationControl(model: model.processActions, snapshot: model.snapshot,
+                                                  history: model.history, isBusy: model.isBusy)
+                            .padding(.horizontal, 28).padding(.bottom, 12)
                         OverviewContent(snapshot: model.snapshot, history: model.history,
                                         analysis: model.analysis, minutes: $minutes,
                                         aiModel: model.aiModel, onAIAnalysis: model.prepareMemoryAIAnalysis,
@@ -579,6 +582,7 @@ struct ProcessesContent: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            MemoryOptimizationControl(model: actions, snapshot: snapshot, history: history, isBusy: isBusy)
             HStack(spacing: 12) {
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass").foregroundStyle(MemoryStyle.secondary)
@@ -594,13 +598,13 @@ struct ProcessesContent: View {
                 Spacer()
                 Text("\(rows.count) 个进程").font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
                 Button { if let selectedProcess { onDiagnose(selectedProcess) } } label: { Label("采集诊断", systemImage: "doc.text.magnifyingglass") }
-                    .disabled(selectedProcess == nil || isBusy || actions.isBusy || actions.isObserving).help("对选中的目标手动运行有界 vmmap 摘要")
+                    .disabled(selectedProcess == nil || isBusy || actions.isBusy || actions.isObserving || actions.isOptimizing).help("对选中的目标手动运行有界 vmmap 摘要")
             }
             HStack(spacing: 12) {
                 Button("请求退出") { if let selectedProcess { actions.prepare(selectedProcess, kind: .request, snapshot: snapshot, history: history) } }
-                    .disabled((selectedProcess.map { !actions.canRequest($0) } ?? true) || isBusy || actions.isBusy || actions.isObserving)
+                    .disabled((selectedProcess.map { !actions.canRequest($0) } ?? true) || isBusy || actions.isBusy || actions.isObserving || actions.isOptimizing)
                 Button("强制结束…") { if let selectedProcess { actions.prepare(selectedProcess, kind: .force, snapshot: snapshot, history: history) } }
-                    .disabled(isBusy || (selectedProcess.map { !actions.canForce($0) } ?? true))
+                    .disabled(isBusy || actions.isOptimizing || (selectedProcess.map { !actions.canForce($0) } ?? true))
                 Text("先选择目标，正常退出后仍存活时可强制结束。")
                     .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
                 Spacer()
