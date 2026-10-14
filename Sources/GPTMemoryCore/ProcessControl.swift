@@ -211,11 +211,15 @@ public enum MemoryOptimizationPlanner {
     public static let supportedRoles: Set<ProcessRole> = [.mcpApp, .mcpCodeReview, .mcpMySQL, .mcpCUA, .repl, .toolWorker]
 
     public static func isDescendant(_ child: ProcessSample, of target: ProcessSample, in snapshot: MemorySnapshot) -> Bool {
+        isDescendant(child, of: target, byPID: Dictionary(snapshot.processes.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first }))
+    }
+
+    private static func isDescendant(_ child: ProcessSample, of target: ProcessSample, byPID: [Int: ProcessSample]) -> Bool {
         var current = child
         var visited: Set<Int> = []
         for _ in 0..<64 {
             guard visited.insert(current.pid).inserted,
-                  let parent = snapshot.processes.first(where: { $0.pid == current.parentPID }),
+                  let parent = byPID[current.parentPID],
                   parent.rootKey == child.rootKey,
                   ProcessControl.birth(parent) <= ProcessControl.birth(current) else { return false }
             if parent.key == target.key { return true }
@@ -225,21 +229,23 @@ public enum MemoryOptimizationPlanner {
     }
 
     public static func candidates(snapshot: MemorySnapshot, protectedPIDs: Set<Int>, minimumBytes: UInt64 = 32 * 1024 * 1024, history: [MemorySnapshot] = []) -> [MemoryOptimizationCandidate] {
-        snapshot.processes.compactMap { process in
+        let byPID = Dictionary(snapshot.processes.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
+        let byKey = Dictionary(snapshot.processes.map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
+        var samples = history.filter {
+            $0.capturedAt >= snapshot.capturedAt.addingTimeInterval(-120) && $0.capturedAt <= snapshot.capturedAt
+        }
+        if !samples.contains(where: { $0.id == snapshot.id }) { samples.append(snapshot) }
+        samples.sort { $0.capturedAt < $1.capturedAt }
+        return snapshot.processes.compactMap { process in
             guard supportedRoles.contains(process.role), process.ownership == "process_tree",
                   process.pid > 1, process.pid <= Int(Int32.max), ProcessControl.birth(process) > 0,
                   !protectedPIDs.contains(process.pid), process.footprintBytes >= minimumBytes,
-                  let root = snapshot.processes.first(where: { $0.key == process.rootKey }),
+                  let root = byKey[process.rootKey],
                   root.role == .appMain, root.key == root.rootKey, root.ownership == "process_tree",
                   ProcessClassifier.isAppRoot(executable: root.executable),
-                  isDescendant(process, of: root, in: snapshot) else { return nil }
-            let descendants = snapshot.processes.filter { isDescendant($0, of: process, in: snapshot) }
+                  isDescendant(process, of: root, byPID: byPID) else { return nil }
+            let descendants = snapshot.processes.filter { isDescendant($0, of: process, byPID: byPID) }
             guard !descendants.contains(where: { protectedPIDs.contains($0.pid) }) else { return nil }
-            var samples = history.filter {
-                $0.capturedAt >= snapshot.capturedAt.addingTimeInterval(-120) && $0.capturedAt <= snapshot.capturedAt
-            }
-            if !samples.contains(where: { $0.id == snapshot.id }) { samples.append(snapshot) }
-            samples.sort { $0.capturedAt < $1.capturedAt }
             let values = samples.compactMap { sample -> Double? in
                 guard let value = sample.processes.first(where: { $0.key == process.key && $0.executable == process.executable })?.cpuPercent,
                       value.isFinite, value >= 0 else { return nil }

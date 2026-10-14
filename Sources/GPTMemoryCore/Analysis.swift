@@ -154,14 +154,17 @@ public enum MemoryAnalyzer {
 
     private static func makeEvents(_ snapshots: [MemorySnapshot]) -> [MemoryEvent] {
         var events: [MemoryEvent] = []
+        var preceding: [String: ProcessSample] = [:]
         for (index, current) in snapshots.enumerated() {
             for pid in Set(current.unavailablePIDs).sorted() {
                 events.append(MemoryEvent(capturedAt: current.capturedAt, kind: .measurementUnavailable,
                                           key: nil, pid: pid, role: nil, message: "PID \(pid) 未取得指标，状态未知。"))
             }
+            let b = samplesByKey(current.processes)
+            let a = preceding
+            preceding = b
             guard index > 0 else { continue }
             let previous = snapshots[index - 1]
-            let a = samplesByKey(previous.processes), b = samplesByKey(current.processes)
             let previousBoot = knownBootIDs(previous)
             let currentBoot = knownBootIDs(current)
             if !previousBoot.isEmpty && !currentBoot.isEmpty && previousBoot.isDisjoint(with: currentBoot)
