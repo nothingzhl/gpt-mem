@@ -58,9 +58,9 @@ struct GPTManagerApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
             CommandGroup(after: .toolbar) {
-                Button(model.isKnowledgeWorkspaceActive ? "刷新记忆库" : (model.isReportLibraryActive ? "刷新 AI 报告" : (model.isSessionWorkspaceActive ? "刷新 Codex 会话" : "刷新内存数据"))) { model.refreshCurrentPage() }
+                Button(model.isSpeedWorkspaceActive ? "刷新桌面速度" : (model.isKnowledgeWorkspaceActive ? "刷新记忆库" : (model.isReportLibraryActive ? "刷新 AI 报告" : (model.isSessionWorkspaceActive ? "刷新 Codex 会话" : "刷新内存数据")))) { model.refreshCurrentPage() }
                     .keyboardShortcut("r", modifiers: [.command])
-                    .disabled(!model.isKnowledgeWorkspaceActive && !model.isSessionWorkspaceActive && !model.isReportLibraryActive && model.isBusy)
+                    .disabled(!model.isSpeedWorkspaceActive && !model.isKnowledgeWorkspaceActive && !model.isSessionWorkspaceActive && !model.isReportLibraryActive && model.isBusy)
                 Button(model.isMonitoring ? "暂停采集" : "开始采集") {
                     model.isMonitoring ? model.stopMonitoring() : model.startMonitoring()
                 }.keyboardShortcut("p", modifiers: [.command, .shift])

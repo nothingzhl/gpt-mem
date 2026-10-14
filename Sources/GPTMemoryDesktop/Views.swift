@@ -3,7 +3,7 @@ import Charts
 import GPTMemoryCore
 
 private enum MemoryPage: String, CaseIterable, Identifiable {
-    case overview, processes, history, sessions, knowledge, reports, settings
+    case overview, processes, history, sessions, speed, knowledge, reports, settings
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -11,6 +11,7 @@ private enum MemoryPage: String, CaseIterable, Identifiable {
         case .processes: return "进程明细"
         case .history: return "历史与报告"
         case .sessions: return "Codex 工作区"
+        case .speed: return "桌面模型速度"
         case .knowledge: return "记忆管理"
         case .reports: return "AI 报告库"
         case .settings: return "设置"
@@ -22,6 +23,7 @@ private enum MemoryPage: String, CaseIterable, Identifiable {
         case .processes: return "list.bullet.rectangle"
         case .history: return "clock.arrow.circlepath"
         case .sessions: return "folder"
+        case .speed: return "speedometer"
         case .knowledge: return "brain"
         case .reports: return "doc.text"
         case .settings: return "slider.horizontal.3"
@@ -33,6 +35,7 @@ private enum MemoryPage: String, CaseIterable, Identifiable {
         case .processes: return "按进程查看真实 Footprint，区分页面、MCP 与执行器。"
         case .history: return "用已有采样追踪进程变化，导出可离线查看的报告。"
         case .sessions: return "按项目查看会话、用量分布和活跃情况。"
+        case .speed: return "持续观察桌面实际用量区间，区分端到端效率和纯生成速度。"
         case .knowledge: return "查看 Codex 记忆，审核和复用自己的长期知识。"
         case .reports: return "保存和回看 AI 分析结论、冻结的依据，导出离线报告。"
         case .settings: return "调整本机采样、历史记录和共用的 AI 分析来源。"
@@ -53,7 +56,7 @@ struct MemoryDesktopView: View {
             Rectangle().fill(MemoryStyle.border).frame(width: 1)
             VStack(alignment: .leading, spacing: 0) {
                 header.padding(.horizontal, 28).padding(.top, 28).padding(.bottom, 20)
-                if selectedPage != .sessions && selectedPage != .reports && selectedPage != .knowledge && (model.displayedErrorMessage != nil || model.noticeMessage != nil) { messageBanner.padding(.horizontal, 28).padding(.bottom, 16) }
+                if selectedPage != .sessions && selectedPage != .reports && selectedPage != .knowledge && selectedPage != .speed && (model.displayedErrorMessage != nil || model.noticeMessage != nil) { messageBanner.padding(.horizontal, 28).padding(.bottom, 16) }
                 switch selectedPage {
                 case .overview:
                     ScrollView {
@@ -84,6 +87,8 @@ struct MemoryDesktopView: View {
                 case .sessions:
                     SessionWorkspaceHost(model: model.sessionModel, aiModel: model.sessionAIModel).equatable()
                         .padding(.horizontal, 28).padding(.bottom, 24)
+                case .speed:
+                    DesktopSpeedHost(model: model.speedModel).equatable().padding(.horizontal, 28).padding(.bottom, 24)
                 case .knowledge:
                     KnowledgeWorkspaceHost(model: model.knowledgeModel, ai: model.knowledgeAIModel, sessions: model.sessionModel, onOpenSessions: { selectedPage = .sessions }).equatable()
                         .padding(.horizontal, 28).padding(.bottom, 24)
@@ -113,6 +118,7 @@ struct MemoryDesktopView: View {
             model.isSessionWorkspaceActive = value == .sessions
             model.isReportLibraryActive = value == .reports
             model.isKnowledgeWorkspaceActive = value == .knowledge
+            model.isSpeedWorkspaceActive = value == .speed
         }
     }
 
@@ -185,7 +191,7 @@ struct MemoryDesktopView: View {
                     else { model.prepareMemoryAIAnalysis() }
                 }
             }
-            if selectedPage != .sessions && selectedPage != .reports && selectedPage != .knowledge {
+            if selectedPage != .sessions && selectedPage != .reports && selectedPage != .knowledge && selectedPage != .speed {
                 if model.isBusy { ProgressView().controlSize(.small) }
                 Button { model.refresh() } label: { Image(systemName: "arrow.clockwise").frame(width: 24, height: 24) }
                     .buttonStyle(.bordered).controlSize(.regular).disabled(model.isBusy).help("刷新当前采样与历史").accessibilityLabel("刷新内存数据")

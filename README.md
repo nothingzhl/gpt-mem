@@ -323,3 +323,13 @@ AI 将摘录整理为目标、进展、约束、待确认问题和下一步清�
 Codex 的生成器不使用本工具的文件锁，最终检查与替换之间仍存在很短的并发窗口，请先结束相关记忆生成任务再操作。手动编辑不会同步修改 `memory_summary.md`、raw memories 或历史来源，不能保证后续不会重新生成相同内容；参见 [OpenAI Docs 的记忆说明](https://learn.chatgpt.com/docs/customization/memories)。这不是官方记忆设置接口，也不控制正在运行的会话已经读取的内容。
 
 自动验证只修改临时 fixture：`./scripts/test.sh --filter CodexMemoryEditingTests`，`python3 scripts/check-knowledge.py`。不操作用户真实 Codex 文件。
+
+## 桌面模型速度（0.19.0）
+
+侧栏「桌面模型速度」只读监听 Codex home 下的 `sessions` 日志，接受日志元数据中来源明确为 Codex Desktop／ChatGPT Desktop 的记录，排除 CLI 来源。打开页面每 5 秒增量读取，离开自动停止；可手动暂停、刷新和按日志模型名筛选，展示近 48 小时的区间效率趋势、模型中位数对比及最近区间明细。不会额外发送模型请求、读取凭据、拦截网络或持久化聊天正文。普通 ChatGPT 云端会话尚无本适配器。
+
+**区间输出效率** = 相邻累计输出用量的增量 / 记录间的墙钟耗时。包含工具、思考、网络、调度等待和日志写入延迟；不是纯生成 Token/s。首段用量等待从 task_started 到首个有效用量记录，也不是首字时间；缺少首字／流式生成时间的指标明确显示「未记录」。输出字段可能包含工具调用参数和思考，不等于屏幕可见文字，思考字段单列但不重复加总。模型名是日志声明，不能核验服务端实际路由；模型对比不是同提示词基准测试。
+
+重复累计用量不重复计数，缺失时间、继承计数无首段基线、计数回退或跨模型的首个混合区间不会伪造速度。截断／替换日志重新解析，未结束的 JSONL 末行等到换行后再处理。仅扫描近 3 个日期目录、最近更新的 32 个候选日志，每次最多读取 8 MiB（单文件 2 MiB），单行最多 1 MiB，保留每文件 500 段、页面最多 1000 段。首轮可能需要多轮追赶，会明确显示待读取数量。
+
+验证：`./scripts/test.sh --filter DesktopSpeedTests`，`python3 scripts/check-desktop-speed.py --render reports/desktop-speed-preview.png`。`--live` 可只读查看真实日志的模型名和区间汇总，均不发测速请求。

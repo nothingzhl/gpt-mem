@@ -34,12 +34,14 @@ final class DesktopModel: ObservableObject {
     @Published var isSessionWorkspaceActive = false
     @Published var isReportLibraryActive = false
     @Published var isKnowledgeWorkspaceActive = false
+    @Published var isSpeedWorkspaceActive = false
     @Published var lastExportURL: URL?
     @Published var lastDiagnosticURL: URL?
     let databaseURL: URL
     let aiModel: DesktopAIModel
     let sessionAIModel: DesktopAIModel
     let sessionModel: SessionDesktopModel
+    let speedModel = DesktopSpeedModel()
     let knowledgeModel: KnowledgeDesktopModel
     let knowledgeAIModel: DesktopAIModel
     let processActions: MemoryProcessActionsModel
@@ -101,7 +103,9 @@ final class DesktopModel: ObservableObject {
     func stopMonitoring() { service.stop() }
     func refresh() { isBusy = true; service.refresh(window: windowSeconds) }
     func refreshCurrentPage() {
-        if isKnowledgeWorkspaceActive {
+        if isSpeedWorkspaceActive {
+            Task { await speedModel.refresh() }
+        } else if isKnowledgeWorkspaceActive {
             Task { await knowledgeModel.reload() }
         } else if isReportLibraryActive {
             guard !aiModel.reportLibrary.isLoading else { return }
