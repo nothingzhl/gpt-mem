@@ -15,6 +15,8 @@ private actor KnowledgeIO {
     func merge(_ draft: KnowledgeDraft, target: KnowledgeEntry, source: KnowledgeEntry) throws -> KnowledgeSnapshot {
         wrap(try store.merge(draft, target: target, source: source))
     }
+    func trash(_ entry: KnowledgeEntry, trashed: Bool) throws -> KnowledgeSnapshot { wrap(try store.setTrashed(trashed, expected: entry)) }
+    func delete(_ entry: KnowledgeEntry) throws -> KnowledgeSnapshot { wrap(try store.permanentlyDelete(expected: entry)) }
     func sources(root: URL) throws -> KnowledgeSourceCatalog { try CodexMemoryReader(rootURL: root).read() }
 }
 struct KnowledgeEditRequest: Identifiable {
@@ -45,6 +47,7 @@ final class KnowledgeDesktopModel: ObservableObject {
     @Published var projectFilter = "" { didSet { filter() } }
     @Published var originFilter: KnowledgeOrigin? { didSet { filter() } }
     @Published var stateFilter: KnowledgeState? { didSet { filter() } }
+    @Published var showTrash = false { didSet { filter() } }
     @Published var includeArchived = false { didSet { filter() } }
     let directoryURL: URL
     @Published private(set) var sourceRoot: URL
@@ -87,13 +90,23 @@ final class KnowledgeDesktopModel: ObservableObject {
             return true
         } catch { operationError = error.localizedDescription; isSaving = false; return false }
     }
+    func trash(_ entry: KnowledgeEntry, restore: Bool = false, permanently: Bool = false) async {
+        guard !isSaving, hasLoaded, loadError == nil else { return }
+        isSaving = true; operationError = nil
+        defer { isSaving = false }
+        do {
+            if permanently { apply(try await io.delete(entry)) }
+            else { apply(try await io.trash(entry, trashed: !restore)) }
+            status = permanently ? "已永久删除该记忆及全部版本。" : (restore ? "已恢复记忆，保留删除前的状态。" : "已移入回收站，可恢复。")
+        } catch { operationError = error.localizedDescription }
+    }
     func changeState(_ entry: KnowledgeEntry, to state: KnowledgeState) async {
         var draft = entry.current; draft.state = state
         _ = await save(.init(draft: draft, expected: entry, reason: state.title))
     }
     func beginMerge(_ entries: [KnowledgeEntry]) {
         guard entries.count == 2, entries[0].current.scopeIdentity == entries[1].current.scopeIdentity,
-              entries.allSatisfy({ $0.current.state != .archived }) else {
+              entries.allSatisfy({ $0.deletedAt == nil && $0.current.state != .archived }) else {
             operationError = "请选择同一范围、同一项目或会话的两条非归档记忆，再审核合并正文。"; return
         }
         let target = entries[0], source = entries[1]
@@ -110,13 +123,13 @@ final class KnowledgeDesktopModel: ObservableObject {
         let entries = catalog.entries, sources = sourceCatalog.documents
         let terms = query.split(whereSeparator: \.isWhitespace).map(String.init)
         let project = projectFilter.trimmingCharacters(in: .whitespacesAndNewlines)
-        let origin = originFilter, state = stateFilter, archived = includeArchived
+        let origin = originFilter, state = stateFilter, archived = includeArchived, trash = showTrash
         filterTask = Task { [weak self] in
             do { try await Task.sleep(nanoseconds: 150_000_000) } catch { return }
             let operation = Task.detached(priority: .utility) { () -> ([KnowledgeEntry], [KnowledgeSourceDocument]) in
                 let matchingEntries = entries.filter { entry in
                     let value = entry.current
-                    guard (archived || state == .archived || value.state != .archived), state == nil || value.state == state,
+                    guard (entry.deletedAt != nil) == trash, (trash || archived || state == .archived || value.state != .archived), state == nil || value.state == state,
                           origin == nil || (origin == .manual ? value.sources.isEmpty || value.sources.contains { $0.origin == .manual } : value.sources.contains { $0.origin == origin }),
                           project.isEmpty || value.projectPath.localizedCaseInsensitiveContains(project) else { return false }
                     let text = value.title + "\n" + value.body + "\n" + value.sources.map { $0.label + " " + $0.locator }.joined(separator: "\n")

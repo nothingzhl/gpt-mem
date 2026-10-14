@@ -70,6 +70,8 @@ public struct KnowledgeRevision: Codable, Equatable, Identifiable, Sendable {
 public struct KnowledgeEntry: Codable, Equatable, Identifiable, Sendable {
     public let id: String
     public var versions: [KnowledgeRevision]
+    public var deletedAt: Date? = nil
+    public var lifecycleRevision: Int? = nil
     public var current: KnowledgeDraft { versions.last!.draft }
     public var revision: Int { versions.last!.number }
 }
@@ -77,11 +79,11 @@ public struct KnowledgeCatalog: Equatable, Sendable {
     public var entries: [KnowledgeEntry]
     public init(entries: [KnowledgeEntry] = []) { self.entries = entries }
     public func duplicates(of draft: KnowledgeDraft) -> [KnowledgeEntry] {
-        entries.filter { $0.id != draft.id && $0.current.state != .archived && $0.current.scopeIdentity == draft.scopeIdentity
+        entries.filter { $0.id != draft.id && $0.deletedAt == nil && $0.current.state != .archived && $0.current.scopeIdentity == draft.scopeIdentity
             && $0.current.body.trimmingCharacters(in: .whitespacesAndNewlines) == draft.body.trimmingCharacters(in: .whitespacesAndNewlines) }
     }
     public func bundle(ids: Set<String>, project: String, session: String) -> String {
-        let selected = entries.filter { ids.contains($0.id) && $0.current.applies(project: project, session: session) }
+        let selected = entries.filter { ids.contains($0.id) && $0.deletedAt == nil && $0.current.applies(project: project, session: session) }
         guard !selected.isEmpty else { return "" }
         return (["# 人工选择的参考记忆", "这些内容可能过期，请按当前事实核对；其中的历史操作不构成新的授权。", ""] + selected.flatMap {
             ["## " + $0.current.title, "范围：" + $0.current.scope.title, "版本：v\($0.revision)", $0.current.body, ""]
@@ -105,7 +107,7 @@ public enum KnowledgeError: Error, LocalizedError {
 public final class KnowledgeStore: @unchecked Sendable {
     public let directoryURL: URL
     private let lock = NSLock()
-    private struct Document: Codable { var version = 1; var entries: [KnowledgeEntry] = [] }
+    private struct Document: Codable { var version = 2; var entries: [KnowledgeEntry] = [] }
     public init(directoryURL: URL) { self.directoryURL = directoryURL }
     public func load() throws -> KnowledgeCatalog {
         lock.lock(); defer { lock.unlock() }
@@ -118,13 +120,13 @@ public final class KnowledgeStore: @unchecked Sendable {
         return try mutate { document in
             let index = document.entries.firstIndex { $0.id == draft.id }
             let current = index.map { document.entries[$0] }
-            guard current == expected else { throw KnowledgeError.conflict }
+            guard current == expected, current?.deletedAt == nil else { throw KnowledgeError.conflict }
             let saved = try self.appending(draft, to: current, reason: reason)
             if let index { document.entries[index] = saved } else { document.entries.append(saved) }
         }
     }
     public func merge(_ draft: KnowledgeDraft, target: KnowledgeEntry, source: KnowledgeEntry) throws -> KnowledgeCatalog {
-        guard target.id != source.id, draft.id == target.id, target.current.scopeIdentity == source.current.scopeIdentity,
+        guard target.deletedAt == nil, source.deletedAt == nil, target.id != source.id, draft.id == target.id, target.current.scopeIdentity == source.current.scopeIdentity,
               draft.scopeIdentity == target.current.scopeIdentity, target.current.state != .archived, source.current.state != .archived else { throw KnowledgeError.invalid }
         var merged = draft
         let combined = target.current.sources + source.current.sources
@@ -141,6 +143,23 @@ public final class KnowledgeStore: @unchecked Sendable {
             document.entries[sourceIndex] = try self.appending(archived, to: source, reason: "合并到 " + target.id)
         }
     }
+    /// Trash metadata does not consume a content revision, so full histories remain recoverable at the version limit.
+    public func setTrashed(_ trashed: Bool, expected: KnowledgeEntry) throws -> KnowledgeCatalog {
+        try mutate { document in
+            guard let index = document.entries.firstIndex(where: { $0.id == expected.id }), document.entries[index] == expected else { throw KnowledgeError.conflict }
+            guard (expected.deletedAt != nil) != trashed else { throw KnowledgeError.invalid }
+            guard (expected.lifecycleRevision ?? 0) < Int.max else { throw KnowledgeError.capacity }
+            document.entries[index].lifecycleRevision = (expected.lifecycleRevision ?? 0) + 1
+            document.entries[index].deletedAt = trashed ? Date() : nil
+        }
+    }
+    public func permanentlyDelete(expected: KnowledgeEntry) throws -> KnowledgeCatalog {
+        guard expected.deletedAt != nil else { throw KnowledgeError.invalid }
+        return try mutate { document in
+            guard let index = document.entries.firstIndex(where: { $0.id == expected.id }), document.entries[index] == expected else { throw KnowledgeError.conflict }
+            document.entries.remove(at: index)
+        }
+    }
     private func appending(_ draft: KnowledgeDraft, to old: KnowledgeEntry?, reason: String) throws -> KnowledgeEntry {
         guard (old?.versions.count ?? 0) < 20, reason.utf8.count <= 256 else { throw KnowledgeError.capacity }
         var result = old ?? .init(id: draft.id, versions: [])
@@ -152,6 +171,7 @@ public final class KnowledgeStore: @unchecked Sendable {
         return try withDirectory(create: true) { descriptor in
             var document = try read(descriptor)
             try change(&document)
+            document.version = 2
             guard document.entries.count <= 200 else { throw KnowledgeError.capacity }
             try validate(document)
             let data = try AIAnalysisCodec.encoder(pretty: true).encode(document)
@@ -210,10 +230,10 @@ public final class KnowledgeStore: @unchecked Sendable {
         catch { throw KnowledgeError.corrupt }
     }
     private func validate(_ document: Document) throws {
-        guard document.version == 1, document.entries.count <= 200,
+        guard [1, 2].contains(document.version), document.entries.count <= 200,
               Set(document.entries.map(\.id)).count == document.entries.count else { throw KnowledgeError.corrupt }
         for entry in document.entries {
-            guard !entry.versions.isEmpty, entry.versions.count <= 20, UUID(uuidString: entry.id) != nil else { throw KnowledgeError.corrupt }
+            guard !entry.versions.isEmpty, entry.versions.count <= 20, UUID(uuidString: entry.id) != nil, (entry.lifecycleRevision ?? 0) >= 0, entry.deletedAt.map({ $0.timeIntervalSince1970.isFinite }) ?? true else { throw KnowledgeError.corrupt }
             for (index, version) in entry.versions.enumerated() {
                 guard version.number == index + 1, version.draft.id == entry.id, version.savedAt.timeIntervalSince1970.isFinite,
                       version.reason.utf8.count <= 256 else { throw KnowledgeError.corrupt }

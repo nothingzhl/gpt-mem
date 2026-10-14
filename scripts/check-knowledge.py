@@ -89,6 +89,21 @@ var assertions = 0
     let reopened = KnowledgeDesktopModel(directoryURL: model.directoryURL, sourceRoot: sources)
     await reopened.loadIfNeeded(); try await settle(reopened)
     try expect(reopened.catalog == model.catalog, "persistence reopened")
+    let target = model.catalog.entries.first { $0.current.state != .archived }!
+    await model.trash(target); try await settle(model)
+    try expect(!model.filteredEntries.contains { $0.id == target.id }, "trash hidden from normal library")
+    model.showTrash = true; try await settle(model)
+    try expect(model.filteredEntries.count == 1, "trash visible in trash view")
+    let trashed = model.filteredEntries[0]
+    await model.trash(trashed, restore: true); try await settle(model)
+    try expect(model.filteredEntries.isEmpty, "restore removes from trash view")
+    model.showTrash = false; try await settle(model)
+    let restored = model.catalog.entries.first { $0.id == target.id }!
+    try expect(restored.versions == target.versions, "trash restore preserves complete history")
+    await model.trash(restored); try await settle(model)
+    let removal = model.catalog.entries.first { $0.id == target.id }!
+    await model.trash(removal, permanently: true); try await settle(model)
+    try expect(!model.catalog.entries.contains { $0.id == target.id }, "explicit permanent deletion removes entry")
     let credentials = NoCredentials(), client = KnowledgeMock()
     let store = AIConfigurationStore(url: root.appendingPathComponent("mock-ai.json"))
     let ai = DesktopAIModel(configurationStore: store, credentials: credentials, coordinator: AIAnalysisCoordinator(client: client, credentials: credentials))

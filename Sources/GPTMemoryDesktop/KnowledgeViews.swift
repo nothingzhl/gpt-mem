@@ -60,11 +60,12 @@ struct KnowledgeWorkspace: View {
                 Picker("状态", selection: $model.stateFilter) { Text("全部状态").tag(Optional<KnowledgeState>.none); ForEach(KnowledgeState.allCases, id: \.self) { Text($0.title).tag(Optional($0)) } }.frame(width: 190)
                 Picker("来源", selection: $model.originFilter) { Text("全部来源").tag(Optional<KnowledgeOrigin>.none); ForEach(KnowledgeOrigin.allCases, id: \.self) { Text($0.title).tag(Optional($0)) } }.frame(width: 190)
                 Toggle("含归档", isOn: $model.includeArchived)
+                Toggle("回收站", isOn: $model.showTrash)
                 Spacer()
             }
             HStack {
                 Button("预览并复用所选（\(checked.count)）") { bundle = .init(catalog: model.catalog, ids: checked) }.disabled(checked.isEmpty)
-                Button("审核合并两条") { model.beginMerge(model.catalog.entries.filter { checked.contains($0.id) }) }.disabled(checked.count != 2 || model.isSaving)
+                Button("审核合并两条") { model.beginMerge(model.catalog.entries.filter { checked.contains($0.id) }) }.disabled(checked.count != 2 || model.isSaving || model.showTrash)
                 Spacer()
                 Button("从已打开会话提取") { if let transcript = sessions.transcript { extraction = .init(transcript: transcript) } else { onOpenSessions() } }
             }
@@ -77,7 +78,7 @@ struct KnowledgeWorkspace: View {
                             Toggle("选择 \(entry.current.title)", isOn: Binding(get: { checked.contains(entry.id) }, set: { if $0 { checked.insert(entry.id) } else { checked.remove(entry.id) } })).labelsHidden()
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(entry.current.title).fontWeight(.medium)
-                                Text("\(entry.current.scope.title) · \(entry.current.state.title) · v\(entry.revision)").font(.caption).foregroundStyle(.secondary)
+                                Text("\(entry.deletedAt == nil ? entry.current.scope.title : "回收站") · \(entry.current.state.title) · v\(entry.revision)").font(.caption).foregroundStyle(.secondary)
                             }
                         }.padding(.vertical, 5).tag(entry.id)
                     }
@@ -126,11 +127,16 @@ private struct KnowledgeEntryDetail: View {
     @ObservedObject var model: KnowledgeDesktopModel
     let entry: KnowledgeEntry
     @State private var version: Int?
+    @State private var confirmDelete = false
     private var revision: KnowledgeRevision { entry.versions.first { $0.number == version } ?? entry.versions.last! }
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(entry.current.title).font(.title3)
             HStack {
+                if entry.deletedAt != nil {
+                    Button("恢复（删除前状态）") { Task { await model.trash(entry, restore: true) } }
+                    Button("永久删除…", role: .destructive) { confirmDelete = true }
+                } else {
                 Button("编辑") { model.editor = .init(draft: entry.current, expected: entry) }
                 Button(entry.current.state == .active ? "停用" : "审核启用") {
                     if entry.current.state == .active { Task { await model.changeState(entry, to: .disabled) } }
@@ -139,6 +145,8 @@ private struct KnowledgeEntryDetail: View {
                 if entry.current.state == .archived {
                     Button("恢复为草稿") { Task { await model.changeState(entry, to: .draft) } }
                 } else { Button("归档") { Task { await model.changeState(entry, to: .archived) } } }
+                Button("移入回收站") { Task { await model.trash(entry) } }
+                }
             }.disabled(model.isSaving || model.loadError != nil)
             Text("\(entry.current.scope.title) · \(entry.current.projectPath) \(entry.current.sessionID)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
             HStack {
@@ -149,7 +157,7 @@ private struct KnowledgeEntryDetail: View {
                 Button("以此版本创建恢复草稿") {
                     var draft = revision.draft; draft.state = .draft
                     model.editor = .init(draft: draft, expected: entry, reason: "恢复自 v\(revision.number)")
-                }.disabled(model.isSaving || model.loadError != nil)
+                }.disabled(model.isSaving || model.loadError != nil || entry.deletedAt != nil)
                 Button("导出全部版本") { exportHistory() }
             }
             ScrollView {
@@ -159,7 +167,11 @@ private struct KnowledgeEntryDetail: View {
                     ForEach(revision.draft.sources) { source in Text("来源：\(source.origin.title) · \(source.label)\n\(source.locator)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
                 }
             }
-        }.id(entry.id).onChange(of: entry.id) { _, _ in version = nil }
+        }.id(entry.id).onChange(of: entry.id) { _, _ in version = nil; confirmDelete = false }
+        .alert("永久删除这条记忆？", isPresented: $confirmDelete) {
+            Button("取消", role: .cancel) {}
+            Button("永久删除", role: .destructive) { Task { await model.trash(entry, permanently: true) } }
+        } message: { Text("将删除“" + entry.current.title + "”及全部 " + String(entry.versions.count) + " 个版本，无法恢复。可以先导出全部版本。Codex 原始文件不受影响。") }
     }
     private func exportHistory() {
         let panel = NSSavePanel(); panel.allowedContentTypes = [.json]; panel.nameFieldStringValue = "memory-history.json"
@@ -218,7 +230,7 @@ private struct KnowledgeBundleView: View {
     @Environment(\.dismiss) private var dismiss
     private var text: String { request.catalog.bundle(ids: request.ids, project: project, session: session) }
     private var oversized: Bool { text.utf8.count > 131_072 }
-    private var count: Int { request.catalog.entries.filter { request.ids.contains($0.id) && $0.current.applies(project: project, session: session) }.count }
+    private var count: Int { request.catalog.entries.filter { request.ids.contains($0.id) && $0.deletedAt == nil && $0.current.applies(project: project, session: session) }.count }
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("预览可复用记忆").font(.title2)

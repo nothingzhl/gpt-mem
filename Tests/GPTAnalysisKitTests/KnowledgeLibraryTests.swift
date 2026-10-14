@@ -13,9 +13,16 @@ final class KnowledgeLibraryTests: XCTestCase {
         var draft = KnowledgeDraft(title: "回答偏好", body: "使用中文")
         let first = try store.save(draft, expected: nil).entries[0]
         XCTAssertEqual(first.current.state, .draft)
+        let libraryFile = directory.appendingPathComponent("library.json")
+        var legacy = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: libraryFile)) as? [String: Any])
+        legacy["version"] = 1
+        try JSONSerialization.data(withJSONObject: legacy).write(to: libraryFile)
+        XCTAssertEqual(try store.load().entries, [first])
         draft.body = "使用中文，先给结果"; draft.state = .active
         let second = try store.save(draft, expected: first).entries[0]
         XCTAssertEqual(second.revision, 2)
+        let upgraded = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: libraryFile)) as? [String: Any])
+        XCTAssertEqual(upgraded["version"] as? Int, 2)
         XCTAssertEqual(second.versions[0].draft.body, "使用中文")
         XCTAssertEqual(try KnowledgeStore(directoryURL: directory).load().entries, [second])
         XCTAssertEqual((try FileManager.default.attributesOfItem(atPath: directory.path)[.posixPermissions] as? NSNumber)?.intValue, 0o700)
@@ -74,6 +81,9 @@ final class KnowledgeLibraryTests: XCTestCase {
         for index in 2...20 { var draft = entry.current; draft.body = String(index); entry = try store.save(draft, expected: entry).entries[0] }
         XCTAssertThrowsError(try store.save(entry.current, expected: entry))
         XCTAssertEqual(try store.load().entries[0].versions.count, 20)
+        let trashedAtLimit = try store.setTrashed(true, expected: entry).entries[0]
+        let restoredAtLimit = try store.setTrashed(false, expected: trashedAtLimit).entries[0]
+        XCTAssertEqual(restoredAtLimit.versions.count, 20)
         let file = directory.appendingPathComponent("library.json"), corrupt = Data("broken".utf8)
         try corrupt.write(to: file)
         XCTAssertThrowsError(try store.load()); XCTAssertThrowsError(try store.save(.init(title: "new", body: "new"), expected: nil))
@@ -107,6 +117,31 @@ final class KnowledgeLibraryTests: XCTestCase {
         XCTAssertThrowsError(try store.load()); XCTAssertThrowsError(try store.save(.init(title: "x", body: "x"), expected: nil))
         try FileManager.default.removeItem(at: file); try FileManager.default.linkItem(at: target, to: file)
         XCTAssertThrowsError(try store.load()); XCTAssertEqual(try Data(contentsOf: target), data)
+    }
+    func testTrashRestoreAndPermanentDeletePreserveOtherEntriesAndRejectStaleOperations() throws {
+        let directory = root(); defer { try? FileManager.default.removeItem(at: directory) }
+        let store = KnowledgeStore(directoryURL: directory)
+        let first = try store.save(.init(title: "A", body: "REFERENCE", state: .active), expected: nil).entries[0]
+        _ = try store.save(.init(title: "B", body: "OTHER"), expected: nil)
+        XCTAssertThrowsError(try store.permanentlyDelete(expected: first))
+        let trashed = try store.setTrashed(true, expected: first)
+        let entry = try XCTUnwrap(trashed.entries.first { $0.id == first.id })
+        XCTAssertEqual(entry.versions, first.versions)
+        XCTAssertTrue(trashed.bundle(ids: [first.id], project: "", session: "").isEmpty)
+        XCTAssertEqual(try store.load().entries.first { $0.id == first.id }, entry)
+        XCTAssertThrowsError(try store.save(first.current, expected: entry))
+        XCTAssertThrowsError(try store.setTrashed(false, expected: first))
+        let restored = try store.setTrashed(false, expected: entry).entries.first { $0.id == first.id }!
+        XCTAssertNil(restored.deletedAt)
+        XCTAssertEqual(restored.current.state, .active)
+        XCTAssertThrowsError(try store.permanentlyDelete(expected: entry))
+        let again = try store.setTrashed(true, expected: restored).entries.first { $0.id == first.id }!
+        XCTAssertThrowsError(try store.permanentlyDelete(expected: entry))
+        let deleted = try store.permanentlyDelete(expected: again)
+        XCTAssertEqual(deleted.entries.count, 1)
+        XCTAssertEqual(deleted.entries[0].current.title, "B")
+        XCTAssertEqual(try store.load(), deleted)
+        XCTAssertThrowsError(try store.permanentlyDelete(expected: again))
     }
     func testMissingReaderAndDuplicateAdvisoryAreSafe() throws {
         let directory = root()
