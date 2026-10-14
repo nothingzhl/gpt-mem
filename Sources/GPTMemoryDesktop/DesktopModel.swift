@@ -4,6 +4,7 @@ import Combine
 import UniformTypeIdentifiers
 import Darwin
 import GPTMemoryCore
+import GPTSessionKit
 import GPTAnalysisKit
 
 private struct DesktopUpdate {
@@ -50,7 +51,7 @@ final class DesktopModel: ObservableObject {
     private lazy var service = DesktopSamplingService(databaseURL: databaseURL) { [weak self] update in
         DispatchQueue.main.async {
             guard let self else { return }
-            if let snapshot = update.snapshot { self.snapshot = snapshot }
+            if let snapshot = update.snapshot { self.snapshot = snapshot; self.processActions.updateSnapshot(snapshot) }
             self.history = update.history
             self.analysis = update.analysis
             self.aiModel.updateWindow(start: update.analysis?.start, end: update.analysis?.end,
@@ -78,7 +79,9 @@ final class DesktopModel: ObservableObject {
             reportLibrary: aiModel.reportLibrary, promptLibrary: aiModel.promptLibrary)
         sessionModel = SessionDesktopModel(indexDirectoryURL: directory.appendingPathComponent("session-index", isDirectory: true),
             managementDirectoryURL: directory.appendingPathComponent("session-management", isDirectory: true))
-        processActions = MemoryProcessActionsModel(directoryURL: directory.appendingPathComponent("process-actions", isDirectory: true))
+        let projectIndex = SessionIndexStore(directoryURL: directory.appendingPathComponent("session-index", isDirectory: true), rootURL: sessionModel.rootURL)
+        processActions = MemoryProcessActionsModel(directoryURL: directory.appendingPathComponent("process-actions", isDirectory: true),
+            projectPathsLoader: { Array(Set(try projectIndex.load().entries.compactMap { $0.summary.projectPath })) })
         processActions.didRequestExit = { [weak self] in self?.refresh() }
         let saved = UserDefaults.standard.double(forKey: "samplingInterval")
         if [1.0, 2.0, 5.0, 10.0].contains(saved) { interval = saved }

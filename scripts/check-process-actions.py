@@ -154,9 +154,58 @@ final class OptimizationFixture: @unchecked Sendable {
     try expect(nestedState.optimizationMessage?.contains("父子关系") == true, "overlap refusal is explained")
     print("PASS optimization selection, serial verified exits, stop, refusal, stale scan and measured effects")
 }
+@MainActor func toolContextChecks(_ base: URL) async throws {
+    let fixture = OptimizationFixture()
+    fixture.roots[1].role = .mcpApp; fixture.roots[1].executable = fixture.roots[0].executable
+    let context = MemoryToolRuntimeContext(arguments: ["node", "./server.mjs"], workingDirectory: "/projects/sample",
+        projectPath: "/projects/sample", projectEvidence: "工作目录所在 Git 仓库")
+    let state = MemoryProcessActionsModel(directoryURL: base, control: fixture.control(), observationDelays: [0.01, 0.02, 0.03],
+        contextReader: { _ in context })
+    let snapshot = fixture.snapshot(), candidates = state.optimizationCandidates(snapshot: fixture.snapshot())
+    state.loadCommandPreviews(candidates: candidates, snapshot: snapshot)
+    try await waitFor({ !state.isLoadingCommands }, "context loading did not finish")
+    try expect(state.toolContexts.count == 2 && state.commandPreviews.count == 2, "command and cwd evidence loaded together")
+    let indexedState = MemoryProcessActionsModel(directoryURL: base.appendingPathComponent("indexed"), control: fixture.control(),
+        contextReader: { _ in MemoryToolRuntimeContext(arguments: ["node", "server.mjs"], workingDirectory: "/workspace/multi/child") },
+        projectPathsLoader: { ["/workspace/multi"] })
+    indexedState.loadCommandPreviews(candidates: candidates, snapshot: snapshot)
+    try await waitFor({ !indexedState.isLoadingCommands }, "indexed workspace lookup")
+    try expect(indexedState.toolContexts.values.allSatisfy { $0.projectPath == "/workspace/multi" }, "non-Git workspace uses cached project reference")
+    try expect(indexedState.toolContexts.values.allSatisfy { $0.projectEvidence.contains("不是具体会话关联") }, "cached project reference never claims session ownership")
+    let groups = MemoryToolGrouping.groups(candidates: candidates, contexts: state.toolContexts)
+    try expect(groups.count == 1 && groups[0].isRepeated, "same configuration instances are grouped")
+    try expect(groups[0].footprintBytes == 400 * 1024 * 1024, "group shows exact sampled instance total")
+    try expect(MemoryToolGrouping.projects(groups: groups)[0].path == "/projects/sample", "project grouping retains full identity")
+    try expect(fixture.sends.isEmpty && state.records.isEmpty, "reading context never exits or writes action records")
+    state.startOptimization(candidates: candidates, selected: [candidates[0].id], snapshot: snapshot, history: [])
+    try await idle(state)
+    try expect(fixture.sends == [candidates[0].process.pid], "only manually selected duplicate is requested to exit")
+    let files = try FileManager.default.contentsOfDirectory(at: base, includingPropertiesForKeys: nil).filter { $0.pathExtension == "json" }
+    let persisted = try String(contentsOf: files[0], encoding: .utf8)
+    try expect(!persisted.contains("./server.mjs") && !persisted.contains("/projects/sample"), "transient command/cwd context never enters action history")
+    state.clearCommandPreviews()
+    try expect(state.toolContexts.isEmpty && state.commandPreviews.isEmpty, "closing view clears both command and cwd metadata")
+    let reviewed = OptimizationFixture()
+    let reviewedState = MemoryProcessActionsModel(directoryURL: base.appendingPathComponent("reviewed"), control: reviewed.control(), observationDelays: [0.01, 0.02, 0.03], contextReader: { _ in context })
+    let old = MemorySnapshot(capturedAt: Date().addingTimeInterval(-90), processes: reviewed.snapshot().processes)
+    let oldCandidates = MemoryOptimizationPlanner.candidates(snapshot: old, protectedPIDs: [])
+    reviewedState.updateSnapshot(reviewed.snapshot())
+    reviewedState.startOptimization(candidates: oldCandidates, selected: [oldCandidates[0].id], snapshot: old, history: [])
+    try await idle(reviewedState)
+    try expect(reviewed.sends.count == 1, "long review uses fresh monitor snapshot and still validates frozen process identity")
+    let changed = OptimizationFixture()
+    let changedState = MemoryProcessActionsModel(directoryURL: base.appendingPathComponent("changed"), control: changed.control())
+    let before = changed.snapshot(), beforeCandidates = changedState.optimizationCandidates(snapshot: before)
+    changed.roots[0].startTimeTicks += 100
+    changedState.updateSnapshot(changed.snapshot())
+    changedState.startOptimization(candidates: beforeCandidates, selected: [beforeCandidates[0].id], snapshot: before, history: [])
+    try expect(changed.sends.isEmpty && !changedState.isOptimizing, "fresh sample rejects a replaced reviewed PID")
+    print("PASS project/instance grouping, selected-instance exits and transient evidence privacy")
+}
 @MainActor func runChecks() async throws {
     let base = URL(fileURLWithPath: ProcessInfo.processInfo.environment["GPT_ACTION_CHECK_DIR"]!)
     try await optimizationChecks(base.appendingPathComponent("optimization"))
+    try await toolContextChecks(base.appendingPathComponent("context"))
     let fixture = Fixture(), state = model(fixture, base.appendingPathComponent("successful"))
     var reused = fixture.target; reused.startTimeTicks += 1
     let trend = [MemorySnapshot(processes: [reused]), MemorySnapshot(processes: [], unavailablePIDs: [fixture.target.pid]), fixture.snapshot()]
@@ -190,7 +239,7 @@ final class OptimizationFixture: @unchecked Sendable {
     try expect(state.records.count == 1, "reading command does not write action records")
     state.loadCommandPreview(for: fixture.target); state.clearCommandPreviews()
     try await Task.sleep(nanoseconds: 50_000_000)
-    try expect(state.commandPreviews.isEmpty && !state.isLoadingCommands, "closing preview rejects late command results")
+    try expect(state.commandPreviews.isEmpty && state.toolContexts.isEmpty && !state.isLoadingCommands, "closing preview rejects late command results")
     print("PASS confirmation/cancel, duplicate submission, verified effects and private persistence/reopening")
 
     let refusing = Fixture(); refusing.refuse = true
@@ -251,7 +300,7 @@ final class OptimizationFixture: @unchecked Sendable {
             print("READ-ONLY LIVE HISTORY: \(tools.count) eligible tools, \(tools.filter { $0.process.footprintBytes >= 32 * 1024 * 1024 }.count) at least 32 MiB; no real signals")
         }
     }
-    print("PROCESS ACTION CHECKS PASSED: 6 workflows, \(assertions) assertions; all signals mocked")
+    print("PROCESS ACTION CHECKS PASSED: 7 workflows, \(assertions) assertions; all signals mocked")
     #if RENDER_ACTIONS
     if let output = ProcessInfo.processInfo.environment["GPT_ACTION_RENDER_DIR"] {
         try await render(force, held, output: URL(fileURLWithPath: output))
@@ -265,13 +314,28 @@ final class OptimizationFixture: @unchecked Sendable {
     let snapshot = MemorySnapshot(processes: [fixture.root, fixture.target])
     let request = MemoryProcessActionRequest(process: fixture.target, kind: .request, relatedProcessCount: 1)
     let force = MemoryProcessActionRequest(process: fixture.target, kind: .force, relatedProcessCount: 1)
+    let groupedFixture = OptimizationFixture()
+    groupedFixture.roots[1].role = .mcpApp; groupedFixture.roots[1].executable = groupedFixture.roots[0].executable
+    var extra = groupedFixture.roots[0]; extra.pid += 10; extra.startTimeTicks += 10; extra.role = .repl
+    groupedFixture.roots.append(extra)
+    let groupedModel = MemoryProcessActionsModel(directoryURL: output.appendingPathComponent("render-fixtures"), control: groupedFixture.control(),
+        contextReader: { process in
+            let known = process.pid < 223460
+            return MemoryToolRuntimeContext(arguments: ["node", "./server.mjs"], workingDirectory: known ? "/projects/gpt-mem" : "/Users/sample/.codex/plugins/repl",
+                projectPath: known ? "/projects/gpt-mem" : nil,
+                projectEvidence: known ? "工作目录所在 Git 仓库；不能证明当前任务或会话" : "工具安装目录，无法据此关联工作项目")
+        })
+    let groupedSnapshot = groupedFixture.snapshot()
+    let groupedCandidates = groupedModel.optimizationCandidates(snapshot: groupedSnapshot)
+    groupedModel.loadCommandPreviews(candidates: groupedCandidates, snapshot: groupedSnapshot)
+    try await waitFor({ !groupedModel.isLoadingCommands }, "render fixture context loading")
     let content: [(String, AnyView, CGFloat, CGFloat)] = [
         ("process-actions-preview.png", AnyView(ProcessesContent(snapshot: snapshot, selectedRole: .constant(nil), isBusy: false,
             focusedKey: .constant(fixture.target.key), actions: state, initiallyExpandedActionHistory: true, onDiagnose: { _ in })), 888, 620),
         ("process-actions-narrow-preview.png", AnyView(ProcessesContent(snapshot: snapshot, selectedRole: .constant(nil), isBusy: false,
             focusedKey: .constant(fixture.target.key), actions: state, initiallyExpandedActionHistory: true, onDiagnose: { _ in })), 728, 520),
-        ("memory-optimization-preview.png", AnyView(MemoryOptimizationPlan(model: state,
-            candidates: MemoryOptimizationPlanner.candidates(snapshot: OptimizationFixture().snapshot(), protectedPIDs: []), snapshot: OptimizationFixture().snapshot(), history: [])), 668, 560),
+        ("memory-optimization-preview.png", AnyView(MemoryOptimizationPlan(model: groupedModel,
+            candidates: groupedCandidates, snapshot: groupedSnapshot, history: [])), 788, 700),
         ("process-exit-confirmation-preview.png", AnyView(MemoryProcessActionConfirmation(model: state, request: request)), 558, 470),
         ("process-force-confirmation-preview.png", AnyView(MemoryProcessActionConfirmation(model: state, request: force)), 558, 520)]
     for (name, view, width, height) in content {

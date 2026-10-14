@@ -138,6 +138,21 @@ int gpt_signal_process(int pid, uint64_t birth, const char *executable, int sign
     return kill(pid, signal_number);
 }
 
+/* On-demand cwd, independently identity-checked; never environment data. */
+int gpt_read_working_directory(int pid, uint64_t birth, const char *executable, char *out, size_t capacity) {
+    if (!out || capacity < 2 || capacity > 4096) { errno = EINVAL; return -1; }
+    memset(out, 0, capacity);
+    if (gpt_validate_process(pid, birth, executable) != 0) return -1;
+    struct proc_vnodepathinfo vnode;
+    memset(&vnode, 0, sizeof(vnode));
+    if (proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &vnode, sizeof(vnode)) != sizeof(vnode)) return -1;
+    size_t length = strnlen(vnode.pvi_cdir.vip_path, sizeof(vnode.pvi_cdir.vip_path));
+    if (length == 0 || length >= sizeof(vnode.pvi_cdir.vip_path) || length >= capacity) { errno = EOVERFLOW; return -1; }
+    if (gpt_validate_process(pid, birth, executable) != 0) return -1;
+    memcpy(out, vnode.pvi_cdir.vip_path, length + 1);
+    return (int)length;
+}
+
 /* Explicit UI request only. Return argc NUL-separated arguments, never env. */
 int gpt_read_command(int pid, uint64_t birth, const char *executable, char *out, size_t capacity) {
     if (!out || capacity == 0 || capacity > 16 * 1024) { errno = EINVAL; return -1; }

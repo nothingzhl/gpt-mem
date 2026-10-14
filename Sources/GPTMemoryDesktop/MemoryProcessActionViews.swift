@@ -150,28 +150,46 @@ struct MemoryOptimizationPlan: View {
     @State private var selected: Set<String> = []
     @State private var confirms = false
     @State private var showAll = false
-    private var visibleCandidates: [MemoryOptimizationCandidate] { candidates.filter { showAll || $0.process.footprintBytes >= 32 * 1024 * 1024 } }
+    @State private var repeatedOnly = false
+    @State private var byProject = true
+    private var groups: [MemoryToolInstanceGroup] { MemoryToolGrouping.groups(candidates: candidates, contexts: model.toolContexts) }
+    private var visibleGroups: [MemoryToolInstanceGroup] {
+        groups.filter { group in
+            (!repeatedOnly || group.isRepeated) && (showAll || group.candidates.contains { $0.process.footprintBytes >= 32 * 1024 * 1024 })
+        }
+    }
     @Environment(\.dismiss) private var dismiss
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("后台工具内存处理").font(.system(size: 20, weight: .semibold))
-            Text("按单个工具进程占用排序，优先显示至少 32 MiB 的 MCP、REPL 和工具执行器。近期 CPU 仅供参考；请确认该工具已经不用。")
+            Text("按项目查看 MCP、REPL 和工具执行器，再按类型、启动命令与工作目录归组。默认展示包含至少 32 MiB 实例的组；请确认工具已经不用。")
                 .font(.system(size: 12)).fixedSize(horizontal: false, vertical: true)
             Text("只向所选工具进程发送正常退出信号，可能中断工具任务并影响其子进程。主应用、页面渲染和 GPU 不在此列表；不自动强杀。")
                 .font(.system(size: 12)).foregroundStyle(MemoryStyle.orange).fixedSize(horizontal: false, vertical: true)
-            Toggle("显示全部可处理工具（包含低于 32 MiB）", isOn: $showAll)
-                .onChange(of: showAll) { _, _ in selected = [] }
+            if let warning = model.contextWarning { Text(warning).font(.system(size: 11)).foregroundStyle(MemoryStyle.orange) }
+            HStack {
+                Toggle("按项目分组", isOn: $byProject)
+                Toggle("仅同配置多实例", isOn: $repeatedOnly).disabled(model.isLoadingCommands)
+                    .onChange(of: repeatedOnly) { _, _ in selected = [] }
+                Toggle("包含低占用组", isOn: $showAll)
+                    .onChange(of: showAll) { _, _ in selected = [] }
+            }.font(.system(size: 11))
+            Text("共 \(candidates.count) 个工具 · \(groups.filter(\.isRepeated).count) 组同配置多实例（含低占用），当前匹配 \(visibleGroups.count) 组。多实例不代表多余。")
+                .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
-                    if visibleCandidates.isEmpty {
-                        Text("当前没有匹配工具。可以显示全部工具，或取消后刷新再扫描；归属不明及观察器的祖先进程不会列出。")
+                    if visibleGroups.isEmpty {
+                        Text(model.isLoadingCommands ? "正在读取命令和工作目录…" : "没有匹配对象。可调整筛选，或取消后刷新；归属不明及受保护进程不会列出。")
                             .font(.system(size: 12)).foregroundStyle(MemoryStyle.secondary)
                     }
-                    ForEach(visibleCandidates) { candidate in
-                        MemoryToolCommandRow(model: model, candidate: candidate, snapshot: snapshot,
-                            selected: Binding(get: { selected.contains(candidate.id) }, set: {
-                                if $0 { selected.insert(candidate.id) } else { selected.remove(candidate.id) }
-                            }))
+                    if byProject {
+                        ForEach(MemoryToolGrouping.projects(groups: visibleGroups)) { project in
+                            MemoryToolProjectSection(model: model, project: project, snapshot: snapshot, selected: $selected)
+                        }
+                    } else {
+                        ForEach(visibleGroups) { group in
+                            MemoryToolInstanceSection(model: model, group: group, snapshot: snapshot, selected: $selected)
+                        }
                     }
                 }
             }.frame(minHeight: 130, maxHeight: 280)
@@ -181,12 +199,13 @@ struct MemoryOptimizationPlan: View {
             HStack {
                 Spacer()
                 Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("请求退出所选进程…") { confirms = true }.disabled(selected.isEmpty || model.hasPendingWork)
+                Button("请求退出所选进程…") { confirms = true }.disabled(selected.isEmpty || model.hasPendingWork || model.isLoadingCommands)
             }.controlSize(.large)
-            Text("命令在打开时读取，仅在本机临时展示。常驻服务的启动参数无法说明当前处理的请求；任务内容可能仍未知。")
+            Text("命令、目录和项目依据仅在本机临时展示。会话归属未知；常驻服务的启动参数不能说明当前请求。")
                 .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
-            Button("刷新启动命令") { model.loadCommandPreviews(candidates: candidates, snapshot: snapshot) }.disabled(model.isLoadingCommands)
-        }.padding(24).frame(width: 620)
+            Button("刷新命令与工作目录") { model.loadCommandPreviews(candidates: candidates, snapshot: snapshot) }.disabled(model.isLoadingCommands)
+        }.padding(24).frame(width: 740)
+            .onChange(of: model.isLoadingCommands) { _, value in if value { selected = [] } }
             .onAppear { model.loadCommandPreviews(candidates: candidates, snapshot: snapshot) }
             .onDisappear { model.clearCommandPreviews() }
             .alert("确认正常退出 \(selected.count) 个工具进程？", isPresented: $confirms) {
@@ -213,6 +232,8 @@ private struct MemoryToolCommandRow: View {
             Text("\(candidate.process.role.label) · \(candidate.relatedProcessCount) 个下级进程 · \(MemoryFormat.date(candidate.process.startedAt)) 启动")
                 .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
             Text("所属：\(MemoryFormat.executable(candidate.rootProcess.executable)) · PID \(candidate.rootProcess.pid)").font(.system(size: 11))
+            Text("父进程 PID \(candidate.process.parentPID) · 会话归属：未知").font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
+            MemoryToolContextDetail(context: model.toolContexts[candidate.id], isLoading: model.isLoadingCommands)
             Text(candidate.activity).font(.system(size: 11)).foregroundStyle(MemoryStyle.orange)
             Text("启动命令：" + (model.commandPreviews[candidate.id] ?? (model.isLoadingCommands ? "读取中…" : "未读取")))
                 .font(.system(size: 11, design: .monospaced)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
@@ -241,10 +262,78 @@ struct MemoryProcessCommandDetail: View {
             if let command = model.commandPreviews[process.key] {
                 Text(command).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
+                MemoryToolContextDetail(context: model.toolContexts[process.key], isLoading: model.isLoadingCommands)
                 Text("本次读取的启动参数，不能据此判断当前请求或是否空闲。")
                     .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
             }
         }.onChange(of: process.key) { _, _ in model.clearCommandPreviews() }
             .onDisappear { model.clearCommandPreviews() }
+    }
+}
+
+
+private struct MemoryToolContextDetail: View {
+    let context: MemoryToolRuntimeContext?
+    let isLoading: Bool
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("工作目录：" + (context?.workingDirectory ?? context?.directoryIssue ?? (isLoading ? "读取中…" : "未知")))
+                .font(.system(size: 11)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            Text("项目：" + (context?.projectPath ?? "归属未知"))
+                .font(.system(size: 11)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            if let context {
+                DisclosureGroup("项目归属依据与读取时间") {
+                    Text(context.projectEvidence).font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
+                    Text("读取时间：" + MemoryFormat.date(context.capturedAt)).font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
+                }.font(.system(size: 10))
+            }
+        }
+    }
+}
+
+private struct MemoryToolInstanceSection: View {
+    @ObservedObject var model: MemoryProcessActionsModel
+    let group: MemoryToolInstanceGroup
+    let snapshot: MemorySnapshot?
+    @Binding var selected: Set<String>
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(group.candidates[0].process.role.label).font(.system(size: 12, weight: .semibold))
+                Text("\(group.candidates.count) 个实例 · 合计 \(group.footprintBytes.map(MemoryFormat.bytes) ?? "超出计量范围")")
+                    .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
+                if group.isRepeated { MemoryBadge(text: "同配置多实例", color: MemoryStyle.orange) }
+            }
+            if !group.isComparable { Text("命令或工作目录未读全，暂不比较重复实例。") .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary) }
+            ForEach(group.candidates) { candidate in
+                MemoryToolCommandRow(model: model, candidate: candidate, snapshot: snapshot,
+                    selected: Binding(get: { selected.contains(candidate.id) }, set: {
+                        if $0 { selected.insert(candidate.id) } else { selected.remove(candidate.id) }
+                    }))
+            }
+        }.padding(.vertical, 6)
+    }
+}
+
+private struct MemoryToolProjectSection: View {
+    @ObservedObject var model: MemoryProcessActionsModel
+    let project: MemoryToolProjectGroup
+    let snapshot: MemorySnapshot?
+    @Binding var selected: Set<String>
+    @State private var expanded = true
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            ForEach(project.groups) { group in
+                MemoryToolInstanceSection(model: model, group: group, snapshot: snapshot, selected: $selected)
+            }
+        } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(project.path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "项目归属未知")
+                    .font(.system(size: 14, weight: .semibold))
+                Text("\(project.instanceCount) 个工具 · 合计 \(project.footprintBytes.map(MemoryFormat.bytes) ?? "超出计量范围")")
+                    .font(.system(size: 11)).foregroundStyle(MemoryStyle.secondary)
+                if let path = project.path { Text(path).font(.system(size: 10)).textSelection(.enabled) }
+            }
+        }
     }
 }

@@ -33,6 +33,7 @@ int gpt_list_pids(int **out_pids);
 int gpt_read_process(int pid, gpt_process_info *out);
 int gpt_signal_process(int pid, uint64_t birth, const char *executable, int signal_number);
 int gpt_validate_process(int pid, uint64_t birth, const char *executable);
+int gpt_read_working_directory(int pid, uint64_t birth, const char *executable, char *out, size_t capacity);
 int gpt_read_command(int pid, uint64_t birth, const char *executable, char *out, size_t capacity);
 void gpt_read_role_hint(int pid, char *out, size_t capacity);
 void gpt_read_system(gpt_system_info *out);

@@ -52,6 +52,8 @@ final class MemoryProcessActionsModel: ObservableObject {
     private var pendingWrites = 0
     private let observationDelays: [Double]
     private let protectedPIDs = ProcessControl.observerAncestors()
+    @Published private(set) var latestSnapshot: MemorySnapshot?
+    func updateSnapshot(_ snapshot: MemorySnapshot) { latestSnapshot = snapshot }
     @Published private(set) var isOptimizing = false
     @Published private(set) var optimizationMessage: String?
     private var optimizationQueue: [MemoryProcessActionRequest] = []
@@ -60,11 +62,15 @@ final class MemoryProcessActionsModel: ObservableObject {
     var hasPendingWork: Bool { isBusy || isObserving || isSavingRecords || isOptimizing }
 
     @Published private(set) var commandPreviews: [String: String] = [:]
+    @Published private(set) var toolContexts: [String: MemoryToolRuntimeContext] = [:]
+    private let contextReader: @Sendable (ProcessSample) -> MemoryToolRuntimeContext
+    private let projectPathsLoader: @Sendable () throws -> [String]
+    @Published private(set) var contextWarning: String?
     @Published private(set) var isLoadingCommands = false
     private var commandReadID = UUID()
 
     func clearCommandPreviews() {
-        commandReadID = UUID(); commandPreviews = [:]; isLoadingCommands = false
+        commandReadID = UUID(); commandPreviews = [:]; toolContexts = [:]; contextWarning = nil; isLoadingCommands = false
     }
 
     func loadCommandPreviews(candidates: [MemoryOptimizationCandidate], snapshot: MemorySnapshot?) {
@@ -81,19 +87,33 @@ final class MemoryProcessActionsModel: ObservableObject {
     func loadCommandPreview(for process: ProcessSample) { loadCommands([process]) }
 
     private func loadCommands(_ processes: [ProcessSample]) {
-        let readID = UUID(); commandReadID = readID; commandPreviews = [:]
+        let readID = UUID(); commandReadID = readID; commandPreviews = [:]; toolContexts = [:]
         var seen: Set<String> = []
         let targets = Array(processes.filter { seen.insert($0.key).inserted }.prefix(128))
         isLoadingCommands = true
-        queue.async { [weak self, targets] in
+        queue.async { [weak self, targets, contextReader, projectPathsLoader] in
+            var knownProjects: [String] = [], warning: String?
+            do { knownProjects = Array(Set(try projectPathsLoader().filter { $0.hasPrefix("/") }.prefix(2000).map(MemoryToolContextReader.normalized))) }
+            catch { warning = "项目索引暂不可读，仍按工作目录和 Git 仓库提供依据。" }
             var values: [String: String] = [:]
+            var contexts: [String: MemoryToolRuntimeContext] = [:]
             for process in targets {
-                do { values[process.key] = try ProcessCommandReader.read(process) }
-                catch { values[process.key] = Self.describe(error) }
+                let read = contextReader(process)
+                let context: MemoryToolRuntimeContext
+                if knownProjects.isEmpty { context = read }
+                else {
+                    let attribution = MemoryToolContextReader.project(process: process, arguments: read.arguments,
+                        directory: read.workingDirectory, knownProjects: knownProjects)
+                    context = .init(arguments: read.arguments, commandIssue: read.commandIssue, workingDirectory: read.workingDirectory,
+                        directoryIssue: read.directoryIssue, projectPath: attribution.path,
+                        projectEvidence: attribution.evidence, capturedAt: read.capturedAt)
+                }
+                contexts[process.key] = context
+                values[process.key] = context.command ?? context.commandIssue ?? "命令未知"
             }
             DispatchQueue.main.async {
                 guard let self, self.commandReadID == readID else { return }
-                self.commandPreviews = values; self.isLoadingCommands = false
+                self.commandPreviews = values; self.toolContexts = contexts; self.contextWarning = warning; self.isLoadingCommands = false
             }
         }
     }
@@ -105,7 +125,7 @@ final class MemoryProcessActionsModel: ObservableObject {
     }
 
     func startOptimization(candidates: [MemoryOptimizationCandidate], selected: Set<String>, snapshot: MemorySnapshot?, history: [MemorySnapshot]) {
-        guard !isBusy, !isObserving, !isOptimizing, pending == nil, let snapshot,
+        guard !isBusy, !isObserving, !isOptimizing, pending == nil, let snapshot = latestSnapshot ?? snapshot,
               Date().timeIntervalSince(snapshot.capturedAt) <= 30 else {
             optimizationMessage = "采样已过期或有其他操作，请刷新后重新扫描。"; return
         }
@@ -139,7 +159,10 @@ final class MemoryProcessActionsModel: ObservableObject {
     }
 
 
-    init(directoryURL: URL, control: ProcessControl = ProcessControl(send: MemoryProcessActionsModel.sendDesktop), observationDelays: [Double] = [1, 5, 10]) {
+    init(directoryURL: URL, control: ProcessControl = ProcessControl(send: MemoryProcessActionsModel.sendDesktop), observationDelays: [Double] = [1, 5, 10],
+         contextReader: @escaping @Sendable (ProcessSample) -> MemoryToolRuntimeContext = { MemoryToolContextReader.read($0) },
+         projectPathsLoader: @escaping @Sendable () throws -> [String] = { [] }) {
+        self.contextReader = contextReader; self.projectPathsLoader = projectPathsLoader
         self.directoryURL = directoryURL; self.control = control
         self.observationDelays = observationDelays.count == 3 && observationDelays.allSatisfy { $0.isFinite && $0 > 0 && $0 <= 10 }
             ? observationDelays.sorted() : [1, 5, 10]

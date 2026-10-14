@@ -260,7 +260,9 @@ public enum MemoryOptimizationPlanner {
 
 public enum ProcessCommandReader {
     /// Transient, on-demand display; not part of any persisted ProcessSample.
-    public static func read(_ process: ProcessSample) throws -> String {
+    public static func read(_ process: ProcessSample) throws -> String { format(try arguments(process)) }
+
+    public static func arguments(_ process: ProcessSample) throws -> [String] {
         guard process.ownership == "process_tree", !process.rootKey.isEmpty,
               process.pid > 1, process.pid <= Int(Int32.max) else {
             throw MemoryError.message("命令未知：进程归属未确认。")
@@ -273,7 +275,11 @@ public enum ProcessCommandReader {
         let arguments = buffer.prefix(Int(count)).split(separator: 0, omittingEmptySubsequences: false).dropLast().map {
             String(decoding: $0.map { UInt8(bitPattern: $0) }, as: UTF8.self)
         }
-        return arguments.map { argument in
+        return arguments
+    }
+
+    public static func format(_ arguments: [String]) -> String {
+        arguments.map { argument in
             if !argument.isEmpty && argument.allSatisfy({ $0.isLetter || $0.isNumber || "-._/:=@".contains($0) }) { return argument }
             return String(reflecting: argument)
         }.joined(separator: " ")
