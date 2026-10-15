@@ -8,6 +8,10 @@ usage() {
 }
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+version="$(cat "$project_dir/VERSION")"
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "VERSION 必须为 major.minor.patch 格式。" >&2; exit 1
+fi
 skip_build=false
 binary_path="${GPT_MANAGER_BIN:-}"
 cli_binary_path="${GPT_MANAGER_CLI_BIN:-}"
@@ -76,7 +80,7 @@ stage_app="$stage_dir/GPT Manager.app"
 mkdir -p "$stage_app/Contents/MacOS" "$stage_app/Contents/Resources"
 /usr/bin/install -m 755 "$binary_path" "$stage_app/Contents/MacOS/gpt-manager"
 /usr/bin/install -m 755 "$cli_binary_path" "$stage_app/Contents/Resources/gpt-mem"
-cat > "$stage_app/Contents/Info.plist" <<'PLIST'
+cat > "$stage_app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -87,8 +91,8 @@ cat > "$stage_app/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>gpt-manager</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-  <key>CFBundleShortVersionString</key><string>0.19.3</string>
-  <key>CFBundleVersion</key><string>0.19.3</string>
+  <key>CFBundleShortVersionString</key><string>$version</string>
+  <key>CFBundleVersion</key><string>$version</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>

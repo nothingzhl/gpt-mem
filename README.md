@@ -12,6 +12,8 @@ macOS 上独立运行的 ChatGPT / Codex 内存观察器与 Codex 会话查看�
 
 ## 桌面应用
 
+GitHub Actions 会为 PR 和默认分支运行双架构测试、Release 构建及打包验证，提供桌面 ZIP、独立 CLI、SHA-256 和构建信息。版本标签通过检查后生成草稿 Release；下载与发布步骤见 [CI 与发布产物](docs/releases.md)。版本号统一维护在 `VERSION`。
+
 界面采用 CC Switch 式的左侧栏和主内容区：
 
 - **内存概览**：先看分析结论和检查建议，再查看 GPT 进程合计、观察器自身、系统内存信息和内存变化。
