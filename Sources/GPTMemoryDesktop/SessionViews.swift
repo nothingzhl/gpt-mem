@@ -537,10 +537,6 @@ private struct SessionMessageCard: View {
     let matchesSearch: Bool
     @Binding var isExpanded: Bool
     let onJump: (String) -> Void
-    @State private var showFullText = false
-
-    private var shortenedText: String { String(message.text.prefix(2_000)) }
-    private var isLongText: Bool { message.text.utf8.count > 2_000 && shortenedText.utf8.count < message.text.utf8.count }
 
     private var isCollapsed: Bool {
         switch message.kind {
@@ -565,7 +561,9 @@ private struct SessionMessageCard: View {
         VStack(alignment: .leading, spacing: 8) {
             if isCollapsed {
                 DisclosureGroup(isExpanded: $isExpanded) {
-                    content.padding(.top, 8)
+                    // DisclosureGroup constructs its content even while closed.
+                    // Tool results can contain megabytes; don't prepare hidden text.
+                    if isExpanded { content.padding(.top, 8) }
                 } label: { heading }
             } else {
                 heading
@@ -605,16 +603,114 @@ private struct SessionMessageCard: View {
                     }
                 }
             }
-            Text(message.text.isEmpty ? "（日志未记录文本）"
-                 : (isLongText && !showFullText ? shortenedText + "\n…" : message.text))
-                .font(.system(size: 12, design: message.kind == .toolCall || message.kind == .toolResult ? .monospaced : .default))
-                .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            if isLongText {
-                Button(showFullText ? "收起长消息" : "展开全文") { showFullText.toggle() }
-                    .font(.system(size: 10)).buttonStyle(.link)
+            SessionMessageBody(text: message.text,
+                monospaced: message.kind == .toolCall || message.kind == .toolResult).equatable()
+        }
+    }
+}
+
+/// Small messages keep their natural height. A full long message uses native
+/// viewport layout instead of making the outer transcript measure every line.
+struct SessionMessageBody: View, Equatable {
+    let text: String
+    var monospaced = false
+    @State private var showFullText = false
+
+    init(text: String, monospaced: Bool = false, initiallyExpanded: Bool = false) {
+        self.text = text
+        self.monospaced = monospaced
+        _showFullText = State(initialValue: initiallyExpanded)
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.monospaced == rhs.monospaced && lhs.text == rhs.text
+    }
+
+    var body: some View {
+        let boundary = text.index(text.startIndex, offsetBy: 2_000, limitedBy: text.endIndex)
+        let isLong = boundary.map { $0 < text.endIndex } ?? false
+        VStack(alignment: .leading, spacing: 8) {
+            if isLong && showFullText {
+                SessionFullMessageTextView(text: text, monospaced: monospaced).equatable()
+                    .frame(height: 320)
+                    .background(MemoryStyle.background.opacity(0.5))
+                    .clipShape(RoundedRectangle(cornerRadius: 5))
+            } else {
+                let displayed = text.isEmpty ? "（日志未记录文本）"
+                    : (isLong ? String(text[..<boundary!]) + "\n…" : text)
+                Text(displayed)
+                    .font(.system(size: 12, design: monospaced ? .monospaced : .default))
+                    .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if isLong {
+                HStack(spacing: 14) {
+                    Button(showFullText ? "收起长消息" : "展开全文") { showFullText.toggle() }
+                        .font(.system(size: 10)).buttonStyle(.link)
+                        .accessibilityIdentifier("session-expand-full-text")
+                    if showFullText {
+                        Text("在正文内滚动、选择或 ⌘F 查找")
+                            .font(.system(size: 10)).foregroundStyle(MemoryStyle.secondary)
+                    }
+                    Button("复制全文") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(text, forType: .string)
+                    }.font(.system(size: 10)).buttonStyle(.link)
+                }
             }
         }
+    }
+}
+
+struct SessionFullMessageTextView: NSViewRepresentable, Equatable {
+    let text: String
+    var monospaced = false
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.monospaced == rhs.monospaced && lhs.text == rhs.text
+    }
+    final class Coordinator {
+        var text: String?
+        var monospaced: Bool?
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        let view = NSTextView(usingTextLayoutManager: true)
+        view.isEditable = false
+        view.isSelectable = true
+        view.isRichText = false
+        view.drawsBackground = false
+        view.usesFindBar = true
+        view.isVerticallyResizable = true
+        view.isHorizontallyResizable = false
+        view.autoresizingMask = [.width]
+        view.minSize = .zero
+        view.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        view.textContainer?.widthTracksTextView = true
+        view.textContainerInset = NSSize(width: 5, height: 6)
+        view.setAccessibilityLabel("会话消息全文")
+        scroll.documentView = view
+        return scroll
+    }
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        guard let view = scroll.documentView as? NSTextView else { return }
+        if context.coordinator.monospaced != monospaced {
+            view.font = monospaced ? .monospacedSystemFont(ofSize: 12, weight: .regular) : .systemFont(ofSize: 12)
+            view.textColor = .labelColor
+            context.coordinator.monospaced = monospaced
+        }
+        guard context.coordinator.text != text else { return }
+        context.coordinator.text = text
+        view.string = text
+        view.setSelectedRange(NSRange(location: 0, length: 0))
+        scroll.contentView.scroll(to: .zero)
+        scroll.reflectScrolledClipView(scroll.contentView)
+    }
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSScrollView, context: Context) -> CGSize? {
+        CGSize(width: proposal.width ?? 500, height: proposal.height ?? 320)
     }
 }
 

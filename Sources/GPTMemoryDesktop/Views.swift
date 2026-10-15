@@ -44,7 +44,7 @@ private enum MemoryPage: String, CaseIterable, Identifiable {
 }
 
 struct MemoryDesktopView: View {
-    @ObservedObject var model: DesktopModel
+    @Bindable var model: DesktopModel
     @State private var selectedPage: MemoryPage = .overview
     @State private var selectedRole: ProcessRole?
     @State private var minutes = 30
@@ -112,6 +112,7 @@ struct MemoryDesktopView: View {
         .onChange(of: minutes) { _, value in model.setWindow(seconds: Double(value * 60)) }
         .onChange(of: model.interval) { _, value in model.setInterval(value) }
         .onChange(of: selectedPage) { _, value in
+            model.setMemoryWorkspaceActive(value == .overview || value == .processes || value == .history)
             if value == .knowledge { model.knowledgeAIModel.reloadSettings() }
             else if value == .sessions { model.sessionAIModel.reloadSettings() }
             else if value == .settings || value == .overview || value == .history { model.aiModel.reloadSettings() }

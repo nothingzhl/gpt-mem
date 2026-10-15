@@ -1546,6 +1546,14 @@ def release_inputs(project: Path, render: bool) -> tuple[Path, list[Path]]:
     return release, objects
 
 
+def desktop_sources(project: Path, render: bool) -> list[Path]:
+    desktop = project / "Sources" / "GPTMemoryDesktop"
+    names = ["SessionManagementModel.swift", "SessionDesktopModel.swift"]
+    if render:
+        names += ["SessionViews.swift", "SessionProjectViews.swift", "SessionManagementViews.swift", "Style.swift", "SessionHandoffAIViews.swift", "DesktopAIModel.swift", "AIReportLibraryModel.swift", "AIViews.swift", "AIReportViews.swift", "AIProviderEditorModel.swift", "PromptTemplateViews.swift", "PromptTemplateLibraryModel.swift"]
+    return [desktop / name for name in names]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="使用临时夹具验证生产 Codex 会话桌面状态机，并可离屏渲染真实界面。")
     parser.add_argument("--render", nargs="?", const="reports/desktop-sessions-preview.png", metavar="PNG")
@@ -1561,10 +1569,7 @@ def main() -> int:
         main_swift = directory / "main.swift"
         main_swift.write_text(SWIFT_CHECKS, encoding="utf-8")
         executable = directory / "session-checks"
-        desktop = project / "Sources" / "GPTMemoryDesktop"
-        sources = [desktop / "SessionManagementModel.swift", desktop / "SessionDesktopModel.swift"]
-        if output:
-            sources += [desktop / "SessionViews.swift", desktop / "SessionProjectViews.swift", desktop / "SessionManagementViews.swift", desktop / "Style.swift", desktop / "SessionHandoffAIViews.swift", desktop / "DesktopAIModel.swift", desktop / "AIReportLibraryModel.swift", desktop / "AIViews.swift", desktop / "AIReportViews.swift", desktop / "AIProviderEditorModel.swift", desktop / "PromptTemplateViews.swift", desktop / "PromptTemplateLibraryModel.swift"]
+        sources = desktop_sources(project, bool(output))
         command = ["swiftc", "-swift-version", "5", "-target", f"{architecture}-apple-macosx14.0",
                    "-module-cache-path", str(directory / "module-cache"), "-I", str(release / "Modules"),
                    "-I", str(release / "CNative.build"), "-o", str(executable)]

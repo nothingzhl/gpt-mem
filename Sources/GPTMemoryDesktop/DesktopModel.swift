@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import Combine
+import Observation
 import UniformTypeIdentifiers
 import Darwin
 import GPTMemoryCore
@@ -18,25 +19,26 @@ private struct DesktopUpdate {
     var notice: String?
 }
 
-@MainActor
-final class DesktopModel: ObservableObject {
-    @Published var snapshot: MemorySnapshot?
-    @Published var history: [MemorySnapshot] = []
-    @Published var analysis: MemoryAnalysis?
-    @Published var isMonitoring = false
-    @Published var isBusy = false
-    @Published var errorMessage: String?
-    @Published var historyErrorMessage: String?
-    @Published var noticeMessage: String?
-    @Published var interval: Double = 5
-    @Published var windowSeconds: TimeInterval = 1800
-    @Published var modeLabel = "准备就绪"
-    @Published var isSessionWorkspaceActive = false
-    @Published var isReportLibraryActive = false
-    @Published var isKnowledgeWorkspaceActive = false
-    @Published var isSpeedWorkspaceActive = false
-    @Published var lastExportURL: URL?
-    @Published var lastDiagnosticURL: URL?
+@MainActor @Observable
+final class DesktopModel {
+    var snapshot: MemorySnapshot?
+    var history: [MemorySnapshot] = []
+    var analysis: MemoryAnalysis?
+    private(set) var memorySampleCount = 0
+    var isMonitoring = false
+    var isBusy = false
+    var errorMessage: String?
+    var historyErrorMessage: String?
+    var noticeMessage: String?
+    var interval: Double = 5
+    var windowSeconds: TimeInterval = 1800
+    var modeLabel = "准备就绪"
+    var isSessionWorkspaceActive = false
+    var isReportLibraryActive = false
+    var isKnowledgeWorkspaceActive = false
+    var isSpeedWorkspaceActive = false
+    var lastExportURL: URL?
+    var lastDiagnosticURL: URL?
     let databaseURL: URL
     let aiModel: DesktopAIModel
     let sessionAIModel: DesktopAIModel
@@ -46,6 +48,7 @@ final class DesktopModel: ObservableObject {
     let knowledgeAIModel: DesktopAIModel
     let processActions: MemoryProcessActionsModel
     private var isPerformingFileOperation = false
+    @ObservationIgnored private var isMemoryWorkspaceActive = true
     var isFileOperationInProgress: Bool { isPerformingFileOperation }
 
     var displayedErrorMessage: String? {
@@ -53,14 +56,21 @@ final class DesktopModel: ObservableObject {
         return messages.isEmpty ? nil : messages.joined(separator: "\n")
     }
 
-    private lazy var service = DesktopSamplingService(databaseURL: databaseURL) { [weak self] update in
+    @ObservationIgnored private lazy var service = DesktopSamplingService(databaseURL: databaseURL) { [weak self] update in
         DispatchQueue.main.async {
             guard let self else { return }
             if let snapshot = update.snapshot { self.snapshot = snapshot; self.processActions.updateSnapshot(snapshot) }
             self.history = update.history
             self.analysis = update.analysis
-            self.aiModel.updateWindow(start: update.analysis?.start, end: update.analysis?.end,
-                                      selectionSeconds: self.windowSeconds)
+            if self.isMemoryWorkspaceActive {
+                self.memorySampleCount = update.history.count
+                if self.aiModel.currentWindowStart != update.analysis?.start
+                || self.aiModel.currentWindowEnd != update.analysis?.end
+                || self.aiModel.currentWindowSelectionSeconds != self.windowSeconds {
+                    self.aiModel.updateWindow(start: update.analysis?.start, end: update.analysis?.end,
+                                              selectionSeconds: self.windowSeconds)
+                }
+            }
             self.isMonitoring = update.monitoring
             self.modeLabel = update.mode
             self.isBusy = self.isPerformingFileOperation
@@ -101,6 +111,10 @@ final class DesktopModel: ObservableObject {
         service.start(interval: interval, window: windowSeconds)
     }
     func stopMonitoring() { service.stop() }
+    func setMemoryWorkspaceActive(_ active: Bool) {
+        isMemoryWorkspaceActive = active
+        service.setHistoryActive(active)
+    }
     func refresh() { isBusy = true; service.refresh(window: windowSeconds) }
     func refreshCurrentPage() {
         if isSpeedWorkspaceActive {
@@ -202,7 +216,6 @@ private final class DesktopSamplingService {
                                      autoreleaseFrequency: .workItem)
     private let operationQueue = DispatchQueue(label: "local.gpt-manager.files", qos: .utility,
                                               autoreleaseFrequency: .workItem)
-    private let historyCacheLimit = 32 * 1_024 * 1_024
     private let databaseURL: URL
     private let handler: (DesktopUpdate) -> Void
     private let sample: () throws -> MemorySnapshot
@@ -216,6 +229,10 @@ private final class DesktopSamplingService {
     private var lastMaintenance = Date.distantPast
     private var lastSnapshot: MemorySnapshot?
     private var historyState = MemoryHistoryState()
+    private var historyActive = true
+    private var loadedWindow: TimeInterval?
+    private var loadedSince: Date?
+    private var loadedDataVersion: Int64?
     private var mode = "已暂停"
 
     init(databaseURL: URL, sample: @escaping () throws -> MemorySnapshot = NativeCollector().sample,
@@ -233,13 +250,15 @@ private final class DesktopSamplingService {
             self.timer?.cancel(); self.timer = nil
             do {
                 self.lock = try MonitorLock(url: self.databaseURL.deletingLastPathComponent().appendingPathComponent("monitor.lock"))
-                self.writer = try MemoryStore(url: self.databaseURL, decodedCacheByteLimit: self.historyCacheLimit)
+                self.writer = try MemoryStore(url: self.databaseURL)
+                self.loadedWindow = nil; self.loadedDataVersion = nil
                 self.reader = nil; self.mode = "正在采集"
             } catch MemoryError.monitorBusy {
                 self.writer = nil; self.lock = nil
                 if FileManager.default.fileExists(atPath: self.databaseURL.path),
-                   let reader = try? MemoryStore(url: self.databaseURL, readOnly: true, decodedCacheByteLimit: self.historyCacheLimit) {
+                   let reader = try? MemoryStore(url: self.databaseURL, readOnly: true) {
                     self.reader = reader; self.mode = "外部采集 · 只读"
+                    self.loadedWindow = nil; self.loadedDataVersion = nil
                     self.handler(.init(snapshot: nil, history: self.historyState.snapshots, analysis: self.historyState.analysis, monitoring: false,
                         mode: self.mode, historyError: self.historyState.loadError,
                         notice: "已有采集器在记录，这个窗口以只读方式查看。"))
@@ -276,12 +295,23 @@ private final class DesktopSamplingService {
             if self.timer != nil { self.timer?.cancel(); self.timer = nil; self.scheduleTimer() }
         }
     }
+    func setHistoryActive(_ active: Bool) {
+        queue.async {
+            guard self.historyActive != active else { return }
+            self.historyActive = active
+            self.historyState = MemoryHistoryState()
+            self.loadedWindow = nil; self.loadedDataVersion = nil
+            // Collection and the shared SQLite lock continue while other pages
+            // are visible. No full history or derived analysis remains retained.
+            self.publish(snapshot: self.lastSnapshot)
+        }
+    }
     func refresh(window: TimeInterval) {
         queue.async {
             self.window = window
             if self.timer != nil { self.tick() }
             else {
-                do { self.lastSnapshot = try self.sample(); self.publish(snapshot: self.lastSnapshot) }
+                do { self.lastSnapshot = try self.sample(); self.publish(snapshot: self.lastSnapshot, forceReload: true) }
                 catch { self.publish(snapshot: self.lastSnapshot, error: String(describing: error)) }
             }
         }
@@ -300,13 +330,16 @@ private final class DesktopSamplingService {
     private func collectAndPublish() {
         do {
             var notice: String?
+            var savedSnapshot: MemorySnapshot?
+            var retentionChanged = false
             // When an external CLI writer exits, the desktop can take over the same
             // lock instead of showing a stale "external collection" state forever.
             if writer == nil, reader != nil {
                 do {
                     let recovered = try MonitorLock(url: databaseURL.deletingLastPathComponent().appendingPathComponent("monitor.lock"))
-                    let store = try MemoryStore(url: databaseURL, decodedCacheByteLimit: historyCacheLimit)
+                    let store = try MemoryStore(url: databaseURL)
                     lock = recovered; writer = store; reader = nil; mode = "正在采集"
+                    loadedWindow = nil; loadedDataVersion = nil
                     notice = "外部采集已结束，桌面已接管记录。"
                 } catch MemoryError.monitorBusy {
                     // The external writer is still active; continue reading.
@@ -319,22 +352,45 @@ private final class DesktopSamplingService {
             if let writer {
                 let snapshot = try sample()
                 try writer.save(snapshot)
-                lastSnapshot = snapshot
+                lastSnapshot = snapshot; savedSnapshot = snapshot
                 if snapshot.capturedAt.timeIntervalSince(lastMaintenance) >= 60 {
-                    try writer.maintenance(now: snapshot.capturedAt); lastMaintenance = snapshot.capturedAt
+                    let removed = try writer.maintenance(now: snapshot.capturedAt)
+                    retentionChanged = removed > 0 && (historyState.snapshots.first.map {
+                        $0.capturedAt < snapshot.capturedAt.addingTimeInterval(-24 * 60 * 60)
+                    } ?? false)
+                    lastMaintenance = snapshot.capturedAt
                 }
             } else if let reader { lastSnapshot = try reader.latest() }
-            publish(snapshot: lastSnapshot, notice: notice)
-        } catch { publish(snapshot: lastSnapshot, error: String(describing: error)) }
+            publish(snapshot: lastSnapshot, savedSnapshot: savedSnapshot, forceReload: retentionChanged, notice: notice)
+        } catch { publish(snapshot: lastSnapshot, forceReload: true, error: String(describing: error)) }
     }
-    private func publish(snapshot: MemorySnapshot?, error: String? = nil, notice: String? = nil) {
-        historyState.refresh {
-            let store: MemoryStore?
-            if let writer { store = writer }
-            else if let reader { store = reader }
-            else if FileManager.default.fileExists(atPath: databaseURL.path) { store = try MemoryStore(url: databaseURL, readOnly: true) }
-            else { store = nil }
-            return try store?.load(since: Date().addingTimeInterval(-window)) ?? []
+    private func publish(snapshot: MemorySnapshot?, savedSnapshot: MemorySnapshot? = nil, forceReload: Bool = false,
+                         error: String? = nil, notice: String? = nil) {
+        if historyActive {
+            let since = Date().addingTimeInterval(-window)
+            do {
+                let liveStore = writer ?? reader
+                let version = try liveStore?.dataVersion()
+                var advanced = false
+                if !forceReload, loadedWindow == window, historyState.loadError == nil,
+                   loadedSince.map({ since >= $0 }) == true,
+                   liveStore == nil || loadedDataVersion == version {
+                    // Reuse the value that was just encoded, instead of SELECT,
+                    // decoding and comparing every old process on each timer tick.
+                    advanced = historyState.advance(saved: savedSnapshot, since: since)
+                    if advanced { loadedSince = since }
+                }
+                if !advanced {
+                    let store = try liveStore ?? (FileManager.default.fileExists(atPath: databaseURL.path)
+                        ? MemoryStore(url: databaseURL, readOnly: true) : nil)
+                    if historyState.refresh(using: { try store?.load(since: since) ?? [] }) {
+                        loadedWindow = window; loadedSince = since; loadedDataVersion = version
+                    } else { loadedWindow = nil }
+                }
+            } catch {
+                historyState.refresh { throw error }
+                loadedWindow = nil
+            }
         }
         handler(.init(snapshot: snapshot, history: historyState.snapshots, analysis: historyState.analysis,
             monitoring: writer != nil, mode: mode, error: error, historyError: historyState.loadError, notice: notice))

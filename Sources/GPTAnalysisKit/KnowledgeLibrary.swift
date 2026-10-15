@@ -79,8 +79,9 @@ public struct KnowledgeCatalog: Equatable, Sendable {
     public var entries: [KnowledgeEntry]
     public init(entries: [KnowledgeEntry] = []) { self.entries = entries }
     public func duplicates(of draft: KnowledgeDraft) -> [KnowledgeEntry] {
-        entries.filter { $0.id != draft.id && $0.deletedAt == nil && $0.current.state != .archived && $0.current.scopeIdentity == draft.scopeIdentity
-            && $0.current.body.trimmingCharacters(in: .whitespacesAndNewlines) == draft.body.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let scope = draft.scopeIdentity, body = draft.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        return entries.filter { $0.id != draft.id && $0.deletedAt == nil && $0.current.state != .archived && $0.current.scopeIdentity == scope
+            && $0.current.body.trimmingCharacters(in: .whitespacesAndNewlines) == body }
     }
     public func bundle(ids: Set<String>, project: String, session: String) -> String {
         let selected = entries.filter { ids.contains($0.id) && $0.deletedAt == nil && $0.current.applies(project: project, session: session) }

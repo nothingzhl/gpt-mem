@@ -112,18 +112,18 @@ public enum MemoryAnalyzer {
         }
         let total = signed(last.totalFootprintBytes) - signed(first.totalFootprintBytes)
         let unresolved = total - added - exited - existing
-        var warnings = ordered.flatMap(\.warnings)
-        let hasMissing = ordered.contains { !$0.unavailablePIDs.isEmpty }
+        let scan = scanHistory(ordered)
+        var warnings = Array(scan.warnings)
+        let hasMissing = scan.hasMissing
         if hasMissing {
             warnings.append("区间内存在未取得指标的进程；缺失值不代表内存为零或进程退出，总量与增长归因可能不完整。")
         }
         if ordered.count == 1 { warnings.append("只有一个快照，无法判断增长趋势。") }
-        let bootIDs = Set(ordered.flatMap { knownBootIDs($0) })
-        if bootIDs.count > 1 {
+        if scan.bootIDs.count > 1 {
             warnings.append("观察区间跨越系统启动实例；进程按启动身份分开，不能作为同一进程的持续增长。")
         }
-        let events = makeEvents(ordered)
-        let candidates = growthCandidates(ordered)
+        let events = scan.events
+        let candidates = growthCandidates(scan.histories, snapshots: ordered)
         if !candidates.isEmpty {
             warnings.append("持续增长候选仅为疑似现象，不能证明泄漏或会话已闲置；工具不会结束任何进程。")
         }
@@ -147,88 +147,127 @@ public enum MemoryAnalyzer {
     }
 
     private static func samplesByKey(_ samples: [ProcessSample]) -> [String: ProcessSample] {
-        Dictionary(samples.map { ($0.key, $0) }, uniquingKeysWith: { _, latest in latest })
+        var result: [String: ProcessSample] = [:]
+        result.reserveCapacity(samples.count)
+        for sample in samples { result[sample.key] = sample }
+        return result
     }
 
     private static func signed(_ value: UInt64) -> Int64 { Int64(clamping: value) }
 
-    private static func makeEvents(_ snapshots: [MemorySnapshot]) -> [MemoryEvent] {
+    private struct FootprintObservation {
+        let snapshotIndex: Int
+        let bytes: UInt64
+        let unavailable: Bool
+    }
+
+    private struct ProcessHistory {
+        var last: ProcessSample
+        var observations: [FootprintObservation] = []
+    }
+
+    private struct HistoryScan {
         var events: [MemoryEvent] = []
+        var histories: [String: ProcessHistory] = [:]
+        var bootIDs: Set<String> = []
+        var warnings: Set<String> = []
+        var hasMissing = false
+    }
+
+    // Events and growth used to rebuild every snapshot's process dictionary in
+    // separate passes and retain full ProcessSample copies for every observation.
+    // Walk once, retaining only an index, footprint and gap flag for each point.
+    private static func scanHistory(_ snapshots: [MemorySnapshot]) -> HistoryScan {
+        var result = HistoryScan()
         var preceding: [String: ProcessSample] = [:]
+        var previousBoot: Set<String> = []
         for (index, current) in snapshots.enumerated() {
-            for pid in Set(current.unavailablePIDs).sorted() {
-                events.append(MemoryEvent(capturedAt: current.capturedAt, kind: .measurementUnavailable,
+            result.warnings.formUnion(current.warnings)
+            let unavailable = Set(current.unavailablePIDs)
+            result.hasMissing = result.hasMissing || !unavailable.isEmpty
+            for pid in unavailable.sorted() {
+                result.events.append(MemoryEvent(capturedAt: current.capturedAt, kind: .measurementUnavailable,
                                           key: nil, pid: pid, role: nil, message: "PID \(pid) 未取得指标，状态未知。"))
             }
             let b = samplesByKey(current.processes)
+            var currentBoot: Set<String> = []
+            for process in current.processes {
+                if !process.bootID.hasPrefix("boot-unavailable") && !process.bootID.hasPrefix("unknown-boot") {
+                    currentBoot.insert(process.bootID)
+                }
+            }
+            for (key, process) in b {
+                if snapshots.count >= 11 {
+                    if result.histories[key] == nil { result.histories[key] = ProcessHistory(last: process) }
+                    result.histories[key]!.last = process
+                    result.histories[key]!.observations.append(.init(snapshotIndex: index, bytes: process.footprintBytes,
+                                                                    unavailable: unavailable.contains(process.pid)))
+                }
+            }
+            result.bootIDs.formUnion(currentBoot)
             let a = preceding
             preceding = b
+            defer { previousBoot = currentBoot }
             guard index > 0 else { continue }
             let previous = snapshots[index - 1]
-            let previousBoot = knownBootIDs(previous)
-            let currentBoot = knownBootIDs(current)
             if !previousBoot.isEmpty && !currentBoot.isEmpty && previousBoot.isDisjoint(with: currentBoot)
-                && Set(a.keys).isDisjoint(with: Set(b.keys)) {
-                events.append(MemoryEvent(capturedAt: current.capturedAt, kind: .bootChanged,
+                && !a.keys.contains(where: { b[$0] != nil }) {
+                result.events.append(MemoryEvent(capturedAt: current.capturedAt, kind: .bootChanged,
                                           key: nil, pid: nil, role: nil, message: "检测到系统启动身份变化。"))
             }
-            for key in Set(b.keys).subtracting(a.keys).sorted() {
+            for key in b.keys.filter({ a[$0] == nil }).sorted() {
                 guard let p = b[key] else { continue }
                 if previous.unavailablePIDs.contains(p.pid) && !previous.processes.contains(where: { $0.pid == p.pid }) { continue }
-                events.append(MemoryEvent(capturedAt: current.capturedAt, kind: .processAdded,
+                result.events.append(MemoryEvent(capturedAt: current.capturedAt, kind: .processAdded,
                                           key: key, pid: p.pid, role: p.role, message: "新增 \(p.role.label) 进程 PID \(p.pid)。"))
             }
-            for key in Set(a.keys).subtracting(b.keys).sorted() {
+            for key in a.keys.filter({ b[$0] == nil }).sorted() {
                 guard let p = a[key] else { continue }
                 if current.unavailablePIDs.contains(p.pid) && !current.processes.contains(where: { $0.pid == p.pid }) { continue }
-                events.append(MemoryEvent(capturedAt: current.capturedAt, kind: .processExited,
+                result.events.append(MemoryEvent(capturedAt: current.capturedAt, kind: .processExited,
                                           key: key, pid: p.pid, role: p.role, message: "已退出 \(p.role.label) 进程 PID \(p.pid)。"))
             }
         }
-        return events
+        return result
     }
 
-    private static func knownBootIDs(_ snapshot: MemorySnapshot) -> Set<String> {
-        Set(snapshot.processes.map(\.bootID).filter {
-            !$0.hasPrefix("boot-unavailable") && !$0.hasPrefix("unknown-boot")
-        })
-    }
-
-    private static func growthCandidates(_ snapshots: [MemorySnapshot]) -> [GrowthCandidate] {
+    private static func growthCandidates(_ histories: [String: ProcessHistory], snapshots: [MemorySnapshot]) -> [GrowthCandidate] {
         guard snapshots.count >= 11 else { return [] }
-        var histories: [String: [(Date, ProcessSample)]] = [:]
-        for snapshot in snapshots {
-            for sample in samplesByKey(snapshot.processes).values {
-                histories[sample.key, default: []].append((snapshot.capturedAt, sample))
-            }
-        }
         var candidates: [GrowthCandidate] = []
-        for (key, history) in histories {
+        for (key, trace) in histories {
+            let history = trace.observations
             guard let last = history.last else { continue }
+            let lastDate = snapshots[last.snapshotIndex].capturedAt
             // An earlier flat hour must not hide growth during the latest 10–15 minutes.
             // Try the recent 10-minute window first, then a 15-minute window for
             // slower but still sustained growth. Never bridge missing observations.
-            let windows = [600.0, 900.0].map { duration in
-                let cutoff = last.0.addingTimeInterval(-duration)
-                let baseline = history.lastIndex(where: { $0.0 <= cutoff }) ?? 0
-                return Array(history[baseline...])
-            }
             var match: GrowthCandidate?
-            for window in windows {
+            for duration in [600.0, 900.0] {
+                let cutoff = lastDate.addingTimeInterval(-duration)
+                let baseline = history.lastIndex(where: { snapshots[$0.snapshotIndex].capturedAt <= cutoff }) ?? 0
+                let window = history[baseline...]
                 guard let first = window.first, window.count >= 11,
-                      last.0.timeIntervalSince(first.0) >= 600 else { continue }
-                let growth = signed(last.1.footprintBytes) - signed(first.1.footprintBytes)
+                      lastDate.timeIntervalSince(snapshots[first.snapshotIndex].capturedAt) >= 600 else { continue }
+                let firstDate = snapshots[first.snapshotIndex].capturedAt
+                let growth = signed(last.bytes) - signed(first.bytes)
                 guard growth >= 100 * 1_024 * 1_024 else { continue }
                 // A sparse or interrupted trace cannot establish sustained growth.
-                let relevant = snapshots.filter { $0.capturedAt >= first.0 && $0.capturedAt <= last.0 }
-                guard window.count == relevant.count,
-                      !relevant.contains(where: { $0.unavailablePIDs.contains(last.1.pid) }),
-                      zip(window, window.dropFirst()).allSatisfy({ $1.0.timeIntervalSince($0.0) > 0 && $1.0.timeIntervalSince($0.0) <= 120 }) else { continue }
-                let positive = zip(window, window.dropFirst()).filter { $1.1.footprintBytes > $0.1.footprintBytes }.count
+                // Contiguous snapshot indices prove no missing observations.
+                // Equal timestamp neighbors outside the slice must also count,
+                // matching the original whole-history time-range selection.
+                guard window.count == last.snapshotIndex - first.snapshotIndex + 1,
+                      (first.snapshotIndex == 0 || snapshots[first.snapshotIndex - 1].capturedAt < firstDate),
+                      (last.snapshotIndex == snapshots.count - 1 || snapshots[last.snapshotIndex + 1].capturedAt > lastDate),
+                      !window.contains(where: \.unavailable),
+                      zip(window, window.dropFirst()).allSatisfy({
+                          let span = snapshots[$1.snapshotIndex].capturedAt.timeIntervalSince(snapshots[$0.snapshotIndex].capturedAt)
+                          return span > 0 && span <= 120
+                      }) else { continue }
+                let positive = zip(window, window.dropFirst()).reduce(0) { $0 + ($1.1.bytes > $1.0.bytes ? 1 : 0) }
                 let fraction = Double(positive) / Double(window.count - 1)
                 guard fraction >= 0.7 else { continue }
-                match = GrowthCandidate(key: key, pid: last.1.pid, role: last.1.role,
-                                        executable: last.1.executable, start: first.0, end: last.0,
+                match = GrowthCandidate(key: key, pid: trace.last.pid, role: trace.last.role,
+                                        executable: trace.last.executable, start: firstDate, end: lastDate,
                                         netGrowthBytes: growth, sampleCount: window.count,
                                         positiveIncrementFraction: fraction)
                 break

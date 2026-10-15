@@ -16,9 +16,9 @@ private struct ExtractionRequest: Identifiable { let id = UUID(); let transcript
 private struct BundleRequest: Identifiable { let id = UUID(); let catalog: KnowledgeCatalog; let ids: Set<String> }
 
 struct KnowledgeWorkspace: View {
-    @ObservedObject var model: KnowledgeDesktopModel
-    @ObservedObject var ai: DesktopAIModel
-    @ObservedObject var sessions: SessionDesktopModel
+    @Bindable var model: KnowledgeDesktopModel
+    let ai: DesktopAIModel
+    let sessions: SessionDesktopModel
     let onOpenSessions: () -> Void
     @State private var sourceTab = false
     @State private var selected: String?
@@ -116,7 +116,7 @@ struct KnowledgeWorkspace: View {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack { Text(source.title).font(.title3); Spacer(); Button("导入副本并审核") { model.editor = .init(draft: source.importedDraft(), expected: nil) }.disabled(model.loadError != nil) }
                         if source.relativePath == "MEMORY.md" { CodexOriginalControls(model: model, source: source) }
-                        ScrollView { Text(source.text).font(.system(size: 12, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+                        KnowledgeTextView(text: source.text, monospaced: true).equatable()
                     }.padding(12)
                 } else { Text(model.isReadingSources ? "正在读取本地 Markdown 记忆…" : "选择文件查看；搜索覆盖已读取的正文").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity) }
             }.frame(maxHeight: .infinity)
@@ -125,7 +125,7 @@ struct KnowledgeWorkspace: View {
 }
 
 private struct KnowledgeEntryDetail: View {
-    @ObservedObject var model: KnowledgeDesktopModel
+    @Bindable var model: KnowledgeDesktopModel
     let entry: KnowledgeEntry
     @State private var version: Int?
     @State private var confirmDelete = false
@@ -161,12 +161,12 @@ private struct KnowledgeEntryDetail: View {
                 }.disabled(model.isSaving || model.loadError != nil || entry.deletedAt != nil)
                 Button("导出全部版本") { exportHistory() }
             }
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    Text(revision.draft.body).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                    Text("保存时间：\(revision.savedAt.formatted())").font(.caption).foregroundStyle(.secondary)
+            KnowledgeTextView(text: revision.draft.body).equatable()
+            Text("保存时间：\(revision.savedAt.formatted())").font(.caption).foregroundStyle(.secondary)
+            if !revision.draft.sources.isEmpty {
+                ScrollView { VStack(alignment: .leading, spacing: 8) {
                     ForEach(revision.draft.sources) { source in Text("来源：\(source.origin.title) · \(source.label)\n\(source.locator)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
-                }
+                }.frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 100)
             }
         }.id(entry.id).onChange(of: entry.id) { _, _ in version = nil; confirmDelete = false }
         .alert("永久删除这条记忆？", isPresented: $confirmDelete) {
@@ -184,7 +184,7 @@ private struct KnowledgeEntryDetail: View {
 }
 
 private struct KnowledgeEditor: View {
-    @ObservedObject var model: KnowledgeDesktopModel
+    @Bindable var model: KnowledgeDesktopModel
     let request: KnowledgeEditRequest
     @State private var draft: KnowledgeDraft
     @State private var error: String?
@@ -229,16 +229,16 @@ private struct KnowledgeBundleView: View {
     @State private var session = ""
     @State private var error: String?
     @Environment(\.dismiss) private var dismiss
-    private var text: String { request.catalog.bundle(ids: request.ids, project: project, session: session) }
-    private var oversized: Bool { text.utf8.count > 131_072 }
     private var count: Int { request.catalog.entries.filter { request.ids.contains($0.id) && $0.deletedAt == nil && $0.current.applies(project: project, session: session) }.count }
     var body: some View {
+        let text = request.catalog.bundle(ids: request.ids, project: project, session: session)
+        let oversized = text.utf8.count > 131_072
         VStack(alignment: .leading, spacing: 12) {
             Text("预览可复用记忆").font(.title2)
             TextField("目标项目绝对路径", text: $project).textFieldStyle(.roundedBorder)
             TextField("目标会话 ID（可选）", text: $session).textFieldStyle(.roundedBorder)
             Text("匹配 \(count) 条 / 所选 \(request.ids.count) 条；草稿、停用、归档或范围不匹配的条目不会复制。内容仅作为参考，请按当前事实核对。").font(.caption).foregroundStyle(.secondary)
-            ScrollView { Text(oversized ? "内容超过 128 KiB，请减少选择后再复用。" : (text.isEmpty ? "没有已启用且范围匹配的记忆" : text)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+            KnowledgeTextView(text: oversized ? "内容超过 128 KiB，请减少选择后再复用。" : (text.isEmpty ? "没有已启用且范围匹配的记忆" : text)).equatable()
             if let error { Text(error).foregroundStyle(.orange) }
             HStack {
                 Button("关闭") { dismiss() }; Spacer()
@@ -259,7 +259,7 @@ private struct CodexOriginalRequest: Identifiable {
     let deleting: Bool
 }
 private struct CodexOriginalControls: View {
-    @ObservedObject var model: KnowledgeDesktopModel
+    @Bindable var model: KnowledgeDesktopModel
     let source: KnowledgeSourceDocument
     @State private var selectedItem: Int?
     @State private var request: CodexOriginalRequest?
@@ -268,10 +268,10 @@ private struct CodexOriginalControls: View {
     @State private var removingBackup: CodexMemoryBackup?
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            let items = CodexMemoryItem.parse(source.text)
+            let items = source.items
             Picker("原始记忆条目", selection: $selectedItem) {
                 Text("选择顶层列表项（\(items.count) 条）").tag(Optional<Int>.none)
-                ForEach(items) { item in Text(String((item.context + " · " + item.text).prefix(100))).tag(Optional(item.id)) }
+                ForEach(items) { item in Text(item.label).tag(Optional(item.id)) }
             }
             HStack {
                 if let item = items.first(where: { $0.id == selectedItem }) {
@@ -315,7 +315,7 @@ private struct CodexOriginalControls: View {
     }
 }
 private struct CodexOriginalEditView: View {
-    @ObservedObject var model: KnowledgeDesktopModel
+    @Bindable var model: KnowledgeDesktopModel
     let request: CodexOriginalRequest
     @State private var draft: String
     @State private var preview: String?
@@ -333,8 +333,8 @@ private struct CodexOriginalEditView: View {
             if let preview {
                 Text("修改范围：\(request.item.text.utf8.count) 字节 → \(request.deleting ? 0 : draft.utf8.count) 字节；文件 \(request.source.text.utf8.count) → \(preview.utf8.count) 字节").font(.caption)
                 HStack(alignment: .top) {
-                    ScrollView { Text("原条目\n\n" + request.item.text).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
-                    ScrollView { Text("修改后\n\n" + (request.deleting ? "（移除此条目）" : draft)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+                    VStack(alignment: .leading) { Text("原条目").font(.caption); KnowledgeTextView(text: request.item.text).equatable() }
+                    VStack(alignment: .leading) { Text("修改后").font(.caption); KnowledgeTextView(text: request.deleting ? "（移除此条目）" : draft).equatable() }
                 }
             } else { Text("先预览这条记忆的前后差异，再确认写入。续行请缩进，不能加入其他顶层条目或标题。").foregroundStyle(.secondary) }
             if let error { Text(error).foregroundStyle(.orange).textSelection(.enabled) }
@@ -356,7 +356,7 @@ private struct CodexOriginalEditView: View {
     }
 }
 private struct CodexOriginalRestoreView: View {
-    @ObservedObject var model: KnowledgeDesktopModel
+    @Bindable var model: KnowledgeDesktopModel
     let backup: CodexMemoryBackup
     @State private var error: String?
     @Environment(\.dismiss) private var dismiss
@@ -364,9 +364,64 @@ private struct CodexOriginalRestoreView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("确认恢复原始 MEMORY.md").font(.title2)
             Text("恢复整个文件；当前内容必须与操作后的快照完全一致，否则拒绝覆盖。恢复前同样备份当前文件。").font(.caption).foregroundStyle(.orange)
-            HStack { ScrollView { Text("操作后（预期当前文件）\n\n" + backup.after).textSelection(.enabled) }; ScrollView { Text("恢复为操作前\n\n" + backup.before).textSelection(.enabled) } }
+            HStack {
+                VStack(alignment: .leading) { Text("操作后（预期当前文件）").font(.caption); KnowledgeTextView(text: backup.after).equatable() }
+                VStack(alignment: .leading) { Text("恢复为操作前").font(.caption); KnowledgeTextView(text: backup.before).equatable() }
+            }
             if let error { Text(error).foregroundStyle(.orange) }
             HStack { Button("取消") { dismiss() }; Spacer(); Button("确认恢复并备份") { Task { if await model.restoreOriginal(backup) { dismiss() } else { error = model.sourceError } } }.buttonStyle(.borderedProminent) }
         }.padding(24).frame(width: 850, height: 650).disabled(model.isSaving).interactiveDismissDisabled()
+    }
+}
+
+/// TextKit 2 lays out the visible viewport instead of asking SwiftUI to size and
+/// render one enormous Text. Selection, copy, find, and the entire file remain native.
+struct KnowledgeTextView: NSViewRepresentable, Equatable {
+    let text: String
+    var monospaced = false
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.monospaced == rhs.monospaced && lhs.text == rhs.text }
+    final class Coordinator {
+        var text: String?
+        var monospaced: Bool?
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        let view = NSTextView(usingTextLayoutManager: true)
+        view.isEditable = false
+        view.isSelectable = true
+        view.isRichText = false
+        view.drawsBackground = false
+        view.usesFindBar = true
+        view.isVerticallyResizable = true
+        view.isHorizontallyResizable = false
+        view.autoresizingMask = [.width]
+        view.minSize = .zero
+        view.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        view.textContainer?.widthTracksTextView = true
+        view.textContainerInset = NSSize(width: 5, height: 6)
+        view.setAccessibilityLabel("记忆正文")
+        scroll.documentView = view
+        return scroll
+    }
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        guard let view = scroll.documentView as? NSTextView else { return }
+        if context.coordinator.monospaced != monospaced {
+            view.font = monospaced ? .monospacedSystemFont(ofSize: 12, weight: .regular) : .systemFont(ofSize: 13)
+            view.textColor = .labelColor
+            context.coordinator.monospaced = monospaced
+        }
+        guard context.coordinator.text != text else { return }
+        context.coordinator.text = text
+        view.string = text
+        view.setSelectedRange(NSRange(location: 0, length: 0))
+        scroll.contentView.scroll(to: .zero)
+        scroll.reflectScrolledClipView(scroll.contentView)
+    }
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSScrollView, context: Context) -> CGSize? {
+        CGSize(width: proposal.width ?? 500, height: proposal.height ?? 300)
     }
 }

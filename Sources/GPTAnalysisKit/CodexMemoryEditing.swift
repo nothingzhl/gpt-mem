@@ -6,17 +6,36 @@ public struct CodexMemoryItem: Identifiable, Equatable, Sendable {
     public let length: Int
     public let text: String
     public let context: String
+    public let label: String
     public var id: Int { offset }
+    public init(offset: Int, length: Int, text: String, context: String) {
+        self.offset = offset; self.length = length; self.text = text; self.context = context
+        label = String((String(context.prefix(100)) + " · " + String(text.prefix(100))).prefix(100))
+    }
     public static func parse(_ text: String) -> [Self] {
         let ns = text as NSString
-        var lines: [(String, NSRange)] = []
-        ns.enumerateSubstrings(in: NSRange(location: 0, length: ns.length), options: [.byLines, .substringNotRequired]) { _, range, enclosing, _ in
-            lines.append((ns.substring(with: range), enclosing))
-        }
+        // Walk UTF-16 line ranges once. Do not allocate a String and tuple for every
+        // line; offsets must still refer to the exact original file for safe edits.
         var items: [Self] = [], context = "MEMORY.md", index = 0
+        var itemStart: Int?, itemContext = "MEMORY.md"
         var fence: (Character, Int)?
-        while index < lines.count {
-            let line = lines[index].0
+        func appendItem(endingAt end: Int) {
+            guard let start = itemStart else { return }
+            items.append(.init(offset: start, length: end - start,
+                               text: ns.substring(with: .init(location: start, length: end - start)), context: itemContext))
+            itemStart = nil
+        }
+        while index < ns.length {
+            var start = 0, end = 0, contentsEnd = 0
+            ns.getLineStart(&start, end: &end, contentsEnd: &contentsEnd, for: .init(location: index, length: 0))
+            index = end
+            let empty = contentsEnd == start
+            let first = empty ? 0 : ns.character(at: start)
+            if itemStart != nil {
+                if empty || first == 32 || first == 9 { continue }
+                appendItem(endingAt: start)
+            }
+            let line = ns.substring(with: .init(location: start, length: contentsEnd - start))
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if let marker = trimmed.first, marker == "`" || marker == "~" {
                 let count = trimmed.prefix { $0 == marker }.count
@@ -24,31 +43,25 @@ public struct CodexMemoryItem: Identifiable, Equatable, Sendable {
                     if let current = fence {
                         if current.0 == marker && count >= current.1 && trimmed.dropFirst(count).trimmingCharacters(in: .whitespaces).isEmpty { fence = nil }
                     } else { fence = (marker, count) }
-                    index += 1; continue
+                    continue
                 }
             }
-            if fence != nil { index += 1; continue }
+            if fence != nil { continue }
             if line.hasPrefix("#") { context = line }
-            guard line.hasPrefix("- ") || line.hasPrefix("* ") else { index += 1; continue }
-            let start = index; index += 1
-            while index < lines.count {
-                let next = lines[index].0
-                if !next.isEmpty && !next.hasPrefix(" ") && !next.hasPrefix("\t") { break }
-                index += 1
-            }
-            let offset = lines[start].1.location
-            let end = NSMaxRange(lines[index - 1].1)
-            items.append(.init(offset: offset, length: end - offset, text: ns.substring(with: .init(location: offset, length: end - offset)), context: context))
+            if line.hasPrefix("- ") || line.hasPrefix("* ") { itemStart = start; itemContext = context }
         }
+        appendItem(endingAt: ns.length)
         return items
     }
     public func replacing(in original: String, with replacement: String?) throws -> String {
         guard Self.parse(original).contains(self) else { throw CodexMemoryEditError.conflict }
         if let replacement {
-            guard !replacement.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  replacement.utf8.count <= 32_768, Self.parse(replacement).count == 1,
-                  Self.parse(replacement).first?.offset == 0,
-                  Self.parse(replacement).first?.length == (replacement as NSString).length else { throw CodexMemoryEditError.invalid }
+            guard replacement.utf8.count <= 32_768,
+                  !replacement.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw CodexMemoryEditError.invalid }
+            let items = Self.parse(replacement)
+            guard items.count == 1,
+                  items.first?.offset == 0,
+                  items.first?.length == (replacement as NSString).length else { throw CodexMemoryEditError.invalid }
         }
         let ns = original as NSString
         let suffix = ns.substring(from: offset + length)

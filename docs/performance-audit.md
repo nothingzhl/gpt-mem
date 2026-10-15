@@ -1,5 +1,63 @@
 # 逐模块性能审计
 
+## 0.19.3：实际交互与内存优化（2026-10-15）
+
+本轮针对长记忆打开、搜索、会话全文展开和采样期间的交互停顿。基线为 `b4d93ef`（0.19.2），当前 production Release 使用相同合成数据和本机编译工具链。没有改写真实 Codex 记忆或历史数据库，没有调用 AI 服务。下方历史的 0.19.2 记录保留为上轮结果。
+
+| 场景 | 优化前 | 优化后 | 范围 |
+| --- | ---: | ---: | --- |
+| 132,205 字节、420条记忆正文首次布局 | 7,784.864 ms | 85.753 ms | 新独立进程，含原生窗口/文本框架初始化 |
+| 同一正文调整窗口宽度 | 2,627.618 ms | 1.284 ms | 7次中位数 |
+| 200条记忆与16个来源，未命中搜索 | 390.065 ms | 4.128 ms | 同负载、5轮中位数，包含结果发布 |
+| 中文命中搜索 | 169.451 ms | 2.083 ms | 同上 |
+| 连续修改40次后最终查询完成 | 173.694 ms | 2.322 ms | 校验旧结果未覆盖最终结果 |
+| 清空搜索 | 154.808 ms | 0.038 ms | 立即恢复完整结果 |
+| 420条选项标签与16文件标题准备 | 93.980 ms | 0.006 ms | 读取时缓存元数据 |
+| 139,890字节会话全文首次布局与绘制 | 37,018.799 ms | 104.537 ms | 独立进程，旧Text布局完整全文 |
+| 2,268,890字节会话全文暖态展开与绘制 | — | 10.725 ms | production展开状态创建，不是鼠标点击计时 |
+| 同一2.27MB正文滚动 | — | p95 2.201 ms | 最大3.007ms，包含绘制 |
+| 2000会话切换 | 中位7.765 ms / p95 9.817 ms | 中位1.593 ms / p95 1.611 ms | 30次选择，统计重建次数30降至0 |
+| 720份×100进程分析CPU | 53.956 ms | 39.889 ms | 5次中位数，完整结果等价 |
+| 同规模采样更新CPU | 57.338 ms | 43.179 ms | 复用已保存样本及历史窗口 |
+
+记忆和会话全文采用 TextKit 2 可视区域布局；保留完整原文、原生查找、选择和滚动。会话长文使用固定最大高度的正文滚动区，折叠工具卡不构造正文。记忆搜索索引保留原 Foundation 搜索语义，包括特殊 Unicode、字符组合与兼容数字；过期任务会取消，查询期间不重复发布相同列表。根界面与记忆模型按属性观察；连续100次采样更新，没有使无关记忆工作区或未改变的状态失效。
+
+采样正常更新直接推进滑动窗口，启动、扩展窗口、壁钟回拨、外部数据库写入与基线移动时重新读取 SQLite；保留 cutoff 之前的比较基线及完整样本，超限仍拒绝而不截断。SQL 使用时间范围索引和独立基线查询。离开内存页面后继续持锁采集和保存，释放历史与分析；返回时后台恢复完整窗口。冻结的 AI 窗口和独立报告导出资格保留。
+
+内存使用物理 Footprint，均为隔离夹具进程或阶段的增量：
+
+| 场景 | 优化前增量 | 优化后增量 |
+| --- | ---: | ---: |
+| 720份×100重复长路径进程的历史元数据 | 66.047 MiB | 20.891 MiB |
+| 132KB记忆正文原生显示 | 12.703 MiB | 8.984 MiB |
+| 139.9KB会话全文显示 | 93.61 MiB | 16.94 MiB |
+
+历史字符串池最多2048项/4MiB，只共享字节完全相同的长元数据，不存额外快照正文。极限记忆夹具（200条、16来源、约6.66MB记忆JSON）索引为13,679,289字节，完整冷载入与建索引578.952ms，在IO actor执行；普通搜索不重复建索引。索引是为交互速度付出的受限内存成本。以上降幅不能解释为整个应用在任何工作负载下的占用降幅。
+
+复现命令（先 `swift build --configuration release`，仅CLT环境的Swift单元测试使用仓库 `scripts/test.sh`）：
+
+```sh
+python3 scripts/check-knowledge.py --render
+python3 scripts/check-knowledge-performance.py --baseline-ref b4d93ef
+python3 scripts/check-session-performance.py
+python3 scripts/check-desktop-sessions.py --render
+python3 scripts/check-desktop-memory.py --benchmark --baseline-ref b4d93ef
+python3 scripts/check-desktop-observation.py
+python3 scripts/check-page-performance.py
+```
+
+相关回归：记忆10,518项检查（其中10,443项与Foundation的Unicode搜索差分）；会话27项仓库测试/242断言、24组桌面流程/257断言；历史32项测试/2,410断言、6组采样流程/18断言；25组完整分析JSON与基线逐字节等价。文本检查涵盖完整原文、非零可滚动尺寸、末尾定位与选区、同文刷新保留滚动及换文重置。
+
+测量限制：离屏环境不提供可用的SwiftUI按钮AX节点和隔离剪贴板服务。暖态展开测量为production展开状态的创建与绘制；复制保留原生接口，但本轮不声称已完成实际剪贴板复制验证。早期会话输出中的“selection/copy”合并文案已由最终暖态日志的明确NOTE纠正。第一次页面布局包含框架初始化，不能当成持续滚动帧耗时。实现依据参见 [Apple SwiftUI性能说明](https://developer.apple.com/documentation/xcode/understanding-and-improving-swiftui-performance) 与 [TextKit说明](https://developer.apple.com/videos/play/wwdc2026/370/)。
+
+原始记录：`reports/knowledge-performance-current.txt`、`reports/session-performance-current.txt`、`reports/session-performance-warm-current.txt`、`reports/memory-performance-current.txt` 与 `reports/performance/`。这些报告为本机生成产物。
+
+最终集成：根观察隔离、隐藏恢复与报告导出资格检查通过；八个主页面production窗口布局通过，尺寸变化布局中位数1.95–9.44ms。200条记忆表格首次创建仍有约200ms的一次性成本：同一可执行文件先渲染概览后，当前198.58ms、基线194.85ms，三轮区间重叠；早期311ms的差距未稳定复现，不据此声称首次导航达到一帧。真实原始详情面板（标题、420项选择器、编辑/删除/备份按钮、132KB正文）166.02ms，截图已目视核对。补测见 `reports/knowledge-warm-page-current.txt`。
+
+最终production Release构建通过；0.19.3应用已打包，桌面可执行文件UUID与构建产物一致，`codesign --verify --deep --strict`通过。打包后的CLI smoke通过，包含临时采集、共享锁、正常停止、7200样本报告、数据库保护及离线导出。运行中的旧实例需重启后加载新版。
+
+## 0.19.2 历史审计
+
 状态：本轮逐模块性能审计完成（0.19.2）。八个主页面及各自的主要本地操作均已测试；规模基线使用临时合成数据，不读写真实记忆、不发送 AI 请求。原生采集为只读。
 
 基线环境：本机 release 产物；每项 5 轮中位数，冷读取单轮。命令：`python3 scripts/check-module-performance.py`。

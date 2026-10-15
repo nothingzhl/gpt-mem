@@ -152,4 +152,16 @@ final class KnowledgeLibraryTests: XCTestCase {
         XCTAssertEqual(KnowledgeCatalog(entries: [entry]).duplicates(of: .init(title: "y", body: " same ")).count, 1)
         XCTAssertTrue(KnowledgeCatalog(entries: [entry]).duplicates(of: .init(title: "y", body: "same", scope: .project, projectPath: "/repo")).isEmpty)
     }
+    func testSourceSnapshotCachesHeadingItemsAndBoundedLabels() throws {
+        let root = root(), text = "before heading\n# 记忆标题\n- " + String(repeating: "中文👋", count: 300) + "\n  续行\n"
+        let main = KnowledgeSourceDocument(id: "MEMORY.md", relativePath: "MEMORY.md", fileURL: root.appendingPathComponent("MEMORY.md"), text: text, modifiedAt: Date())
+        XCTAssertEqual(main.title, "记忆标题")
+        XCTAssertEqual(main.items.count, 1)
+        XCTAssertEqual(main.items[0].label.count, 100)
+        XCTAssertEqual(main.items[0].text, CodexMemoryItem.parse(text)[0].text)
+        let other = KnowledgeSourceDocument(id: "nested/other.md", relativePath: "nested/other.md", fileURL: root.appendingPathComponent("nested/other.md"), text: "- no heading", modifiedAt: Date())
+        XCTAssertEqual(other.title, "other.md")
+        XCTAssertEqual(other.category, "nested")
+        XCTAssertTrue(other.items.isEmpty)
+    }
 }

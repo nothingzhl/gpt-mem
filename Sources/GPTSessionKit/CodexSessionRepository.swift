@@ -201,10 +201,16 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
     }
 
     public func loadTranscript(for summary: CodexSessionSummary) throws -> SessionTranscript {
-        try autoreleasepool { try readTranscript(for: summary) }
+        try autoreleasepool { try readTranscript(for: summary, retainInCache: true) }
     }
 
-    private func readTranscript(for summary: CodexSessionSummary) throws -> SessionTranscript {
+    /// A one-pass search can reuse existing detail but must not fill its LRU with
+    /// every scanned log or evict the document the user was just viewing.
+    public func loadTranscriptForSearch(for summary: CodexSessionSummary) throws -> SessionTranscript {
+        try autoreleasepool { try readTranscript(for: summary, retainInCache: false) }
+    }
+
+    private func readTranscript(for summary: CodexSessionSummary, retainInCache: Bool) throws -> SessionTranscript {
         try acquireReadLock(); defer { lock.unlock() }
         readMetrics = .init()
         var fileURL = summary.fileURL
@@ -226,8 +232,10 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
         if let cached = transcriptCache[candidate.url.path], cached.candidate.matches(candidate) {
             readMetrics.cachedRolloutFiles += 1
             transcript = cached.transcript
-            transcriptAccessOrder.removeAll { $0 == candidate.url.path }
-            transcriptAccessOrder.append(candidate.url.path)
+            if retainInCache {
+                transcriptAccessOrder.removeAll { $0 == candidate.url.path }
+                transcriptAccessOrder.append(candidate.url.path)
+            }
         } else {
             removeTranscript(at: candidate.url.path)
             let parsed = try parse(candidate, byteBudget: limits.maximumFileBytes)
@@ -237,7 +245,7 @@ public final class CodexSessionRepository: SessionRepository, @unchecked Sendabl
                 persistentIndexDirty = true
             }
             if catalogContinuation?.candidate.url == candidate.url { catalogContinuation = nil }
-            if parsed.sourceIsStable { retainTranscript(transcript, for: candidate) }
+            if parsed.sourceIsStable && retainInCache { retainTranscript(transcript, for: candidate) }
         }
         var warnings = transcript.warnings
         let titles = try loadTitleIndex(for: [transcript.summary.sessionID], warnings: &warnings)

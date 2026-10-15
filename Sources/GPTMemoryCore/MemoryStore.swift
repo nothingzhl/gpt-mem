@@ -84,6 +84,15 @@ public final class MemoryStore {
         try query("SELECT payload FROM snapshots ORDER BY captured_at DESC, id DESC LIMIT 1").first
     }
 
+    /// Changes only when another SQLite connection commits. A sampling owner can
+    /// advance its in-memory window with its own saved values until this changes.
+    public func dataVersion() throws -> Int64 {
+        let statement = try prepare("PRAGMA data_version")
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw sqliteError("读取历史版本") }
+        return sqlite3_column_int64(statement, 0)
+    }
+
     /// Includes the latest snapshot before `since`, when available, as the comparison baseline.
     /// The default budget covers a two-hour window at one sample per second plus its baseline.
     public func load(since: Date, maxSamples: Int = 10_000) throws -> [MemorySnapshot] {
@@ -92,11 +101,12 @@ public final class MemoryStore {
         try execute("BEGIN DEFERRED")
         var committed = false
         defer { if !committed { try? execute("ROLLBACK") } }
-        let predicate = "captured_at >= ? OR id = (SELECT id FROM snapshots WHERE captured_at < ? ORDER BY captured_at DESC, id DESC LIMIT 1)"
         let bindings = [since.timeIntervalSince1970, since.timeIntervalSince1970]
         // Count before touching the JSON payloads so a seven-day window cannot
         // load all raw process samples into the observer's own memory.
-        let countStatement = try prepare("SELECT COUNT(*) FROM snapshots WHERE \(predicate)")
+        // Split the baseline and range: the OR predicate made SQLite walk the
+        // entire retained history when the ordered payload query used its index.
+        let countStatement = try prepare("SELECT (SELECT COUNT(*) FROM snapshots WHERE captured_at >= ?) + EXISTS(SELECT 1 FROM snapshots WHERE captured_at < ?)")
         defer { sqlite3_finalize(countStatement) }
         for (index, value) in bindings.enumerated() {
             try check(sqlite3_bind_double(countStatement, Int32(index + 1), value), "绑定历史读取时间")
@@ -106,17 +116,16 @@ public final class MemoryStore {
         // COUNT establishes the SQLite read snapshot before checking other
         // connections' commits. Cache and payloads thus see one database version.
         if decodedCacheByteLimit > 0 {
-            let versionStatement = try prepare("PRAGMA data_version")
-            defer { sqlite3_finalize(versionStatement) }
-            guard sqlite3_step(versionStatement) == SQLITE_ROW else { throw sqliteError("读取历史版本") }
-            let version = sqlite3_column_int64(versionStatement, 0)
+            let version = try dataVersion()
             if cacheDataVersion != version {
                 decodedCache.removeAll(keepingCapacity: true); cachedPayloadBytes = 0
                 cacheDataVersion = version
             }
         }
-        let sql = "SELECT payload, id FROM snapshots WHERE \(predicate) ORDER BY captured_at ASC, id ASC"
-        let result = try query(sql, bindings: bindings, rowLimit: maxSamples, reuseDecoded: decodedCacheByteLimit > 0)
+        var result = try query("SELECT payload, id FROM snapshots WHERE captured_at < ? ORDER BY captured_at DESC, id DESC LIMIT 1",
+            bindings: [bindings[0]], rowLimit: 1, reuseDecoded: decodedCacheByteLimit > 0)
+        result += try query("SELECT payload, id FROM snapshots WHERE captured_at >= ? ORDER BY captured_at ASC, id ASC",
+            bindings: [bindings[0]], rowLimit: maxSamples - result.count, reuseDecoded: decodedCacheByteLimit > 0)
         try execute("COMMIT"); committed = true
         let retained = Set(result.map(\.id))
         for id in Array(decodedCache.keys) where !retained.contains(id) {
@@ -128,15 +137,19 @@ public final class MemoryStore {
 
     /// Keep every sample for 24 hours, one sample per minute for the preceding six days,
     /// and remove history older than seven days. This is one atomic transaction.
-    public func maintenance(now: Date = Date()) throws {
+    @discardableResult
+    public func maintenance(now: Date = Date()) throws -> Int {
         try requireWritable()
         let week = now.addingTimeInterval(-7 * 24 * 60 * 60).timeIntervalSince1970
         let day = now.addingTimeInterval(-24 * 60 * 60).timeIntervalSince1970
         try execute("BEGIN IMMEDIATE")
         do {
             try execute("DELETE FROM snapshots WHERE captured_at < ?", bindings: [week])
+            var removed = Int(sqlite3_changes(database))
             try execute("DELETE FROM snapshots WHERE id IN (SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY CAST(captured_at / 60 AS INTEGER) ORDER BY captured_at DESC, id DESC) AS ordinal FROM snapshots WHERE captured_at < ?) WHERE ordinal > 1)", bindings: [day])
+            removed += Int(sqlite3_changes(database))
             try execute("COMMIT")
+            return removed
         } catch {
             try? execute("ROLLBACK")
             throw error
@@ -189,6 +202,7 @@ public final class MemoryStore {
             try check(sqlite3_bind_double(statement, Int32(index + 1), value), "绑定查询时间")
         }
         var snapshots: [MemorySnapshot] = []
+        var metadata = MemoryProcessMetadataPool()
         while true {
             let result = sqlite3_step(statement)
             if result == SQLITE_DONE { return snapshots }
@@ -209,9 +223,10 @@ public final class MemoryStore {
                 // JSONDecoder and Data can create autoreleased Foundation objects.
                 // Drain each row's temporaries while keeping the decoded Swift value
                 // alive, rather than retaining a full window's decoding scratch space.
-                let snapshot = try autoreleasepool {
+                var snapshot = try autoreleasepool {
                     try decoder.decode(MemorySnapshot.self, from: Data(bytes: bytes, count: length))
                 }
+                metadata.canonicalize(&snapshot)
                 snapshots.append(snapshot); lastReadMetrics.decodedSnapshots += 1
                 if let id, length <= decodedCacheByteLimit - cachedPayloadBytes {
                     decodedCache[id] = (snapshot, length); cachedPayloadBytes += length
@@ -220,5 +235,56 @@ public final class MemoryStore {
                 throw MemoryError.message("历史快照无法解析：\(error.localizedDescription)")
             }
         }
+    }
+}
+
+/// Stable native metadata repeats across most samples. Reuse equal string storage
+/// while keeping every process measurement; bound unique metadata independently.
+/// The pool never stores payloads, arguments, conversation content or snapshot IDs.
+struct MemoryProcessMetadataPool {
+    private var strings: [String: String] = [:]
+    private var bytes = 0
+    private let maximumEntries = 2_048
+    private let maximumBytes = 4 * 1_024 * 1_024
+    var cachedStringCount: Int { strings.count }
+    var cachedStringBytes: Int { bytes }
+
+    mutating func canonicalized(_ snapshot: MemorySnapshot) -> MemorySnapshot {
+        var result = snapshot
+        canonicalize(&result)
+        return result
+    }
+
+    mutating func canonicalize(_ snapshot: inout MemorySnapshot) {
+        for index in snapshot.processes.indices { canonicalize(&snapshot.processes[index]) }
+        if snapshot.observer != nil { canonicalize(&snapshot.observer!) }
+    }
+
+    mutating func observe(_ snapshot: MemorySnapshot) {
+        for var process in snapshot.processes { canonicalize(&process) }
+        if var observer = snapshot.observer { canonicalize(&observer) }
+    }
+
+    private mutating func canonicalize(_ process: inout ProcessSample) {
+        process.bootID = intern(process.bootID)
+        process.executable = intern(process.executable)
+        process.roleHint = intern(process.roleHint)
+        process.rootKey = intern(process.rootKey)
+        process.ownership = intern(process.ownership)
+    }
+
+    private mutating func intern(_ value: String) -> String {
+        let length = value.utf8.count
+        // Swift stores short strings inline, so pooling them adds table overhead.
+        guard length > 15 else { return value }
+        if let existing = strings[value] {
+            // String equality normalizes Unicode; executable paths and encoded
+            // exports must retain their original byte representation as well.
+            return existing.utf8.elementsEqual(value.utf8) ? existing : value
+        }
+        if strings.count < maximumEntries, length <= maximumBytes - bytes {
+            strings[value] = value; bytes += length
+        }
+        return value
     }
 }

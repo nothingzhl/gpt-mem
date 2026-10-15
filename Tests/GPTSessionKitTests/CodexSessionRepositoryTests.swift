@@ -418,6 +418,31 @@ final class CodexSessionRepositoryTests: XCTestCase {
         XCTAssertTrue(try repository.loadCatalog().sessions.isEmpty)
     }
 
+    func testSearchReadsPreserveDetailLRUWithoutRetainingScannedTranscripts() throws {
+        let fixture = try Fixture(); defer { fixture.remove() }
+        for index in 0..<3 {
+            _ = try fixture.write([metadata("s\(index)"),
+                record("event_msg", ["type":"user_message", "message":"Prompt \(index)"])],
+                name: "\(index).jsonl")
+        }
+        let repository = CodexSessionRepository(rootURL: fixture.root,
+            limits: .init(maximumCachedTranscripts: 2))
+        let summaries = try repository.loadCatalog().sessions.sorted { $0.sessionID < $1.sessionID }
+        let first = try repository.loadTranscript(for: summaries[0])
+        let second = try repository.loadTranscript(for: summaries[1])
+        XCTAssertEqual(try repository.loadTranscriptForSearch(for: summaries[0]), first)
+        XCTAssertEqual(repository.lastReadMetrics.rolloutBytesRead, 0)
+        let scanned = try repository.loadTranscriptForSearch(for: summaries[2])
+        XCTAssertGreaterThan(repository.lastReadMetrics.rolloutBytesRead, 0)
+        XCTAssertEqual(try repository.loadTranscriptForSearch(for: summaries[2]), scanned)
+        XCTAssertGreaterThan(repository.lastReadMetrics.rolloutBytesRead, 0)
+        _ = try repository.loadTranscript(for: summaries[2])
+        XCTAssertEqual(try repository.loadTranscript(for: summaries[1]), second)
+        XCTAssertEqual(repository.lastReadMetrics.rolloutBytesRead, 0)
+        _ = try repository.loadTranscript(for: summaries[0])
+        XCTAssertGreaterThan(repository.lastReadMetrics.rolloutBytesRead, 0)
+    }
+
     func testFastUTCTimestampsKeepFractionalAndOffsetDateSemantics() throws {
         let fixture = try Fixture(); defer { fixture.remove() }
         let timestamps = ["2024-02-29T23:59:59Z", "2026-10-12T01:02:03.123Z",

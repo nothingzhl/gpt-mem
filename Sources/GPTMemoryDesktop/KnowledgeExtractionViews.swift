@@ -2,6 +2,35 @@ import SwiftUI
 import GPTAnalysisKit
 import GPTSessionKit
 
+/// Draft IDs must survive view updates. Rebuilding candidates in a computed
+/// property regenerated UUIDs and validated the same report several times.
+final class KnowledgeExtractionCandidateCache {
+    struct Output { var drafts: [KnowledgeDraft] = []; var error: String? }
+    private struct Key: Equatable {
+        let prepared: AIAnalysisInput?
+        let input: AIAnalysisInput?
+        let record: AIAnalysisRecord?
+        let source: CodexSessionSummary
+        let labels: [String: String]
+        let context: String
+        let prompt: AIAnalysisPrompt?
+    }
+    private var key: Key?
+    private var output = Output()
+    func evaluate(prepared: AIAnalysisInput?, input: AIAnalysisInput?, record: AIAnalysisRecord?, source: CodexSessionSummary,
+                  labels: [String: String], context: String, prompt: AIAnalysisPrompt?) -> Output {
+        let next = Key(prepared: prepared, input: input, record: record, source: source, labels: labels, context: context, prompt: prompt)
+        guard key != next else { return output }
+        key = next; output = .init()
+        guard let prepared, prepared == input, let record else { return output }
+        do {
+            let drafts = try KnowledgeExtractionModule.drafts(record: record, input: prepared, source: source, subjectLabels: labels)
+            if prepared.context == context && prepared.prompt == prompt { output.drafts = drafts }
+        } catch { output.error = "候选校验失败，不能入库：" + error.localizedDescription }
+        return output
+    }
+}
+
 struct KnowledgeExtractionView: View {
     @ObservedObject var ai: DesktopAIModel
     let transcript: SessionTranscript
@@ -9,19 +38,12 @@ struct KnowledgeExtractionView: View {
     @State private var context = ""
     @State private var preparedInput: AIAnalysisInput?
     @State private var error: String?
+    @State private var candidateCache = KnowledgeExtractionCandidateCache()
     @Environment(\.dismiss) private var dismiss
-    private var candidates: [KnowledgeDraft] {
-        guard let input = preparedInput, ai.recordInput == input, input.context == context,
-              input.prompt == (try? ai.appliedPrompt(for: KnowledgeExtractionModule.moduleID)),
-              let record = ai.record else { return [] }
-        return (try? KnowledgeExtractionModule.drafts(record: record, input: input, source: transcript.summary, subjectLabels: ai.recordSubjectLabels)) ?? []
-    }
-    private var candidateError: String? {
-        guard let input = preparedInput, ai.recordInput == input, let record = ai.record else { return nil }
-        do { _ = try KnowledgeExtractionModule.drafts(record: record, input: input, source: transcript.summary, subjectLabels: ai.recordSubjectLabels); return nil }
-        catch { return "候选校验失败，不能入库：" + error.localizedDescription }
-    }
     var body: some View {
+        let candidates = candidateCache.evaluate(prepared: preparedInput, input: ai.recordInput, record: ai.record,
+            source: transcript.summary, labels: ai.recordSubjectLabels, context: context,
+            prompt: try? ai.appliedPrompt(for: KnowledgeExtractionModule.moduleID))
         VStack(alignment: .leading, spacing: 12) {
             Text("从会话提取长期记忆草稿").font(.title2)
             Text(transcript.summary.title).font(.headline)
@@ -41,15 +63,15 @@ struct KnowledgeExtractionView: View {
                 Spacer()
             }
             if let error = error ?? ai.configurationError ?? ai.analysisError { Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
-            if let candidateError { Text(candidateError).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
+            if let candidateError = candidates.error { Text(candidateError).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
             AIReportSaveStatus(model: ai.reportLibrary)
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     if let input = preparedInput, ai.recordInput == input, let record = ai.record {
                         Text(record.result.summary).textSelection(.enabled)
                         Text("生成来源：\(record.providerName) · \(record.model) · \(record.generatedAt.formatted())").font(.caption).foregroundStyle(.secondary)
-                        if candidates.isEmpty { Text("没有可入库候选，或提取条件已变化；可以重新预览提取。").foregroundStyle(.secondary) }
-                        ForEach(candidates) { draft in
+                        if candidates.drafts.isEmpty { Text("没有可入库候选，或提取条件已变化；可以重新预览提取。").foregroundStyle(.secondary) }
+                        ForEach(candidates.drafts) { draft in
                             VStack(alignment: .leading, spacing: 8) {
                                 Text(draft.body).textSelection(.enabled)
                                 Text(draft.sources.first?.label ?? "").font(.caption).foregroundStyle(.secondary)

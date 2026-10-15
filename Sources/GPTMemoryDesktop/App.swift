@@ -39,7 +39,7 @@ final class ManagerAppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct GPTManagerApp: App {
     @NSApplicationDelegateAdaptor(ManagerAppDelegate.self) private var delegate
-    @StateObject private var model = DesktopModel()
+    @State private var model = DesktopModel()
 
     var body: some Scene {
         WindowGroup("GPT Manager") {
@@ -66,7 +66,7 @@ struct GPTManagerApp: App {
                 }.keyboardShortcut("p", modifiers: [.command, .shift])
                     .disabled(model.isBusy || model.modeLabel.contains("外部采集"))
                 Button("导出内存报告…") { model.exportReport() }.keyboardShortcut("e", modifiers: [.command])
-                    .disabled(model.isBusy || (model.analysis?.sampleCount ?? 0) < 2)
+                    .disabled(model.isBusy || model.memorySampleCount < 2)
             }
         }
     }

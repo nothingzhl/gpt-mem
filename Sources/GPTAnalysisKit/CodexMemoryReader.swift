@@ -7,8 +7,20 @@ public struct KnowledgeSourceDocument: Identifiable, Equatable, Sendable {
     public let fileURL: URL
     public let text: String
     public let modifiedAt: Date
-    public var title: String { text.split(separator: "\n").first(where: { $0.hasPrefix("# ") }).map { String($0.dropFirst(2)) } ?? fileURL.lastPathComponent }
-    public var category: String { relativePath.contains("/") ? String(relativePath.split(separator: "/")[0]) : "主记忆文件" }
+    public let title: String
+    public let category: String
+    public let items: [CodexMemoryItem]
+    public init(id: String, relativePath: String, fileURL: URL, text: String, modifiedAt: Date) {
+        self.id = id; self.relativePath = relativePath; self.fileURL = fileURL; self.text = text; self.modifiedAt = modifiedAt
+        var heading: String?
+        text.enumerateLines { line, stop in
+            if line.hasPrefix("# ") { heading = String(line.dropFirst(2)); stop = true }
+        }
+        title = heading ?? fileURL.lastPathComponent
+        category = relativePath.contains("/") ? String(relativePath.prefix { $0 != "/" }) : "主记忆文件"
+        // Parsing happens on the reader's IO actor once per snapshot, never in a SwiftUI body.
+        items = relativePath == "MEMORY.md" ? CodexMemoryItem.parse(text) : []
+    }
     public func importedDraft() -> KnowledgeDraft {
         .init(title: String(title.prefix(120)), body: text, state: .draft,
               sources: [.init(origin: .codex, label: relativePath, locator: fileURL.path)])

@@ -5,6 +5,22 @@ import XCTest
 
 final class CodexMemoryEditingTests: XCTestCase {
     private func root() -> URL { FileManager.default.temporaryDirectory.appendingPathComponent("original-memory-test-" + UUID().uuidString) }
+    func testStreamingParserKeepsExactRangesContinuationAndFinalLine() throws {
+        let text = "# Rules\r\n- first\r\n  ```swift\r\n  - nested\r\n  ```\r\n\r\n# Second\n* last 👋"
+        let items = CodexMemoryItem.parse(text)
+        XCTAssertEqual(items.count, 2)
+        XCTAssertEqual(items[0].text, "- first\r\n  ```swift\r\n  - nested\r\n  ```\r\n\r\n")
+        XCTAssertEqual(items[1].text, "* last 👋")
+        XCTAssertEqual(items[1].context, "# Second")
+        for item in items {
+            XCTAssertEqual((text as NSString).substring(with: NSRange(location: item.offset, length: item.length)), item.text)
+            XCTAssertEqual(item.label, String((item.context + " · " + item.text).prefix(100)))
+        }
+        XCTAssertEqual(try items[1].replacing(in: text, with: "- 最后条目"), text.replacingOccurrences(of: "* last 👋", with: "- 最后条目"))
+        XCTAssertEqual(try items[1].replacing(in: text, with: nil), (text as NSString).substring(to: items[1].offset))
+        let forged = CodexMemoryItem(offset: items[1].offset, length: 1, text: "*", context: "# Second")
+        XCTAssertThrowsError(try forged.replacing(in: text, with: "- 无效"))
+    }
     func testParserPreservesUnicodeCRLFAndSkipsFencedCode() throws {
         let text = "# 项目\r\n\r\n- 中文👋\r\n  续行\r\n\r\n- 第二条\r\n\r\n```\r\n- 代码不是记忆\r\n```\r\n## 结束\r\n"
         let items = CodexMemoryItem.parse(text)

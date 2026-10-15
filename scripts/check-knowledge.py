@@ -10,6 +10,7 @@ import argparse
 
 SWIFT = r'''
 import Foundation
+import Observation
 import SwiftUI
 import AppKit
 import GPTAnalysisKit
@@ -28,6 +29,12 @@ actor KnowledgeMock: AIProviderClient {
         return .init(summary: "发现一条稳定偏好", observations: [.init(text: "使用中文回答", evidenceIDs: ["m1"])], hypotheses: [], nextSteps: [], limitations: ["有限摘录，须人工审核"])
     }
 }
+final class ObservationChanges: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    var count: Int { lock.lock(); defer { lock.unlock() }; return value }
+    func increment() { lock.lock(); value += 1; lock.unlock() }
+}
 var assertions = 0
 @MainActor func expect(_ value: @autoclosure () -> Bool, _ message: String) throws {
     assertions += 1; if !value() { throw Failure(message: message) }
@@ -37,6 +44,18 @@ var assertions = 0
     throw Failure(message: "filter did not finish")
 }
 @MainActor func checks() async throws {
+    for (text, term) in [("Straße 中文", "STRASSE"), ("café", "cafe\u{301}"), ("Σίσυφος", "σίσυφος"), ("가", "가"), ("é", "e"), ("İstanbul", "istanbul"), ("中文规则", "规则"), ("中文", "不存在"), ("①", "1"), ("1", "①"), ("²", "2"), ("½", "1⁄2"), ("ﬃ", "ffi"), ("👩🏽‍💻", "👩"), ("👩🏽‍💻 👩", "👩"), ("a\u{0301}b", "a"), ("a\u{200D}b", "ab"), ("ＡＢＣ", "abc"), ("ß", "s"), ("ﬃ", "f"), ("ﬃ", "ff"), ("ß", "SS"), ("ss", "ß"), ("ᄀᄀ", "ᄀ"), ("ß①", "s1")] {
+        try expect(KnowledgeSearchText(text).contains(KnowledgeSearchText.fold(term)) == text.localizedCaseInsensitiveContains(term), "indexed search preserves Unicode/case semantics")
+    }
+    let unicodePieces = ["a", "A", "中", "文", "é", "e\u{0301}", "e", "E", "a\u{0315}\u{0300}", "👩🏽‍💻", "👩", "🏽", "💻", "\u{200D}", "👩💻", "ß", "s", "SS", "ﬃ", "f", "ff", "fi", "ffi", "ᄀᄀ", "ᄀ", "①", "1", "²", "2", "½", "1⁄2", "１", "Ⅳ", "IV", "٤", "4", "ﬓ", "մն", "Å", "Å", "Σ", "ς", "σ", "İ", "i", "i\u{0307}", "\u{FE0F}", "🇺🇸", "🇺", "🇸", "\r\n", "\n", " ", "\u{00A0}", "א", "שׁ", "ש", "Ａ", "𝕒"]
+    for piece in unicodePieces {
+        for text in [piece, "head" + piece + "tail", piece + " " + piece] {
+            let indexed = KnowledgeSearchText(text)
+            for term in unicodePieces {
+                try expect(indexed.contains(KnowledgeSearchText.fold(term)) == text.localizedCaseInsensitiveContains(term), "native Unicode search differential: " + text.debugDescription + " / " + term.debugDescription)
+            }
+        }
+    }
     let root = URL(fileURLWithPath: ProcessInfo.processInfo.environment["KNOWLEDGE_FIXTURE"]!)
     let sources = root.appendingPathComponent("sources")
     try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
@@ -49,6 +68,18 @@ var assertions = 0
     await model.readSources(); try await settle(model)
     try expect(model.filteredSources.count == 1, "source indexing")
     let originalSource = model.filteredSources[0]
+    let controls = ObservationChanges(), sourceCatalogChanges = ObservationChanges(), results = ObservationChanges(), queryChanges = ObservationChanges()
+    withObservationTracking { _ = model.isSaving; _ = model.loadError } onChange: { controls.increment() }
+    withObservationTracking { _ = model.sourceCatalog } onChange: { sourceCatalogChanges.increment() }
+    withObservationTracking { _ = model.filteredSources } onChange: { results.increment() }
+    withObservationTracking { _ = model.query } onChange: { queryChanges.increment() }
+    for query in ["Codex", "记忆", "中文"] { model.query = query; try await settle(model) }
+    try expect(controls.count == 0, "search never invalidates original item controls")
+    try expect(sourceCatalogChanges.count == 0, "search never invalidates source metadata/text observers")
+    try expect(results.count == 0, "same source matches never republish source list")
+    try expect(queryChanges.count == 1, "search field observers receive genuine input")
+    try expect(model.searchIndexByteCount > 0 && model.searchIndexByteCount <= sourceData.count * 2, "source index stays within fixture memory budget")
+    model.query = ""; try await settle(model)
     try expect(model.originalBackups.isEmpty, "read source does not create operation backups")
     let originalWithItem = "# Fixture\n- Original rule\n\n- Keep rule\n"
     try Data(originalWithItem.utf8).write(to: sources.appendingPathComponent("MEMORY.md"))
@@ -106,7 +137,9 @@ var assertions = 0
     let unchangedSource = try Data(contentsOf: sources.appendingPathComponent("MEMORY.md")); try expect(unchangedSource == sourceData, "original source unchanged")
     await model.readSources(root: root.appendingPathComponent("missing")); try await settle(model)
     try expect(model.filteredSources.isEmpty && !model.sourceCatalog.warnings.isEmpty, "missing source explicit")
+    let libraryIndexBytes = model.searchIndexByteCount
     await model.readSources(root: sources); model.includeArchived = true; try await settle(model)
+    try expect(model.searchIndexByteCount > libraryIndexBytes, "missing source snapshot releases old source index")
     let reopened = KnowledgeDesktopModel(directoryURL: model.directoryURL, sourceRoot: sources)
     await reopened.loadIfNeeded(); try await settle(reopened)
     try expect(reopened.catalog == model.catalog, "persistence reopened")
@@ -147,6 +180,15 @@ var assertions = 0
     try expect(calls == 1 && ai.analysisError == nil, "only explicit confirmation sends")
     let drafts = try KnowledgeExtractionModule.drafts(record: record, input: input, source: summary, subjectLabels: ai.recordSubjectLabels)
     try expect(drafts.count == 1 && drafts[0].state == .draft, "mock candidate stays draft")
+    let candidateCache = KnowledgeExtractionCandidateCache()
+    let cached = candidateCache.evaluate(prepared: input, input: input, record: record, source: summary, labels: ai.recordSubjectLabels, context: input.context, prompt: input.prompt)
+    let cachedAgain = candidateCache.evaluate(prepared: input, input: input, record: record, source: summary, labels: ai.recordSubjectLabels, context: input.context, prompt: input.prompt)
+    try expect(cached.drafts.count == 1 && cached.drafts.map(\.id) == cachedAgain.drafts.map(\.id), "candidate identity survives redraw")
+    let changedContext = candidateCache.evaluate(prepared: input, input: input, record: record, source: summary, labels: ai.recordSubjectLabels, context: "changed", prompt: input.prompt)
+    try expect(changedContext.drafts.isEmpty, "changed extraction context cannot reuse cached candidates")
+    let wrongSource = CodexSessionSummary(id: "other", sessionID: "other", fileURL: root.appendingPathComponent("other.jsonl"), title: "wrong")
+    let wrongCandidates = candidateCache.evaluate(prepared: input, input: input, record: record, source: wrongSource, labels: ai.recordSubjectLabels, context: input.context, prompt: input.prompt)
+    try expect(wrongCandidates.drafts.isEmpty && wrongCandidates.error != nil, "invalid source still fails cached candidate validation")
     try expect(model.catalog == libraryBefore, "AI completion does not write knowledge")
     model.editor = .init(draft: drafts[0], expected: nil)
     try expect(model.catalog == libraryBefore, "review opening does not write knowledge")

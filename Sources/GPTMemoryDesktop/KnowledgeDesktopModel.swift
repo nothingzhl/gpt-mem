@@ -1,14 +1,155 @@
 import Foundation
-import Combine
+import Observation
 import GPTAnalysisKit
 
-private struct KnowledgeSnapshot { let sequence: Int; let catalog: KnowledgeCatalog }
+// Normalize once when a snapshot arrives. Searching bytes avoids repeated
+// locale-aware scans; grapheme boundaries preserve native substring semantics.
+struct KnowledgeSearchTerm: Sendable {
+    let text: String
+    let original: String
+    let bytes: Data
+    let hasNumber: Bool
+    let hasNonASCIINumber: Bool
+    init(_ text: String, original: String) {
+        self.text = text; self.original = original
+        bytes = Data(text.utf8)
+        var number = false, nonASCII = false
+        for scalar in text.unicodeScalars where Self.isNumber(scalar) {
+            number = true; if scalar.value > 127 { nonASCII = true }
+        }
+        hasNumber = number; hasNonASCIINumber = nonASCII
+    }
+    private static func isNumber(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.properties.generalCategory {
+        case .decimalNumber, .letterNumber, .otherNumber: return true
+        default: return false
+        }
+    }
+}
+struct KnowledgeSearchText: Sendable {
+    private let bytes: Data
+    private let compoundCharacters: [Range<UInt32>]
+    private let original: String?
+    private let requiresNativeSearch: Bool
+    private let hasNonASCIINumber: Bool
+    init(_ text: String) {
+        let folded = Self.fold(text)
+        bytes = folded.bytes; hasNonASCIINumber = folded.hasNonASCIINumber
+        var ranges: [Range<UInt32>] = [], offset: UInt32 = 0
+        // Common prose has only independent ASCII/Han scalars. Avoid walking
+        // every grapheme when there cannot be an exceptional boundary.
+        if text.unicodeScalars.allSatisfy(Self.hasSimpleBoundary) {
+            offset = UInt32(text.utf8.count)
+        } else {
+            // Preserve boundaries before folding: ß → ss and ﬃ → ffi must not
+            // introduce partial matches that native search would reject.
+            for character in text.precomposedStringWithCanonicalMapping {
+                var length = character.utf8.count
+                var compound = character.unicodeScalars.count > 1
+                if character.unicodeScalars.contains(where: { $0.value > 127 && $0.properties.changesWhenCaseFolded }) {
+                    let value = String(character).folding(options: .caseInsensitive, locale: .current).precomposedStringWithCanonicalMapping
+                    length = value.utf8.count
+                    compound = compound || value.unicodeScalars.count > 1
+                }
+                let end = offset + UInt32(length)
+                if compound { ranges.append(offset..<end) }
+                offset = end
+            }
+        }
+        compoundCharacters = ranges
+        requiresNativeSearch = Int(offset) != folded.bytes.count
+        // Plain Chinese/ASCII needs no second retained string. Exceptional
+        // source text shares the original buffer; only its rare boundary path
+        // invokes Foundation, rather than slowing every normal query.
+        original = ranges.isEmpty && !hasNonASCIINumber && !requiresNativeSearch ? nil : text
+    }
+    private static func hasSimpleBoundary(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0...12, 14...127, 0x3000...0x3029, 0x3030...0x303F,
+             0x3400...0x9FFF, 0xFF01...0xFF60, 0x20000...0x2EBEF: return true
+        default: return false
+        }
+    }
+    static func fold(_ text: String) -> KnowledgeSearchTerm {
+        .init(text.folding(options: .caseInsensitive, locale: .current).precomposedStringWithCanonicalMapping, original: text)
+    }
+    var byteCount: Int { bytes.count + compoundCharacters.capacity * MemoryLayout<Range<UInt32>>.stride }
+    private func isCharacterBoundary(_ offset: Int) -> Bool {
+        var lower = 0, upper = compoundCharacters.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            let range = compoundCharacters[middle]
+            if offset <= range.lowerBound { upper = middle }
+            else if offset >= range.upperBound { lower = middle + 1 }
+            else { return false }
+        }
+        return true
+    }
+    func contains(_ needle: KnowledgeSearchTerm) -> Bool {
+        if needle.bytes.isEmpty { return true }
+        if requiresNativeSearch { return original!.localizedCaseInsensitiveContains(needle.original) }
+        // Native search equates numeric forms such as ①/1 and ½/1⁄2, while
+        // preserving other compatibility characters. Keep that uncommon path
+        // native without retaining a second copy of every indexed source.
+        if needle.hasNumber && (hasNonASCIINumber || needle.hasNonASCIINumber) {
+            return (original ?? String(decoding: bytes, as: UTF8.self)).localizedCaseInsensitiveContains(needle.original)
+        }
+        guard let range = bytes.range(of: needle.bytes) else { return false }
+        if isCharacterBoundary(range.lowerBound) && isCharacterBoundary(range.upperBound) { return true }
+        // Foundation handles the uncommon partial cluster case (including its
+        // distinct Hangul/emoji rules); it also finds any later complete match.
+        return (original ?? String(decoding: bytes, as: UTF8.self)).localizedCaseInsensitiveContains(needle.original)
+    }
+    func matches(_ terms: [KnowledgeSearchTerm]) -> Bool {
+        for term in terms { if Task.isCancelled || !contains(term) { return false } }
+        return true
+    }
+}
+private struct IndexedKnowledgeEntry: Sendable {
+    let entry: KnowledgeEntry
+    let text: KnowledgeSearchText
+    init(_ entry: KnowledgeEntry) {
+        self.entry = entry
+        let draft = entry.current
+        text = .init(([draft.title, draft.body] + draft.sources.map { $0.label + " " + $0.locator }).joined(separator: "\n"))
+    }
+    init(entry: KnowledgeEntry, text: KnowledgeSearchText) { self.entry = entry; self.text = text }
+}
+private struct IndexedKnowledgeSource: Sendable {
+    let source: KnowledgeSourceDocument
+    let path: KnowledgeSearchText
+    let text: KnowledgeSearchText
+    init(_ source: KnowledgeSourceDocument) { self.source = source; path = .init(source.relativePath); text = .init(source.text) }
+}
+private struct KnowledgeSnapshot {
+    let sequence: Int
+    let catalog: KnowledgeCatalog
+    let entries: [IndexedKnowledgeEntry]
+}
+private struct KnowledgeSourcesSnapshot {
+    let catalog: KnowledgeSourceCatalog
+    let sources: [IndexedKnowledgeSource]
+}
 private actor KnowledgeIO {
     let store: KnowledgeStore
     let originalEditor: CodexMemoryEditor
     var sequence = 0
+    private var entryIndex: [String: IndexedKnowledgeEntry] = [:]
     init(store: KnowledgeStore) { self.store = store; originalEditor = CodexMemoryEditor(backupDirectory: store.directoryURL.deletingLastPathComponent().appendingPathComponent("codex-memory-backups")) }
-    private func wrap(_ catalog: KnowledgeCatalog) -> KnowledgeSnapshot { sequence += 1; return .init(sequence: sequence, catalog: catalog) }
+    private func wrap(_ catalog: KnowledgeCatalog) -> KnowledgeSnapshot {
+        sequence += 1
+        let entries = catalog.entries.sorted { $0.versions.last!.savedAt > $1.versions.last!.savedAt }.map { entry -> IndexedKnowledgeEntry in
+            if let cached = entryIndex[entry.id] {
+                let before = cached.entry.current, after = entry.current
+                if before.title == after.title && before.body == after.body && before.sources == after.sources {
+                    return .init(entry: entry, text: cached.text)
+                }
+            }
+            return autoreleasepool { IndexedKnowledgeEntry(entry) }
+        }
+        entryIndex = Dictionary(uniqueKeysWithValues: entries.map { ($0.entry.id, $0) })
+        return .init(sequence: sequence, catalog: catalog, entries: entries)
+    }
     func load() throws -> KnowledgeSnapshot { wrap(try store.load()) }
     func save(_ draft: KnowledgeDraft, expected: KnowledgeEntry?, reason: String) throws -> KnowledgeSnapshot {
         wrap(try store.save(draft, expected: expected, reason: reason))
@@ -22,7 +163,10 @@ private actor KnowledgeIO {
     func removeBackup(_ backup: CodexMemoryBackup) throws { try originalEditor.removeBackup(backup) }
     func backups() throws -> [CodexMemoryBackup] { try originalEditor.backups() }
     func restoreOriginal(_ backup: CodexMemoryBackup, root: URL) throws { _ = try originalEditor.restore(backup, root: root) }
-    func sources(root: URL) throws -> KnowledgeSourceCatalog { try CodexMemoryReader(rootURL: root).read() }
+    func sources(root: URL) throws -> KnowledgeSourcesSnapshot {
+        let catalog = try CodexMemoryReader(rootURL: root).read()
+        return .init(catalog: catalog, sources: catalog.documents.map { source in autoreleasepool { IndexedKnowledgeSource(source) } })
+    }
 }
 struct KnowledgeEditRequest: Identifiable {
     let id = UUID()
@@ -32,39 +176,50 @@ struct KnowledgeEditRequest: Identifiable {
     var reason = "编辑"
 }
 
-@MainActor
-final class KnowledgeDesktopModel: ObservableObject {
-    @Published private(set) var catalog = KnowledgeCatalog()
-    @Published private(set) var sourceCatalog = KnowledgeSourceCatalog()
-    @Published private(set) var filteredEntries: [KnowledgeEntry] = []
-    @Published private(set) var filteredSources: [KnowledgeSourceDocument] = []
-    @Published private(set) var isLoading = false
-    @Published private(set) var isReadingSources = false
-    @Published private(set) var isFiltering = false
-    @Published private(set) var isSaving = false
-    @Published private(set) var hasLoaded = false
-    @Published private(set) var loadError: String?
-    @Published private(set) var operationError: String?
-    @Published private(set) var sourceError: String?
-    @Published private(set) var status: String?
-    @Published private(set) var originalBackups: [CodexMemoryBackup] = []
-    @Published var editor: KnowledgeEditRequest?
-    @Published var query = "" { didSet { filter() } }
-    @Published var projectFilter = "" { didSet { filter() } }
-    @Published var originFilter: KnowledgeOrigin? { didSet { filter() } }
-    @Published var stateFilter: KnowledgeState? { didSet { filter() } }
-    @Published var showTrash = false { didSet { filter() } }
-    @Published var includeArchived = false { didSet { filter() } }
+@MainActor @Observable
+final class KnowledgeDesktopModel {
+    private(set) var catalog = KnowledgeCatalog()
+    private(set) var sourceCatalog = KnowledgeSourceCatalog()
+    private(set) var filteredEntries: [KnowledgeEntry] = []
+    private(set) var filteredSources: [KnowledgeSourceDocument] = []
+    private(set) var isLoading = false
+    private(set) var isReadingSources = false
+    private(set) var isFiltering = false
+    private(set) var isSaving = false
+    private(set) var hasLoaded = false
+    private(set) var loadError: String?
+    private(set) var operationError: String?
+    private(set) var sourceError: String?
+    private(set) var status: String?
+    private(set) var originalBackups: [CodexMemoryBackup] = []
+    var editor: KnowledgeEditRequest?
+    var query = "" { didSet { if query != oldValue { filter() } } }
+    var projectFilter = "" { didSet { if projectFilter != oldValue { filter() } } }
+    var originFilter: KnowledgeOrigin? { didSet { if originFilter != oldValue { filter() } } }
+    var stateFilter: KnowledgeState? { didSet { if stateFilter != oldValue { filter() } } }
+    var showTrash = false { didSet { if showTrash != oldValue { filter() } } }
+    var includeArchived = false { didSet { if includeArchived != oldValue { filter() } } }
     let directoryURL: URL
-    @Published private(set) var sourceRoot: URL
+    private(set) var sourceRoot: URL
     private let io: KnowledgeIO
-    private var appliedSequence = 0
-    private var filterTask: Task<Void, Never>?
-    private var filterGeneration = UUID()
+    @ObservationIgnored private var appliedSequence = 0
+    @ObservationIgnored private var filterTask: Task<Void, Never>?
+    @ObservationIgnored private var filterOperation: Task<([KnowledgeEntry], [KnowledgeSourceDocument])?, Never>?
+    @ObservationIgnored private var filterGeneration = UUID()
+    @ObservationIgnored private var indexedEntries: [IndexedKnowledgeEntry] = []
+    @ObservationIgnored private var indexedSources: [IndexedKnowledgeSource] = []
+    @ObservationIgnored private var snapshotVersion = 0
+    @ObservationIgnored private var publishedSnapshotVersion = -1
     init(directoryURL: URL, sourceRoot: URL) {
         self.directoryURL = directoryURL; self.sourceRoot = sourceRoot
         io = KnowledgeIO(store: KnowledgeStore(directoryURL: directoryURL))
     }
+    /// Account for owned normalized buffers; original strings remain shared by value.
+    var searchIndexByteCount: Int {
+        indexedEntries.reduce(0) { $0 + $1.text.byteCount }
+            + indexedSources.reduce(0) { $0 + $1.path.byteCount + $1.text.byteCount }
+    }
+    deinit { filterTask?.cancel(); filterOperation?.cancel() }
     func loadIfNeeded() async {
         if !hasLoaded { await reload() }
     }
@@ -79,8 +234,11 @@ final class KnowledgeDesktopModel: ObservableObject {
         guard !isReadingSources else { return }
         if let root { sourceRoot = root }
         isReadingSources = true
-        do { sourceCatalog = try await io.sources(root: sourceRoot); sourceError = nil }
-        catch { sourceCatalog = .init(); sourceError = error.localizedDescription }
+        do {
+            let snapshot = try await io.sources(root: sourceRoot)
+            sourceCatalog = snapshot.catalog; indexedSources = snapshot.sources; snapshotVersion += 1; sourceError = nil
+        }
+        catch { sourceCatalog = .init(); indexedSources = []; snapshotVersion += 1; sourceError = error.localizedDescription }
         isReadingSources = false; filter()
     }
     func loadOriginalBackups() async {
@@ -154,34 +312,62 @@ final class KnowledgeDesktopModel: ObservableObject {
     }
     private func apply(_ snapshot: KnowledgeSnapshot) {
         guard snapshot.sequence > appliedSequence else { return }
-        appliedSequence = snapshot.sequence; catalog = snapshot.catalog; filter()
+        appliedSequence = snapshot.sequence; catalog = snapshot.catalog; indexedEntries = snapshot.entries; snapshotVersion += 1; filter()
     }
     private func filter() {
-        filterTask?.cancel(); let generation = UUID(); filterGeneration = generation; isFiltering = true
-        let entries = catalog.entries, sources = sourceCatalog.documents
-        let terms = query.split(whereSeparator: \.isWhitespace).map(String.init)
+        filterTask?.cancel(); filterOperation?.cancel()
+        let generation = UUID(); filterGeneration = generation
+        let entries = indexedEntries, sources = indexedSources
+        let terms = query.split(whereSeparator: \.isWhitespace).map { KnowledgeSearchText.fold(String($0)) }
         let project = projectFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+        let projectTerm = KnowledgeSearchText.fold(project)
         let origin = originFilter, state = stateFilter, archived = includeArchived, trash = showTrash
-        filterTask = Task { [weak self] in
-            do { try await Task.sleep(nanoseconds: 150_000_000) } catch { return }
-            let operation = Task.detached(priority: .utility) { () -> ([KnowledgeEntry], [KnowledgeSourceDocument]) in
-                let matchingEntries = entries.filter { entry in
-                    let value = entry.current
-                    guard (entry.deletedAt != nil) == trash, (trash || archived || state == .archived || value.state != .archived), state == nil || value.state == state,
-                          origin == nil || (origin == .manual ? value.sources.isEmpty || value.sources.contains { $0.origin == .manual } : value.sources.contains { $0.origin == origin }),
-                          project.isEmpty || value.projectPath.localizedCaseInsensitiveContains(project) else { return false }
-                    let text = value.title + "\n" + value.body + "\n" + value.sources.map { $0.label + " " + $0.locator }.joined(separator: "\n")
-                    return terms.allSatisfy { text.localizedCaseInsensitiveContains($0) }
-                }.sorted { $0.versions.last!.savedAt > $1.versions.last!.savedAt }
-                let matchingSources = sources.filter { value in
-                    guard project.isEmpty || value.text.localizedCaseInsensitiveContains(project) else { return false }
-                    return terms.allSatisfy { value.relativePath.localizedCaseInsensitiveContains($0) || value.text.localizedCaseInsensitiveContains($0) }
-                }
-                return (matchingEntries, matchingSources)
-            }
-            let result = await operation.value
-            guard !Task.isCancelled, let self, self.filterGeneration == generation else { return }
-            self.filteredEntries = result.0; self.filteredSources = result.1; self.isFiltering = false
+        let matchesMetadata: @Sendable (KnowledgeEntry) -> Bool = { entry in
+            let value = entry.current
+            return (entry.deletedAt != nil) == trash && (trash || archived || state == .archived || value.state != .archived)
+                && (state == nil || value.state == state)
+                && (origin == nil || (origin == .manual ? value.sources.isEmpty || value.sources.contains { $0.origin == .manual } : value.sources.contains { $0.origin == origin }))
+                && (project.isEmpty || value.projectPath.localizedCaseInsensitiveContains(project))
         }
+        // Metadata-only changes are bounded by the 200-entry catalog and need no
+        // task, debounce, scan, or body copy. Clearing search updates immediately.
+        if terms.isEmpty && project.isEmpty {
+            publish(entries.compactMap { matchesMetadata($0.entry) ? $0.entry : nil }, sources.map(\.source))
+            filterTask = nil; filterOperation = nil; isFiltering = false; return
+        }
+        if !isFiltering { isFiltering = true }
+        let operation = Task.detached(priority: .userInitiated) { () -> ([KnowledgeEntry], [KnowledgeSourceDocument])? in
+            var matchingEntries: [KnowledgeEntry] = [], matchingSources: [KnowledgeSourceDocument] = []
+            for value in entries {
+                if Task.isCancelled { return nil }
+                if matchesMetadata(value.entry) && value.text.matches(terms) { matchingEntries.append(value.entry) }
+            }
+            for value in sources {
+                if Task.isCancelled { return nil }
+                guard project.isEmpty || value.text.contains(projectTerm) else { continue }
+                var matches = true
+                for term in terms {
+                    if Task.isCancelled { return nil }
+                    if !value.path.contains(term) && !value.text.contains(term) { matches = false; break }
+                }
+                if matches { matchingSources.append(value.source) }
+            }
+            return (matchingEntries, matchingSources)
+        }
+        filterOperation = operation
+        filterTask = Task { [weak self] in
+            let result = await operation.value
+            guard !Task.isCancelled, let result, let self, self.filterGeneration == generation else { return }
+            self.publish(result.0, result.1); self.isFiltering = false
+            self.filterTask = nil; self.filterOperation = nil
+        }
+    }
+    private func publish(_ entries: [KnowledgeEntry], _ sources: [KnowledgeSourceDocument]) {
+        // Snapshot objects already hold the current content. Within one snapshot,
+        // equal IDs mean equal content and avoid unnecessary SwiftUI list updates.
+        let changed = publishedSnapshotVersion != snapshotVersion
+        if changed || filteredEntries.map(\.id) != entries.map(\.id) { filteredEntries = entries }
+        if changed || filteredSources.map(\.id) != sources.map(\.id) { filteredSources = sources }
+        publishedSnapshotVersion = snapshotVersion
     }
 }

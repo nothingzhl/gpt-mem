@@ -63,6 +63,7 @@ private func sessionProjectPaths(_ sessions: [CodexSessionSummary]) -> [String] 
 
 private struct SessionFilterResult: Sendable {
     let summaries: [CodexSessionSummary]
+    let positions: [String: Int]
     let analytics: SessionAnalytics
     let totals: [SessionTokenMetric: SessionTokenTotal]
     let matchingUserMessageIDs: [String]
@@ -70,7 +71,8 @@ private struct SessionFilterResult: Sendable {
     static func make(sessions: [CodexSessionSummary], filter: SessionFilter,
                      previousMatches: Set<String>?, transcriptIndex: SessionTranscriptIndex?, selectedSessionID: String?,
                      management: SessionManagementIndex) -> SessionFilterResult? {
-        var summaries: [CodexSessionSummary] = []
+        var favorites: [CodexSessionSummary] = []
+        var others: [CodexSessionSummary] = []
         let terms = filter.query.split(whereSeparator: \.isWhitespace).map(String.init)
         let tagTerms = terms.map(SessionManagementStore.tagKey)
         for summary in sessions {
@@ -90,12 +92,14 @@ private struct SessionFilterResult: Sendable {
                 }
                 guard matches else { continue }
             }
-            summaries.append(summary)
+            if management.isFavorite(summary) { favorites.append(summary) }
+            else { others.append(summary) }
         }
         // Stable partition preserves the existing newest-first order inside each
         // group. Bookmarking does not alter the source log or analytics identity.
-        summaries = summaries.filter { management.isFavorite($0) }
-            + summaries.filter { !management.isFavorite($0) }
+        let summaries = favorites + others
+        let positions = Dictionary(summaries.enumerated().map { ($0.element.id, $0.offset) },
+                                   uniquingKeysWith: { first, _ in first })
         var totals: [SessionTokenMetric: SessionTokenTotal] = [:]
         for metric in SessionTokenMetric.allCases {
             guard !Task.isCancelled else { return nil }
@@ -112,10 +116,10 @@ private struct SessionFilterResult: Sendable {
                 missingSessionCount: missing, isOverflow: overflow)
         }
         guard !Task.isCancelled else { return nil }
-        let hasVisibleDetail = selectedSessionID.map { selectedID in summaries.contains { $0.id == selectedID } } ?? false
+        let hasVisibleDetail = selectedSessionID.map { positions[$0] != nil } ?? false
         let matches = hasVisibleDetail ? transcriptIndex?.matchingUserMessages(query: filter.query) ?? [] : []
         guard !Task.isCancelled else { return nil }
-        return SessionFilterResult(summaries: summaries, analytics: SessionAnalytics(sessions: summaries),
+        return SessionFilterResult(summaries: summaries, positions: positions, analytics: SessionAnalytics(sessions: summaries),
                                    totals: totals, matchingUserMessageIDs: matches)
     }
 }
@@ -181,6 +185,22 @@ enum SessionMessagePage {
 private struct SessionTranscriptLoad: Sendable {
     let transcript: SessionTranscript
     let index: SessionTranscriptIndex
+    let matchingUserMessageIDs: [String]
+}
+
+/// Search may finish hundreds of small logs between two screen frames. Do not
+/// enqueue one main-actor task for every log just to update a progress label.
+private final class SessionSearchProgressGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastPublished = -Double.infinity
+
+    func shouldPublish(_ count: Int, total: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard count == total || now - lastPublished >= 0.1 else { return false }
+        lastPublished = now
+        return true
+    }
 }
 
 @MainActor
@@ -202,11 +222,14 @@ final class SessionDesktopModel: ObservableObject {
     @Published private(set) var projectPaths: [String] = []
     @Published private(set) var availableProjectTags: [String] = []
     @Published private(set) var analytics = SessionAnalytics(sessions: [])
+    @Published private(set) var displayedProjects: [SessionProjectSummary] = []
     @Published var query = "" { didSet { if query != oldValue { updateFilteredSessions(debounce: true) } } }
     @Published var selectedProject: String? { didSet { if selectedProject != oldValue { updateFilteredSessions() } } }
     @Published var includeArchived = false { didSet { if includeArchived != oldValue { updateFilteredSessions() } } }
     @Published var onlyFavoriteSessions = false { didSet { if onlyFavoriteSessions != oldValue { updateFilteredSessions() } } }
-    @Published var onlyFavoriteProjects = false
+    @Published var onlyFavoriteProjects = false {
+        didSet { if onlyFavoriteProjects != oldValue { updateDisplayedProjects() } }
+    }
     @Published var selectedProjectTag: String? {
         didSet {
             guard selectedProjectTag != oldValue else { return }
@@ -220,6 +243,7 @@ final class SessionDesktopModel: ObservableObject {
     private var managementSubscription: AnyCancellable?
     private let catalogLoader: @Sendable () throws -> SessionCatalog
     private let transcriptLoader: @Sendable (CodexSessionSummary) throws -> SessionTranscript
+    private let searchTranscriptLoader: @Sendable (CodexSessionSummary) throws -> SessionTranscript
     private var catalogGeneration = UUID()
     private var transcriptGeneration = UUID()
     private var catalogTask: Task<Void, Never>?
@@ -234,6 +258,8 @@ final class SessionDesktopModel: ObservableObject {
     private var tokenTotals: [SessionTokenMetric: SessionTokenTotal] = [:]
     private var pendingSelectionReload = false
     private var catalogProjectTags: [String] = []
+    private var sessionPositions: [String: Int] = [:]
+    private var filteredSessionPositions: [String: Int] = [:]
 
     init(rootURL: URL = CodexSessionRepository.defaultRootURL, indexDirectoryURL: URL? = nil,
          managementDirectoryURL: URL? = nil) {
@@ -242,6 +268,7 @@ final class SessionDesktopModel: ObservableObject {
         management = SessionManagementModel(directoryURL: managementDirectoryURL, sourceRootURL: rootURL)
         catalogLoader = { try repository.loadCatalog() }
         transcriptLoader = { try repository.loadTranscript(for: $0) }
+        searchTranscriptLoader = { try repository.loadTranscriptForSearch(for: $0) }
         connectManagement()
     }
 
@@ -254,6 +281,7 @@ final class SessionDesktopModel: ObservableObject {
         management = SessionManagementModel(directoryURL: managementDirectoryURL, sourceRootURL: rootURL)
         self.catalogLoader = catalogLoader
         self.transcriptLoader = transcriptLoader
+        searchTranscriptLoader = transcriptLoader
         connectManagement()
     }
 
@@ -262,6 +290,7 @@ final class SessionDesktopModel: ObservableObject {
         management.didChange = { [weak self] in
             guard let self else { return }
             self.sortProjectPaths()
+            self.updateDisplayedProjects()
             self.lastAppliedFilter = nil
             self.lastMatchedIDs = []
             self.updateFilteredSessions()
@@ -302,9 +331,13 @@ final class SessionDesktopModel: ObservableObject {
         availableProjectTags = choices
     }
 
-    var displayedProjects: [SessionProjectSummary] {
-        let projects = analytics.projects.filter { !onlyFavoriteProjects || isFavoriteProject($0.id) }
-        return projects.filter { isFavoriteProject($0.id) } + projects.filter { !isFavoriteProject($0.id) }
+    private func updateDisplayedProjects() {
+        var favorites: [SessionProjectSummary] = [], others: [SessionProjectSummary] = []
+        for project in analytics.projects {
+            if isFavoriteProject(project.id) { favorites.append(project) }
+            else if !onlyFavoriteProjects { others.append(project) }
+        }
+        displayedProjects = favorites + others
     }
 
     func localTitle(for summary: CodexSessionSummary) -> String { management.index.entry(for: summary)?.displayName ?? "" }
@@ -319,8 +352,10 @@ final class SessionDesktopModel: ObservableObject {
     /// Frozen editor targets can survive normal refreshes and detail loads, but
     /// may not write metadata for a file whose actual session identity changed.
     private func currentManagementTarget(_ summary: CodexSessionSummary) -> Bool {
-        !isLoading && sessions.contains { $0.id == summary.id && $0.managementID == summary.managementID
-            && $0.fileURL.standardizedFileURL == summary.fileURL.standardizedFileURL }
+        guard !isLoading, let position = sessionPositions[summary.id] else { return false }
+        let current = sessions[position]
+        return current.managementID == summary.managementID
+            && current.fileURL.standardizedFileURL == summary.fileURL.standardizedFileURL
     }
 
     func toggleSessionFavorite(_ summary: CodexSessionSummary) {
@@ -404,9 +439,11 @@ final class SessionDesktopModel: ObservableObject {
             self.filterOperation = nil
             self.filterTask = nil
             guard let result else { self.isFiltering = false; return }
+            self.filteredSessionPositions = result.positions
             self.filteredSessions = result.summaries
             self.tokenTotals = result.totals
             self.analytics = result.analytics
+            self.updateDisplayedProjects()
             self.matchingUserMessageIDs = Set(result.matchingUserMessageIDs)
             self.firstMatchingUserMessageID = result.matchingUserMessageIDs.first
             self.lastAppliedFilter = filter
@@ -422,7 +459,8 @@ final class SessionDesktopModel: ObservableObject {
     }
 
     var selectedSession: CodexSessionSummary? {
-        filteredSessions.first { $0.id == selectedSessionID }
+        guard let selectedSessionID, let position = filteredSessionPositions[selectedSessionID] else { return nil }
+        return filteredSessions[position]
     }
 
     func total(_ keyPath: KeyPath<CodexTokenUsage, Int?>) -> SessionTokenTotal {
@@ -455,12 +493,14 @@ final class SessionDesktopModel: ObservableObject {
         fullTextGeneration = generation
         let candidates = sessions.filter { (archived || !$0.isArchived) &&
             (project == nil || SessionManagementIndex.projectPath(for: $0) == project) }
-        let loader = transcriptLoader
+        let loader = searchTranscriptLoader
         fullTextScanned = 0
         fullTextTotal = candidates.count
         isSearchingFullText = true
         let operation = Task.detached(priority: .utility) {
-            try SessionFullTextSearch.search(sessions: candidates, query: query, scope: scope, progress: { [weak self] count, _ in
+            let gate = SessionSearchProgressGate()
+            return try SessionFullTextSearch.search(sessions: candidates, query: query, scope: scope, progress: { [weak self] count, total in
+                guard gate.shouldPublish(count, total: total) else { return }
                 Task { @MainActor in
                     guard let self, self.fullTextGeneration == generation, self.isSearchingFullText else { return }
                     self.fullTextScanned = count
@@ -473,6 +513,7 @@ final class SessionDesktopModel: ObservableObject {
                 let result = try await operation.value
                 guard let self, self.fullTextGeneration == generation, !Task.isCancelled else { return }
                 self.fullTextResult = result
+                self.fullTextScanned = result.scannedSessions + result.skippedSessions
                 self.isSearchingFullText = false
                 self.fullTextOperation = nil
                 self.fullTextTask = nil
@@ -541,6 +582,8 @@ final class SessionDesktopModel: ObservableObject {
                 self.transcriptGeneration = UUID()
                 self.isLoadingTranscript = false
                 self.sessions = catalog.sessions
+                self.sessionPositions = Dictionary(catalog.sessions.enumerated().map { ($0.element.id, $0.offset) },
+                                                    uniquingKeysWith: { first, _ in first })
                 self.catalogWarnings = catalog.warnings
                 self.sortProjectPaths()
                 self.lastAppliedFilter = nil
@@ -563,10 +606,11 @@ final class SessionDesktopModel: ObservableObject {
 
     func select(_ id: String, forceReload: Bool = false) {
         guard !isFiltering else { return }
-        guard let summary = filteredSessions.first(where: { $0.id == id }) else {
+        guard let position = filteredSessionPositions[id] else {
             clearSelection()
             return
         }
+        let summary = filteredSessions[position]
         if !forceReload, selectedSessionID == id,
            (transcript != nil || isLoadingTranscript) { return }
         transcriptTask?.cancel()
@@ -583,10 +627,13 @@ final class SessionDesktopModel: ObservableObject {
         transcriptErrorMessage = nil
         isLoadingTranscript = true
         let loader = transcriptLoader
+        let requestedFilter = currentFilter
         let operation = Task.detached(priority: .utility) {
             Result {
                 let transcript = try loader(summary)
-                return SessionTranscriptLoad(transcript: transcript, index: try SessionTranscriptIndex(messages: transcript.messages))
+                let index = try SessionTranscriptIndex(messages: transcript.messages)
+                return SessionTranscriptLoad(transcript: transcript, index: index,
+                    matchingUserMessageIDs: index.matchingUserMessages(query: requestedFilter.query))
             }
         }
         transcriptOperation = operation
@@ -608,8 +655,17 @@ final class SessionDesktopModel: ObservableObject {
                 self.transcript = transcript
                 self.transcriptIndex = loaded.index
                 var unchangedSearchFields = false
-                if let index = self.sessions.firstIndex(where: { $0.id == id }) {
+                if let index = self.sessionPositions[id] {
                     let previous = self.sessions[index]
+                    // Opening a previously indexed log changes only visible detail.
+                    // Rebuilding every project and chart here blocked rapid selection
+                    // even though all catalog/filter/analytics inputs were identical.
+                    if previous == transcript.summary, self.currentFilter == requestedFilter,
+                       self.lastAppliedFilter == requestedFilter, !self.isFiltering {
+                        self.matchingUserMessageIDs = Set(loaded.matchingUserMessageIDs)
+                        self.firstMatchingUserMessageID = loaded.matchingUserMessageIDs.first
+                        return
+                    }
                     unchangedSearchFields = previous.title == transcript.summary.title
                         && previous.managementID == transcript.summary.managementID
                         && previous.projectPath == transcript.summary.projectPath
