@@ -32,11 +32,14 @@ public struct AIProviderConfiguration: Codable, Equatable, Identifiable {
     public var maxOutputTokens: Int
     public var jsonMode: Bool
     public var revision: Int
+    public var credentialReference: UUID?
+    public var credentialStorageID: UUID { credentialReference ?? id }
     public init(id: UUID = UUID(), name: String, kind: AIProviderKind, baseURL: String, model: String,
                 timeoutSeconds: Double = 60, maxOutputTokens: Int = AIProviderConfiguration.defaultMaxOutputTokens,
-                jsonMode: Bool = true, revision: Int = 1) {
+                jsonMode: Bool = true, revision: Int = 1, credentialReference: UUID? = nil) {
         self.id = id; self.name = name; self.kind = kind; self.baseURL = baseURL; self.model = model
         self.timeoutSeconds = timeoutSeconds; self.maxOutputTokens = maxOutputTokens; self.jsonMode = jsonMode; self.revision = revision
+        self.credentialReference = credentialReference
     }
 
     public func validated() throws -> URL {
@@ -75,8 +78,25 @@ public struct AISettings: Codable, Equatable {
     public init(providers: [AIProviderConfiguration] = [], selectedProviderID: UUID? = nil) {
         self.providers = providers; self.selectedProviderID = selectedProviderID
     }
+    private enum CodingKeys: String, CodingKey { case version, sources, providers, selectedProviderID }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let version = try values.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        guard version == 1 || version == 2 else {
+            throw DecodingError.dataCorruptedError(forKey: .version, in: values, debugDescription: "Unsupported settings version")
+        }
+        providers = try values.decode([AIProviderConfiguration].self, forKey: version == 1 ? .providers : .sources)
+        selectedProviderID = try values.decodeIfPresent(UUID.self, forKey: .selectedProviderID)
+    }
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(2, forKey: .version)
+        try values.encode(providers, forKey: .sources)
+        try values.encodeIfPresent(selectedProviderID, forKey: .selectedProviderID)
+    }
     public func validate() throws {
-        guard providers.count <= 30, Set(providers.map(\.id)).count == providers.count,
+        guard Set(providers.map(\.credentialStorageID)).count == providers.count,
+              providers.count <= 30, Set(providers.map(\.id)).count == providers.count,
               selectedProviderID == nil || providers.contains(where: { $0.id == selectedProviderID }) else {
             throw AIAnalysisError.invalidConfiguration("AI 来源过多、编号重复或选择的来源不存在。")
         }
@@ -88,6 +108,26 @@ public struct AISettings: Codable, Equatable {
 public final class AIConfigurationStore {
     public let url: URL
     public init(url: URL) { self.url = url }
+    /// Keep read/check/write mutations in one cross-process critical section.
+    /// Requests use immutable credential references, so readers need no lock.
+    public func withExclusiveAccess<T>(_ action: () throws -> T) throws -> T {
+        guard url.isFileURL else { throw AIAnalysisError.invalidConfiguration("AI 设置必须保存到本机文件。") }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let lockURL = url.appendingPathExtension("lock")
+        let descriptor = open(lockURL.path, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { throw AIAnalysisError.invalidConfiguration("无法打开 AI 配置锁。") }
+        defer { close(descriptor) }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+              info.st_uid == getuid(), info.st_nlink == 1, info.st_mode & 0o077 == 0 else {
+            throw AIAnalysisError.invalidConfiguration("AI 配置锁不是当前用户的私有普通文件。")
+        }
+        guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            throw AIAnalysisError.invalidConfiguration("其他实例正在修改 AI 来源，请稍后重试。")
+        }
+        defer { flock(descriptor, LOCK_UN) }
+        return try action()
+    }
     public func load() throws -> AISettings {
         guard url.isFileURL else { throw AIAnalysisError.invalidConfiguration("AI 设置必须保存到本机文件。") }
         guard FileManager.default.fileExists(atPath: url.path) else { return AISettings() }
@@ -110,7 +150,7 @@ public final class AIConfigurationStore {
         let data = try AIAnalysisCodec.encoder(pretty: true).encode(settings)
         guard data.count <= 131_072 else { throw AIAnalysisError.invalidConfiguration("AI 配置文件超过允许大小。") }
         // Complete every fallible write/permission operation before replacing the
-        // existing configuration, so a failed save can safely roll back credentials.
+        // existing configuration. Immutable credential references keep failures safe.
         var path = Array(url.deletingLastPathComponent().appendingPathComponent(".ai-services-XXXXXX").path.utf8CString)
         let descriptor = mkstemp(&path) // Creates the staging file with mode 0600.
         guard descriptor >= 0 else { throw AIAnalysisError.invalidConfiguration("无法创建 AI 配置临时文件（\(errno)）。") }

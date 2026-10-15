@@ -194,6 +194,53 @@ final class AIInfrastructureTests: XCTestCase {
         XCTAssertEqual(client.callCount, 2)
     }
 
+    func testLegacySettingsUpgradeRejectsOldDecoderAndUnknownVersions() throws {
+        let config = configuration()
+        let legacy = try JSONSerialization.data(withJSONObject: [
+            "providers": [JSONSerialization.jsonObject(with: AIAnalysisCodec.encoder().encode(config))],
+            "selectedProviderID": config.id.uuidString
+        ])
+        let decoded = try AIAnalysisCodec.decoder().decode(AISettings.self, from: legacy)
+        XCTAssertEqual(decoded.providers[0].credentialStorageID, config.id)
+        let upgraded = try AIAnalysisCodec.encoder().encode(decoded)
+        struct OldSettings: Decodable { let providers: [AIProviderConfiguration] }
+        XCTAssertThrowsError(try JSONDecoder().decode(OldSettings.self, from: upgraded))
+        XCTAssertEqual(try AIAnalysisCodec.decoder().decode(AISettings.self, from: upgraded), decoded)
+        XCTAssertThrowsError(try AIAnalysisCodec.decoder().decode(AISettings.self, from: Data("{\"version\":3,\"sources\":[]}".utf8)))
+    }
+
+    func testConfigurationLockRejectsOtherStoresAndSymlinkLock() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ai-lock-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = AIConfigurationStore(url: directory.appendingPathComponent("services.json"))
+        let other = AIConfigurationStore(url: store.url)
+        try store.withExclusiveAccess {
+            XCTAssertThrowsError(try other.withExclusiveAccess { try other.save(AISettings()) })
+            try store.save(AISettings())
+        }
+        try other.withExclusiveAccess { XCTAssertTrue(try other.load().providers.isEmpty) }
+        try FileManager.default.removeItem(at: store.url.appendingPathExtension("lock"))
+        try FileManager.default.createSymbolicLink(atPath: store.url.appendingPathExtension("lock").path,
+                                                  withDestinationPath: store.url.path)
+        XCTAssertThrowsError(try store.withExclusiveAccess { try store.save(AISettings()) })
+    }
+
+    func testCredentialReferencesPreserveBindingAcrossStagedReplacement() throws {
+        let client = InfrastructureMockClient(result: result()), credentials = InfrastructureCredentials()
+        let coordinator = AIAnalysisCoordinator(client: client, credentials: credentials)
+        var old = configuration(); old.credentialReference = UUID()
+        var next = old; next.baseURL = "https://next-service.test/v1"; next.credentialReference = UUID()
+        try credentials.setKey("old-key", for: old.credentialStorageID)
+        try credentials.setKey("new-key", for: next.credentialStorageID)
+        _ = try awaitValue { try await coordinator.analyze(module: InfrastructureModule(input: self.input()), configuration: old) }
+        XCTAssertEqual(client.lastKey, "old-key")
+        _ = try awaitValue { try await coordinator.analyze(module: InfrastructureModule(input: self.input()), configuration: next) }
+        XCTAssertEqual(client.lastKey, "new-key")
+        try credentials.deleteKey(for: old.credentialStorageID)
+        XCTAssertThrowsError(try awaitValue { try await coordinator.analyze(module: InfrastructureModule(input: self.input()), configuration: old) })
+        XCTAssertEqual(client.callCount, 2)
+    }
+
     private func awaitValue<T>(_ operation: @escaping () async throws -> T) throws -> T {
         let box = InfrastructureAsyncBox<T>(), semaphore = DispatchSemaphore(value: 0)
         let task = Task.detached {

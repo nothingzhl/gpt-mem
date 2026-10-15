@@ -2,6 +2,17 @@
 
 macOS 上独立运行的 ChatGPT / Codex 内存观察器与 Codex 会话查看器。提供原生 SwiftUI 桌面应用 GPT Manager 和保留的 `gpt-mem` CLI，记录进程内存，并根据历史给出变化结论、主要来源、重点进程和下一步检查建议。桌面还可在本机查看、搜索 Codex 会话和统计日志记录的 Token 用量。常规内存采样不读取聊天正文；会话模块只在打开该页面后读取本机会话日志，不发送正文或读取其他应用的凭据。AI 内存分析仅在你确认发送摘要后调用所选服务。
 
+[![CI](https://github.com/nothingzhl/gpt-mem/actions/workflows/ci.yml/badge.svg)](https://github.com/nothingzhl/gpt-mem/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
+[下载发布版本](https://github.com/nothingzhl/gpt-mem/releases) · [安装与发布说明](docs/releases.md) · [贡献指南](CONTRIBUTING.md) · [私密安全报告](SECURITY.md)
+
+桌面 ZIP 按 Apple Silicon（arm64）与 Intel（x86_64）分别提供；解压后将 GPT Manager.app 放入 Applications。CLI 压缩包解压后将 gpt-mem 复制到自己的 PATH 目录。当前产物为 ad-hoc 签名，未经过 Apple 公证，首次启动可能被 Gatekeeper 拦截；确认来源可信后按系统提示操作，不要全局关闭安全检查。
+
+![内存概览：由模拟数据生成的界面](docs/images/memory-overview.png)
+
+截图使用 scripts/check-page-performance.py 的模拟 fixture，不包含真实会话或用户进程。
+
 需要 macOS 14 或更新版本；从源码构建需要 Swift 6 工具链（Command Line Tools 即可，无需安装完整 Xcode）。采样使用 macOS 原生进程接口，数据保存在本机 SQLite，应用运行不依赖 Python、Node 或第三方包。桌面监控和 CLI `watch` 使用同一套历史及单实例锁。
 
 ## 里程碑与后续方向
@@ -181,7 +192,7 @@ gpt-mem report --since 2h --output report.html --json > report.json
 
 “拉取模型”仅向表单上显示的服务地址发送模型列表请求，不发送内存摘要，不保存草稿。新输入的 Key 仅随这次请求使用；编辑已有来源时可复用同地址、同协议的已保存 Key，改成其他服务后需重新填写该服务的 Key。切换预设、服务地址或协议会清除尚未保存的 Key。自定义地址旁直接显示接口格式，可选择 Chat Completions、Responses 或 Ollama。取消、关闭表单或改地址后，旧列表请求不能覆盖新表单；服务不支持列出模型时可手动填写。此流程参考 [CC Switch 的预设与模型选择](https://github.com/farion1231/cc-switch/blob/main/docs/user-manual/en/2-providers/2.1-add.md)，模型列表协议参考 [OpenAI Models](https://developers.openai.com/api/reference/resources/models/methods/list)、[Ollama Tags](https://docs.ollama.com/api/tags)，DeepSeek 预设参考[官方快速开始](https://api-docs.deepseek.com/)。
 
-来源配置保存在历史目录中的 `ai-services.json`，文件权限为 `0600`，不包含 API Key。密钥只保存在 macOS 钥匙串。同地址、同协议编辑时留空表示保留已有密钥；换服务时需填入新 Key，或在高级设置中明确清除原 Key，避免把旧密钥沿用到新服务。“清除已保存的密钥”是独立选项；取消编辑不会保存。配置读取失败时禁止覆盖保存，修复文件后可重新读取。编辑、移除前重新核对已保存来源，冲突时保留草稿与密钥并提示重新打开编辑；保存时保留其他新来源。模型列表拉取期间也可保存手填模型，保存成功会取消列表请求。
+来源配置保存在历史目录中的 `ai-services.json`，文件权限为 `0600`，不包含 API Key。0.19.4 起使用独立凭据引用和跨进程写锁；新 Key 先写入新条目，配置成功切换后清理旧条目，失败不覆盖旧 Key。旧配置可读，首次保存升级为格式 2，旧版应用会拒绝读取新格式。密钥只保存在 macOS 钥匙串。同地址、同协议编辑时留空表示保留已有密钥；换服务时需填入新 Key，或在高级设置中明确清除原 Key，避免把旧密钥沿用到新服务。“清除已保存的密钥”是独立选项；取消编辑不会保存。配置读取失败时禁止覆盖保存，修复文件后可重新读取。编辑、移除前重新核对已保存来源，冲突时保留草稿与密钥并提示重新打开编辑；保存时保留其他新来源。模型列表拉取期间也可保存手填模型，保存成功会取消列表请求。
 
 高级设置的超时限制从发送到完整响应的总时间；服务持续慢速返回字节也会在期限内取消传输。模型列表与 AI 分析均使用这个限制，取消或超时不会自动重试。
 
@@ -341,3 +352,7 @@ Codex 的生成器不使用本工具的文件锁，最终检查与替换之间�
 0.19.2 完成逐模块性能审计：会话冷解析和全文搜索减少约67–69%，200工具推荐扫描减少约91%，历史分析减少约22%（对应合成负载）。八个主页面已进行原生窗口布局与资源占用测量。复现方法、具体规模与限制见 [性能审计](docs/performance-audit.md)，不会把夹具进程的Footprint当成实际应用内存。
 
 0.19.3 优化实际交互：记忆与会话长文使用原生 TextKit 2 可滚动全文，避免一次布局整篇正文；记忆搜索取消固定等待，缓存搜索索引与条目标题，并按属性观察界面变化。采样复用滑动历史窗口，离开内存页面后继续记录并释放历史分析；重复进程路径共享字符串存储。对应合成负载中，132KB记忆首次布局由7.8秒降至86ms，搜索由169–390ms降至2–4ms，历史元数据物理内存增量减少约68%。完整数据、复现命令及测量边界见 [性能审计](docs/performance-audit.md)。
+
+## 许可证与维护
+
+本项目采用 [Apache-2.0](LICENSE)，保留 [NOTICE](NOTICE) 和 [第三方声明](THIRD-PARTY-NOTICES.md)。这是独立工具，与 OpenAI、ChatGPT 或 Codex 官方没有隶属关系。贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)，安全问题见 [SECURITY.md](SECURITY.md)，分支保护和维护规则见 [仓库维护](docs/repository-governance.md)。

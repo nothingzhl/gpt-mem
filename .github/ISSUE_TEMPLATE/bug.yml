@@ -1,0 +1,30 @@
+name: 问题反馈
+description: 提供可复现的问题和运行环境
+title: '[Bug] '
+body:
+  - type: markdown
+    attributes:
+      value: '请勿提交 API Key、真实会话、用户目录或完整诊断文件。安全漏洞请使用仓库的私密漏洞报告。'
+  - type: input
+    id: version
+    attributes:
+      label: 应用版本或源提交
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: macOS 版本及架构
+      placeholder: macOS 15 / Apple Silicon 或 Intel
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤、预期行为和实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 脱敏日志或模拟数据截图（可选）

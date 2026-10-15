@@ -2,6 +2,26 @@ name: Build and verify macOS
 
 on:
   workflow_call:
+    inputs:
+      signing:
+        type: boolean
+        default: false
+      tag:
+        type: string
+        default: ''
+    secrets:
+      APPLE_CERTIFICATE_P12_BASE64:
+        required: false
+      APPLE_CERTIFICATE_PASSWORD:
+        required: false
+      APPLE_SIGN_IDENTITY:
+        required: false
+      APPLE_NOTARY_KEY_BASE64:
+        required: false
+      APPLE_NOTARY_KEY_ID:
+        required: false
+      APPLE_NOTARY_ISSUER_ID:
+        required: false
 
 permissions:
   contents: read
@@ -18,13 +38,14 @@ jobs:
           - runner: macos-15-intel
             architecture: x86_64
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ inputs.signing && 90 || 45 }}
     env:
       MACOSX_DEPLOYMENT_TARGET: '14.0'
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+          ref: ${{ inputs.tag }}
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
@@ -33,11 +54,16 @@ jobs:
           EXPECTED_ARCH: ${{ matrix.architecture }}
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
+          REQUESTED_TAG: ${{ inputs.tag }}
         run: |
           swift --version
           xcodebuild -version
           test "$(uname -m)" = "$EXPECTED_ARCH"
           python3 -c 'import pathlib,re; assert re.fullmatch(r"\d+\.\d+\.\d+\n?", pathlib.Path("VERSION").read_text()), "Invalid VERSION"'
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            test "$REQUESTED_TAG" = "v$(cat VERSION)"
+            test "$(git describe --tags --exact-match HEAD)" = "$REQUESTED_TAG"
+          fi
           if [[ "$REF_TYPE" == tag ]]; then
             test "$REF_NAME" = "v$(cat VERSION)"
           fi
@@ -54,14 +80,28 @@ jobs:
           python3 scripts/check-desktop-sessions.py
           python3 scripts/check-report-library.py
           python3 scripts/check-knowledge.py
+      - name: Prepare isolated Developer ID keychain
+        if: inputs.signing
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+          APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: ./scripts/prepare-signing.sh
       - name: Package desktop and CLI archives
+        env:
+          GPT_MANAGER_SIGN_IDENTITY: ${{ inputs.signing && secrets.APPLE_SIGN_IDENTITY || '-' }}
+          GPT_MANAGER_NOTARY_PROFILE: ${{ inputs.signing && 'gpt-manager-notary' || '' }}
+          GPT_MANAGER_SIGNING_KEYCHAIN: ${{ inputs.signing && format('{0}/gpt-manager-signing/signing.keychain-db', runner.temp) || '' }}
         run: ./scripts/build-artifacts.sh --skip-build
       - name: Verify extracted artifacts
         run: ./scripts/verify-artifacts.sh
       - name: Upload verified archives
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: gpt-manager-macos-${{ matrix.architecture }}-${{ github.sha }}
+          name: ${{ inputs.signing && 'signed-' || '' }}gpt-manager-macos-${{ matrix.architecture }}-${{ github.sha }}
           path: dist/artifacts/*
           if-no-files-found: error
           retention-days: 14
@@ -69,10 +109,19 @@ jobs:
       - name: Write build summary
         env:
           ARCHITECTURE: ${{ matrix.architecture }}
+          SIGNED: ${{ inputs.signing }}
         run: |
           {
             echo "### GPT Manager $(cat VERSION) / $ARCHITECTURE"
             echo 'Swift tests, desktop mock checks, CLI smoke and extracted artifacts verified.'
             echo 'Downloads: desktop ZIP, CLI tar.gz, build metadata and SHA-256 checksums.'
-            echo 'Signing: ad-hoc; Apple notarization is not configured.'
+            echo "Developer ID signed and notarized: $SIGNED"
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Clean isolated signing material
+        if: always() && inputs.signing
+        run: |
+          directory="$RUNNER_TEMP/gpt-manager-signing"
+          if [[ -f "$directory/signing.keychain-db" ]]; then
+            security delete-keychain "$directory/signing.keychain-db"
+          fi
+          rm -rf -- "$directory"
