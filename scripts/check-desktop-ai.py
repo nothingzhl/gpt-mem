@@ -35,8 +35,9 @@ struct CheckFailure: Error, CustomStringConvertible {
 
 final class MockCredentials: AICredentialStore {
     private var values: [UUID: String] = [:]
+    var onSet: ((UUID, String) -> Void)?
     func key(for id: UUID) throws -> String? { values[id] }
-    func setKey(_ key: String, for id: UUID) throws { values[id] = key }
+    func setKey(_ key: String, for id: UUID) throws { values[id] = key; onSet?(id, key) }
     func deleteKey(for id: UUID) throws { values.removeValue(forKey: id) }
 }
 
@@ -165,11 +166,11 @@ func fixtureInput(_ context: String, offset: TimeInterval = 0) -> AIAnalysisInpu
     edit.name = "模拟服务已编辑"
     let revision = edit.revision
     try expect(fixture.model.saveProvider(edit, key: "", clearKey: false), "edit with empty secret")
-    let retainedKey = try fixture.credentials.key(for: firstID)
+    let retainedKey = try fixture.credentials.key(for: fixture.provider.credentialStorageID)
     try expect(retainedKey == "fixture-old-key", "empty secret retains existing key")
     try expect(fixture.provider.revision == revision + 1, "editing increments revision")
     try expect(fixture.model.saveProvider(fixture.provider, key: "ignored", clearKey: true), "explicitly clear secret")
-    let clearedKey = try fixture.credentials.key(for: firstID)
+    let clearedKey = try fixture.credentials.key(for: fixture.provider.credentialStorageID)
     try expect(clearedKey == nil, "clear flag removes key independently")
     try expect(fixture.model.saveProvider(fixture.provider, key: "fixture-restored-key", clearKey: false), "restore mock key")
     let contents = try String(contentsOf: fixture.store.url, encoding: .utf8)
@@ -180,10 +181,11 @@ func fixtureInput(_ context: String, offset: TimeInterval = 0) -> AIAnalysisInpu
     try expect(fixture.model.saveProvider(fixture.provider, key: "", clearKey: false), "save related preview source")
     try expect(fixture.model.preview == nil, "saving source clears its preview")
     _ = try prepare(fixture, input: fixtureInput("crud-remove"))
+    let removedReference = fixture.provider.credentialStorageID
     fixture.model.removeProvider(firstID)
     try expect(fixture.model.preview == nil, "removing source clears its preview")
     try expect(fixture.model.settings.providers.count == 2, "remove one source")
-    let removedKey = try fixture.credentials.key(for: firstID)
+    let removedKey = try fixture.credentials.key(for: removedReference)
     try expect(removedKey == nil, "source removal deletes corresponding mock key")
     try expect(fixture.model.settings.providers.contains { $0.id == fixture.model.settings.selectedProviderID }, "removed selection changes to existing source")
     let calls = await fixture.client.captured()
@@ -202,7 +204,7 @@ func fixtureInput(_ context: String, offset: TimeInterval = 0) -> AIAnalysisInpu
     fixture.model.removeProvider(fixture.provider.id)
     let preservedData = try Data(contentsOf: fixture.store.url)
     try expect(preservedData == broken, "corrupt file is not overwritten")
-    let key = try fixture.credentials.key(for: fixture.provider.id)
+    let key = try fixture.credentials.key(for: fixture.provider.credentialStorageID)
     try expect(key == "fixture-old-key", "blocked mutation leaves credential unchanged")
     try fixture.store.save(AISettings())
     fixture.model.reloadSettings()
@@ -238,21 +240,21 @@ func fixtureInput(_ context: String, offset: TimeInterval = 0) -> AIAnalysisInpu
     let local = try fixture.model.modelDiscoveryKey(configuration: changed, draftKey: "", clearKey: false)
     try expect(local == nil, "local source does not inherit remote saved key")
     let after = try Data(contentsOf: fixture.store.url)
-    let stored = try fixture.credentials.key(for: saved.id)
+    let stored = try fixture.credentials.key(for: saved.credentialStorageID)
     try expect(after == original && stored == "fixture-old-key", "discovery leaves saved metadata and key unchanged")
     changed = saved
     changed.baseURL = "https://other.invalid/v1"
     try expect(!fixture.model.saveProvider(changed, key: "", clearKey: false), "changed destination cannot save with silently retained key")
-    let preservedKey = try fixture.credentials.key(for: saved.id)
+    let preservedKey = try fixture.credentials.key(for: saved.credentialStorageID)
     try expect(fixture.provider == saved && preservedKey == "fixture-old-key", "rejected save preserves source and key")
     try expect(fixture.model.saveProvider(changed, key: "fixture-other-key", clearKey: false), "changed destination accepts its new key")
-    let replacedKey = try fixture.credentials.key(for: saved.id)
+    let replacedKey = try fixture.credentials.key(for: fixture.provider.credentialStorageID)
     try expect(replacedKey == "fixture-other-key", "new destination stores its explicitly supplied key")
     changed = fixture.provider
     changed.kind = .ollama
     changed.baseURL = "http://localhost:11434"
     try expect(fixture.model.saveProvider(changed, key: "", clearKey: true), "keyless local destination permits explicitly clearing saved key")
-    let noLocalKey = try fixture.credentials.key(for: saved.id)
+    let noLocalKey = try fixture.credentials.key(for: saved.credentialStorageID)
     try expect(noLocalKey == nil, "local destination has no inherited remote key")
     print("PASS model discovery binds credentials to their saved destination")
 }
@@ -324,7 +326,7 @@ func fixtureInput(_ context: String, offset: TimeInterval = 0) -> AIAnalysisInpu
     try expect(calls.count == 1, "one bound confirmation request")
     try expect(calls[0].configuration == prepared.configuration, "request destination remains the approved configuration")
     try expect(calls[0].apiKey == "fixture-old-key", "request key remains the confirmation-time credential")
-    let currentKey = try fixture.credentials.key(for: fixture.provider.id)
+    let currentKey = try fixture.credentials.key(for: fixture.provider.credentialStorageID)
     try expect(currentKey == "fixture-new-key", "later edit still updates the stored credential")
     try expect(fixture.model.resultIsStale, "result preserves provenance after source edit")
     print("PASS destination and credential bound before async task execution")
@@ -354,6 +356,74 @@ func fixtureInput(_ context: String, offset: TimeInterval = 0) -> AIAnalysisInpu
     print("PASS cancelled late completion, new request ownership, failure preserves prior result")
 }
 
+@MainActor func checkImmutableCredentialCommit() throws {
+    let fixture = try makeFixture("immutable-credential")
+    let original = fixture.provider
+    let second = DesktopAIModel(configurationStore: fixture.store, credentials: fixture.credentials)
+    var observedAddress: String?, observedKey: String?, blockedWriter = false
+    fixture.credentials.onSet = { _, _ in
+        let disk = try? fixture.store.load().providers.first
+        observedAddress = disk?.baseURL
+        observedKey = try? disk.flatMap { try fixture.credentials.key(for: $0.credentialStorageID) }
+        // Another instance's mutation must not enter between key staging and commit.
+        blockedWriter = !second.saveProvider(original, key: "must-not-win", clearKey: false)
+    }
+    var changed = original
+    changed.baseURL = "https://next-service.invalid/v1"
+    try expect(fixture.model.saveProvider(changed, key: "next-service-key", clearKey: false), "destination/key commit succeeds")
+    fixture.credentials.onSet = nil
+    try expect(observedAddress == original.baseURL && observedKey == "fixture-old-key", "reader between key staging and commit sees old destination and old key")
+    try expect(blockedWriter, "shared file lock rejects interleaved writer before it mutates credentials")
+    try expect(fixture.provider.credentialStorageID != original.credentialStorageID, "replacement uses independent credential record")
+    let oldKey = try fixture.credentials.key(for: original.credentialStorageID)
+    let currentKey = try fixture.credentials.key(for: fixture.provider.credentialStorageID)
+    try expect(oldKey == nil && currentKey == "next-service-key", "committed replacement cleans only obsolete reference")
+    // Simulate a crash leaving a staged record without a configuration commit.
+    try fixture.credentials.setKey("abandoned-key", for: UUID())
+    let disk = try fixture.store.load().providers[0]
+    let diskKey = try fixture.credentials.key(for: disk.credentialStorageID)
+    try expect(diskKey == "next-service-key", "abandoned pre-commit credential cannot change active destination binding")
+    print("PASS staged credential crash safety and interleaved writer rejection")
+}
+
+@MainActor func checkCredentialCommitFailureAndLegacyMigration() throws {
+    let fixture = try makeFixture("credential-commit-failure")
+    let original = fixture.provider
+    let originalData = try Data(contentsOf: fixture.store.url)
+    var stagedReference: UUID?
+    fixture.credentials.onSet = { reference, _ in
+        stagedReference = reference
+        try? FileManager.default.removeItem(at: fixture.store.url)
+        try? FileManager.default.createDirectory(at: fixture.store.url, withIntermediateDirectories: false)
+    }
+    var changed = original
+    changed.baseURL = "https://never-committed.invalid/v1"
+    try expect(!fixture.model.saveProvider(changed, key: "never-committed-key", clearKey: false), "rename failure after key staging rejects commit")
+    fixture.credentials.onSet = nil
+    try FileManager.default.removeItem(at: fixture.store.url)
+    try originalData.write(to: fixture.store.url)
+    let oldKey = try fixture.credentials.key(for: original.credentialStorageID)
+    let stagedKey = try stagedReference.flatMap { try fixture.credentials.key(for: $0) }
+    try expect(oldKey == "fixture-old-key" && stagedKey == nil, "failed commit preserves old key and removes only staged record")
+    try expect(fixture.provider == original, "failed commit preserves approved configuration")
+
+    let legacy = AIProviderConfiguration(name: "legacy", kind: .openAIResponses,
+        baseURL: "https://legacy.invalid/v1", model: "fixture")
+    let providerObject = try JSONSerialization.jsonObject(with: AIAnalysisCodec.encoder().encode(legacy))
+    let legacyData = try JSONSerialization.data(withJSONObject: ["providers": [providerObject], "selectedProviderID": legacy.id.uuidString])
+    try legacyData.write(to: fixture.store.url)
+    try fixture.credentials.setKey("legacy-secret", for: legacy.id)
+    fixture.model.reloadSettings()
+    try expect(fixture.model.saveProvider(legacy, key: "", clearKey: false), "old-format provider migrates without retyping key")
+    let migrated = fixture.provider
+    let migratedKey = try fixture.credentials.key(for: migrated.credentialStorageID)
+    let legacyKey = try fixture.credentials.key(for: legacy.id)
+    try expect(migrated.credentialReference != nil && migratedKey == "legacy-secret" && legacyKey == nil, "migration binds independent record and clears legacy slot after commit")
+    let json = try String(contentsOf: fixture.store.url, encoding: .utf8)
+    try expect(json.contains("sources") && !json.contains("providers") && !json.contains("legacy-secret"), "new format fails closed in old applications and never stores secret")
+    print("PASS post-staging commit failure and legacy credential migration")
+}
+
 @MainActor func checkSaveFailureRollback() throws {
     let fixture = try makeFixture("save-failure")
     let originalSettings = fixture.model.settings
@@ -370,7 +440,7 @@ func fixtureInput(_ context: String, offset: TimeInterval = 0) -> AIAnalysisInpu
     var changed = fixture.provider
     changed.name = "模拟保存失败"
     try expect(!fixture.model.saveProvider(changed, key: "fixture-rejected-key", clearKey: false), "configuration rename failure rejects edit")
-    let restoredKey = try fixture.credentials.key(for: fixture.provider.id)
+    let restoredKey = try fixture.credentials.key(for: fixture.provider.credentialStorageID)
     try expect(restoredKey == "fixture-old-key", "configuration failure rolls credential back")
     try expect(fixture.model.settings == originalSettings, "failed edit preserves in-memory settings")
     try expect(FileManager.default.fileExists(atPath: backup.path), "failed replacement keeps original configuration backup")
@@ -390,7 +460,7 @@ func fixtureInput(_ context: String, offset: TimeInterval = 0) -> AIAnalysisInpu
         expectedProvider: opened), "stale draft cannot overwrite externally changed source")
     try expect(fixture.model.operationError?.contains("编辑期间已变化") == true, "conflict gives a concrete recovery action")
     let preserved = try fixture.store.load()
-    let key = try fixture.credentials.key(for: opened.id)
+    let key = try fixture.credentials.key(for: opened.credentialStorageID)
     try expect(preserved == latest && key == "fixture-old-key", "conflict preserves persisted source and credential")
     fixture.model.removeProvider(opened.id, expectedProvider: opened)
     let afterRemoval = try fixture.store.load()
@@ -444,7 +514,7 @@ func fixtureInput(_ context: String, offset: TimeInterval = 0) -> AIAnalysisInpu
         && refreshed.subjectLabels == preview.subjectLabels && refreshed.windowSelectionSeconds == preview.windowSelectionSeconds,
         "budget upgrade preserves exact frozen input, JSON, labels and window")
     try expect(fixture.provider.maxOutputTokens == 8192, "new budget is persisted for same source")
-    let key = try fixture.credentials.key(for: fixture.provider.id)
+    let key = try fixture.credentials.key(for: fixture.provider.credentialStorageID)
     try expect(key == "fixture-old-key", "budget-only update preserves credential")
     let calls = await fixture.client.captured()
     try expect(calls.isEmpty, "budget upgrade never sends an analysis request")
@@ -802,6 +872,8 @@ struct MockModelCatalog: AIModelCatalogClient {
     try await checkRejectChangedDestination()
     try await checkCredentialSnapshot()
     try await checkCancellationAndFailure()
+    try checkCredentialCommitFailureAndLegacyMigration()
+    try checkImmutableCredentialCommit()
     try checkSaveFailureRollback()
     try checkConfigurationConflict()
     try await checkOutputBudgetPreview()
@@ -809,7 +881,7 @@ struct MockModelCatalog: AIModelCatalogClient {
     try await checkSessionHandoffIsolationAndPersistence()
     try await checkPromptTemplateDefaultsAndFrozenInput()
     try await checkPromptLibraryCorruptionAndDefaultUpdates()
-    print("DESKTOP AI CHECKS PASSED: 14 workflows, \(assertionCount) assertions; mock providers and credentials only")
+    print("DESKTOP AI CHECKS PASSED: 16 workflows, \(assertionCount) assertions; mock providers and credentials only")
     #if RENDER_AI
     if let output = ProcessInfo.processInfo.environment["GPT_DESKTOP_AI_RENDER_PATH"] {
         try await renderFixture(to: output)

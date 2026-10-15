@@ -17,7 +17,7 @@ public actor AIAnalysisCoordinator {
         _ = try configuration.validated()
         let input = try module.makeInput()
         let payload = try input.validated()
-        let key = try credentials.key(for: configuration.id)
+        let key = try credentials.key(for: configuration.credentialStorageID)
         return try await perform(input: input, payload: payload, configuration: configuration, apiKey: key)
     }
 

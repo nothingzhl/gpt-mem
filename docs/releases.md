@@ -13,7 +13,7 @@ PR、默认分支 `codex/report-history` 的推送，以及 Actions 页手动运
 下载 Actions 运行页面中对应架构的 Artifact，解压外层 GitHub Artifact 后，可见：
 
 - `GPT-Manager-<版本>-macos-<架构>.zip`：含桌面 `.app` 和内置 CLI；使用 `ditto` 保留应用包结构及权限。
-- `gpt-mem-<版本>-macos-<架构>.tar.gz`：独立 CLI、README 和第三方声明。
+- `gpt-mem-<版本>-macos-<架构>.tar.gz`：独立 CLI、README、Apache-2.0 许可证及声明。
 - `build-info-<版本>-macos-<架构>.json`：源提交、工作区是否有修改、Swift 工具链、架构及签名方式。
 - `SHA256SUMS-<架构>.txt`：该架构三个文件的 SHA-256，可执行 `shasum -a 256 -c SHA256SUMS-arm64.txt`（Intel 替换架构名）。
 
@@ -39,3 +39,5 @@ PR、默认分支 `codex/report-history` 的推送，以及 Actions 页手动运
 构建与测试任务没有写权限，仅组装草稿的任务拥有 `contents: write`。GitHub 自动提供的 `GITHUB_TOKEN` 足够，不需要 PAT、AI API Key 或 Apple 证书。私有仓库的下载仍受仓库访问权限控制。实际 Actions 执行取决于仓库 Actions 设置和可用运行额度。
 
 当前使用 ad-hoc 签名，未配置 Developer ID 或 Apple 公证，下载后可能被 Gatekeeper 拦截。只有确认来源可信后才按 macOS 提示操作；不要全局关闭系统安全检查。面向外部用户正式分发前，应另行配置 Developer ID 签名和公证。
+
+0.19.4 同时修复 AI 来源地址与凭据的崩溃/并发错配。旧设置首次保存后升级格式，旧版应用会拒绝读取；请保留升级前设置备份并使用新版。正式签名的可选手动工作流已接入，当前没有 Apple 凭据，普通版本标签继续生成 ad-hoc 产物，见 [签名与公证](signing.md)。

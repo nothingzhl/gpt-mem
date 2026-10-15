@@ -156,6 +156,11 @@ final class DesktopAIModel: ObservableObject {
 
     @discardableResult
     func selectProvider(_ id: UUID?) -> Bool {
+        do { return try configurationStore.withExclusiveAccess { selectProviderLocked(id) } }
+        catch { operationError = error.localizedDescription; return false }
+    }
+
+    private func selectProviderLocked(_ id: UUID?) -> Bool {
         guard configurationError == nil else { return false }
         guard refreshSettingsForMutation() else { return false }
         guard id == nil || settings.providers.contains(where: { $0.id == id }) else { return false }
@@ -183,7 +188,7 @@ final class DesktopAIModel: ObservableObject {
             }
             return nil
         }
-        return try credentials.key(for: saved.id)
+        return try credentials.key(for: saved.credentialStorageID)
     }
 
     private func sameDestination(_ first: AIProviderConfiguration, _ second: AIProviderConfiguration) -> Bool {
@@ -198,6 +203,15 @@ final class DesktopAIModel: ObservableObject {
     @discardableResult
     func saveProvider(_ draft: AIProviderConfiguration, key: String, clearKey: Bool,
                       expectedProvider: AIProviderConfiguration? = nil) -> Bool {
+        do {
+            return try configurationStore.withExclusiveAccess {
+                saveProviderLocked(draft, key: key, clearKey: clearKey, expectedProvider: expectedProvider)
+            }
+        } catch { operationError = error.localizedDescription; return false }
+    }
+
+    private func saveProviderLocked(_ draft: AIProviderConfiguration, key: String, clearKey: Bool,
+                                   expectedProvider: AIProviderConfiguration?) -> Bool {
         guard configurationError == nil else { return false }
         operationError = nil
         let original = expectedProvider ?? settings.providers.first { $0.id == draft.id }
@@ -213,12 +227,21 @@ final class DesktopAIModel: ObservableObject {
         do {
             _ = try provider.validated()
             let previous = settings.providers.first { $0.id == provider.id }
+            let suppliedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            let previousKey: String?
+            if let previous, suppliedKey.isEmpty, !clearKey,
+               previous.credentialReference == nil || !sameDestination(previous, provider) {
+                previousKey = try credentials.key(for: previous.credentialStorageID)
+            } else { previousKey = nil }
             if let previous, !sameDestination(previous, provider), !clearKey,
-               key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-               try credentials.key(for: provider.id) != nil {
+               suppliedKey.isEmpty, previousKey != nil {
                 throw AIAnalysisError.invalidConfiguration("服务地址或协议已改变，请填写新来源的 API Key；不需要密钥时，可在高级设置中清除已保存的密钥。")
             }
             provider.revision = (previous?.revision ?? 0) + 1
+            let changesCredential = clearKey || !suppliedKey.isEmpty || previous?.credentialReference == nil
+            // Never overwrite an existing credential. A crash leaves the old
+            // configuration pointing to the old key, or the new one to the new key.
+            provider.credentialReference = changesCredential ? UUID() : previous?.credentialReference
             var updated = settings
             if let index = updated.providers.firstIndex(where: { $0.id == provider.id }) {
                 updated.providers[index] = provider
@@ -227,25 +250,20 @@ final class DesktopAIModel: ObservableObject {
                 if updated.selectedProviderID == nil { updated.selectedProviderID = provider.id }
             }
             try updated.validate()
-            let changedKey = clearKey || !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            let previousKey = changedKey ? try credentials.key(for: provider.id) : nil
-            if changedKey {
-                if clearKey { try credentials.deleteKey(for: provider.id) }
-                else { try credentials.setKey(key.trimmingCharacters(in: .whitespacesAndNewlines), for: provider.id) }
+            if changesCredential, !clearKey, let newKey = suppliedKey.isEmpty ? previousKey : suppliedKey {
+                try credentials.setKey(newKey, for: provider.credentialStorageID)
             }
             do {
                 try configurationStore.save(updated)
             } catch {
-                if changedKey {
-                    do {
-                        if let previousKey { try credentials.setKey(previousKey, for: provider.id) }
-                        else { try credentials.deleteKey(for: provider.id) }
-                    } catch {
-                        operationError = "配置保存失败，密钥还原也失败。请重新编辑这个来源并检查钥匙串。"
-                        return false
-                    }
-                }
+                // Only the uncommitted new reference may be removed; no rollback
+                // can ever restore a key over another instance's successful edit.
+                if changesCredential { try? credentials.deleteKey(for: provider.credentialStorageID) }
                 throw error
+            }
+            if changesCredential, let previous {
+                do { try credentials.deleteKey(for: previous.credentialStorageID) }
+                catch { operationError = "来源已保存，但旧钥匙串条目清理失败；不会用于新请求。" }
             }
             settings = updated
             if preview?.configuration.id == provider.id { preview = nil }
@@ -258,6 +276,11 @@ final class DesktopAIModel: ObservableObject {
     }
 
     func removeProvider(_ id: UUID, expectedProvider: AIProviderConfiguration? = nil) {
+        do { try configurationStore.withExclusiveAccess { removeProviderLocked(id, expectedProvider: expectedProvider) } }
+        catch { operationError = error.localizedDescription }
+    }
+
+    private func removeProviderLocked(_ id: UUID, expectedProvider: AIProviderConfiguration?) {
         guard configurationError == nil else { return }
         let original = expectedProvider ?? settings.providers.first { $0.id == id }
         guard refreshSettingsForMutation() else { return }
@@ -270,7 +293,7 @@ final class DesktopAIModel: ObservableObject {
         if updated.selectedProviderID == id { updated.selectedProviderID = updated.providers.first?.id }
         guard persistSettings(updated) else { return }
         if preview?.configuration.id == id { preview = nil }
-        do { try credentials.deleteKey(for: id) }
+        do { try credentials.deleteKey(for: original.credentialStorageID) }
         catch { operationError = "来源已移除，但钥匙串中的密钥未能删除：\(error.localizedDescription)" }
     }
 
@@ -350,7 +373,7 @@ final class DesktopAIModel: ObservableObject {
         }
         let apiKey: String?
         do {
-            apiKey = try credentials.key(for: prepared.configuration.id)
+            apiKey = try credentials.key(for: prepared.configuration.credentialStorageID)
             if prepared.configuration.requiresAPIKey,
                apiKey?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
                 throw AIAnalysisError.missingCredential

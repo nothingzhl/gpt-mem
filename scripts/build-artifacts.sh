@@ -29,11 +29,14 @@ suffix="$version-macos-$architecture"
 mkdir "$stage/cli"
 /usr/bin/install -m 755 "$cli" "$stage/cli/gpt-mem"
 /usr/bin/install -m 644 "$project_dir/README.md" "$stage/cli/README.md"
-/usr/bin/install -m 644 "$project_dir/THIRD-PARTY-NOTICES.md" "$stage/cli/THIRD-PARTY-NOTICES.md"
-COPYFILE_DISABLE=1 /usr/bin/tar -czf "$stage/gpt-mem-$suffix.tar.gz" -C "$stage/cli" gpt-mem README.md THIRD-PARTY-NOTICES.md
+for notice in LICENSE NOTICE THIRD-PARTY-NOTICES.md; do
+  /usr/bin/install -m 644 "$project_dir/$notice" "$stage/cli/$notice"
+done
+COPYFILE_DISABLE=1 /usr/bin/tar -czf "$stage/gpt-mem-$suffix.tar.gz" -C "$stage/cli" gpt-mem README.md LICENSE NOTICE THIRD-PARTY-NOTICES.md
 python3 - "$project_dir" "$version" "$architecture" "$stage/build-info-$suffix.json" <<'PY'
 import json
 import pathlib
+import os
 import subprocess
 import sys
 root, version, architecture, destination = sys.argv[1:]
@@ -44,7 +47,8 @@ metadata = {
     "commit": command("git", "rev-parse", "HEAD"),
     "dirty": bool(command("git", "status", "--porcelain", "--untracked-files=normal")),
     "swift": command("swift", "--version"),
-    "signing": "ad-hoc", "notarized": False,
+    "signing": "ad-hoc" if os.environ.get("GPT_MANAGER_SIGN_IDENTITY", "-") == "-" else "developer-id",
+    "notarized": bool(os.environ.get("GPT_MANAGER_NOTARY_PROFILE")),
 }
 pathlib.Path(destination).write_text(json.dumps(metadata, indent=2) + "\n")
 PY

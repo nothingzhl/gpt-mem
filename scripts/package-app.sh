@@ -12,6 +12,17 @@ version="$(cat "$project_dir/VERSION")"
 if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "VERSION 必须为 major.minor.patch 格式。" >&2; exit 1
 fi
+signing_identity="${GPT_MANAGER_SIGN_IDENTITY:--}"
+notary_profile="${GPT_MANAGER_NOTARY_PROFILE:-}"
+signing_keychain="${GPT_MANAGER_SIGNING_KEYCHAIN:-}"
+if [[ -n "$notary_profile" && "$signing_identity" == "-" ]]; then
+  echo "公证需要 Developer ID 身份，不能使用 ad-hoc 签名。" >&2; exit 1
+fi
+signing_args=(--force --sign "$signing_identity")
+if [[ "$signing_identity" != "-" ]]; then
+  signing_args+=(--options runtime --timestamp)
+  if [[ -n "$signing_keychain" ]]; then signing_args+=(--keychain "$signing_keychain"); fi
+fi
 skip_build=false
 binary_path="${GPT_MANAGER_BIN:-}"
 cli_binary_path="${GPT_MANAGER_CLI_BIN:-}"
@@ -99,16 +110,26 @@ cat > "$stage_app/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
-if [[ -f "$project_dir/THIRD-PARTY-NOTICES.md" ]]; then
-  /usr/bin/install -m 644 "$project_dir/THIRD-PARTY-NOTICES.md" "$stage_app/Contents/Resources/THIRD-PARTY-NOTICES.md"
-fi
+for notice in LICENSE NOTICE THIRD-PARTY-NOTICES.md; do
+  /usr/bin/install -m 644 "$project_dir/$notice" "$stage_app/Contents/Resources/$notice"
+done
 echo "local.gpt-manager.desktop" > "$stage_app/Contents/Resources/.gpt-manager-package"
 /usr/bin/plutil -lint "$stage_app/Contents/Info.plist"
-# Ad-hoc signing is local only and requires no developer account or certificate.
-/usr/bin/codesign --force --sign - "$stage_app/Contents/Resources/gpt-mem"
+# Default is ad-hoc. Developer ID signing is explicit and fails closed.
+/usr/bin/codesign "${signing_args[@]}" "$stage_app/Contents/Resources/gpt-mem"
 /usr/bin/codesign --verify --strict "$stage_app/Contents/Resources/gpt-mem"
-/usr/bin/codesign --force --sign - "$stage_app"
+/usr/bin/codesign "${signing_args[@]}" "$stage_app"
 /usr/bin/codesign --verify --strict "$stage_app"
+
+if [[ -n "$notary_profile" ]]; then
+  notary_args=(--keychain-profile "$notary_profile")
+  if [[ -n "$signing_keychain" ]]; then notary_args+=(--keychain "$signing_keychain"); fi
+  /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$stage_app" "$stage_dir/notarization.zip"
+  /usr/bin/xcrun notarytool submit "$stage_dir/notarization.zip" "${notary_args[@]}" --wait --timeout 30m
+  /usr/bin/xcrun stapler staple "$stage_app"
+  /usr/bin/xcrun stapler validate "$stage_app"
+  /usr/bin/codesign --verify --deep --strict "$stage_app"
+fi
 
 # Replace only a validated project artifact, after the new bundle passes checks.
 if [[ -e "$app_path" ]]; then rm -rf -- "$app_path"; fi

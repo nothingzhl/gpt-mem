@@ -21,7 +21,9 @@ assert metadata["architecture"] == sys.argv[3]
 assert metadata["minimumMacOS"] == "14.0"
 assert re.fullmatch(r"[0-9a-f]{40}", metadata["commit"])
 assert isinstance(metadata["dirty"], bool)
-assert metadata["signing"] == "ad-hoc" and metadata["notarized"] is False
+assert metadata["signing"] in ("ad-hoc", "developer-id")
+assert isinstance(metadata["notarized"], bool)
+assert metadata["signing"] != "ad-hoc" or metadata["notarized"] is False
 PY
 stage="$(mktemp -d "${TMPDIR:-/tmp}/gpt-artifact-check.XXXXXX")"
 trap 'rm -rf -- "$stage"' EXIT
@@ -38,6 +40,18 @@ for binary in "$app/Contents/MacOS/gpt-manager" "$app/Contents/Resources/gpt-mem
   /usr/bin/codesign --verify --strict "$binary"
 done
 /usr/bin/codesign --verify --deep --strict "$app"
+for notice in LICENSE NOTICE THIRD-PARTY-NOTICES.md; do
+  test -s "$app/Contents/Resources/$notice"
+  test -s "$stage/cli/$notice"
+done
+signing="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["signing"])' "$output/build-info-$suffix.json")"
+if [[ "$signing" == developer-id ]]; then
+  for binary in "$app" "$stage/cli/gpt-mem"; do
+    /usr/bin/codesign --display --verbose=2 "$binary" 2>&1 | /usr/bin/grep -q '^Authority=Developer ID Application:'
+  done
+fi
+notarized="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["notarized"])' "$output/build-info-$suffix.json")"
+if [[ "$notarized" == True ]]; then /usr/bin/xcrun stapler validate "$app"; fi
 /usr/bin/cmp "$stage/cli/gpt-mem" "$app/Contents/Resources/gpt-mem"
 GPT_MEM_HOME="$stage/history" "$stage/cli/gpt-mem" --help > "$stage/help.txt"
 [[ ! -e "$stage/history" ]]
